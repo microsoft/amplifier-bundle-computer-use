@@ -5,6 +5,7 @@ bundle:
   description: See and control a real desktop - Windows, macOS, or Linux, local or across your network - with the LLM's native computer-use tool
 
 includes:
+  - bundle: git+https://github.com/microsoft/amplifier-foundation@main
   - bundle: computer-use:behaviors/computer-use
 ---
 

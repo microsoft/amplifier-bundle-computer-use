@@ -37,27 +37,40 @@ CLI, no browser extension required.
 
 ## Install
 
-Registering this bundle is ordinary Amplifier bundle management:
+Use it as-is by registering this repo's **root bundle** — a normal, runnable bundle
+that pulls in foundation plus the computer-use behavior — then running it:
 
 ```bash
-# 1. Register it (the name "computer-use" comes from this repo's own bundle.md)
-amplifier bundle add git+https://github.com/microsoft/amplifier-bundle-computer-use@main#subdirectory=behaviors/computer-use.yaml --app
-
-# 2. Use it for a session
+# Registers under the name "computer-use" (from the root bundle.md).
+amplifier bundle add git+https://github.com/microsoft/amplifier-bundle-computer-use@main
 amplifier run --bundle computer-use "What's on my screen right now?"
-
 ```
 
 Confirm it registered correctly with `amplifier bundle show computer-use` — it should
 list `tool-computer-use`, `hook-computer-use`, and `computer-use:computer-operator`.
-Working from a local clone instead of GitHub? `amplifier bundle add
-file:///path/to/amplifier-bundle-computer-use` instead.
+Working from a local clone instead of GitHub? `amplifier bundle add file:///path/to/amplifier-bundle-computer-use` instead.
+
+Adding computer-use to a bundle you already have? Include the **behavior** in that
+bundle's `includes:` list — this composes its tool, hook, and agent into your
+sessions:
+
+```yaml
+includes:
+  - bundle: foundation
+  - bundle: git+https://github.com/microsoft/amplifier-bundle-computer-use@main#subdirectory=behaviors/computer-use.yaml
+```
+
+You can also layer that behavior across *every* session with
+`amplifier bundle add …#subdirectory=behaviors/computer-use.yaml --app`. It registers
+under its behavior name, `computer-use-behavior`, following the ecosystem convention
+that behaviors carry a `-behavior` suffix; run it with a plain `amplifier run "…"`
+(the behavior is layered into your normal session — there is no standalone
+`computer-use-behavior` bundle to target with `--bundle`).
 
 **Registering the bundle is not the same as the tools working.** See
 **[docs/SETUP.md](docs/SETUP.md)** for the four things that decide whether `computer` and
 `desktop` actually function once a session starts: upstream module versions, a model with
 native computer-use support, a reachable target machine, and (for remote targets) SSH.
-
 ---
 
 ## What makes this the native thing
