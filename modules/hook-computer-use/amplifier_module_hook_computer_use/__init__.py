@@ -1113,18 +1113,21 @@ def _make_halt_notice_handler(coordinator: Any):
         if not notices:
             return HookResult(action="continue")
         latest = notices[-1]
+        safety_notice = (
+            "SAFETY NOTICE (computer-use human/agent coexistence guard): "
+            f"{len(notices)} human-detected interruption(s) occurred during "
+            "this driving session - a person at the machine produced input "
+            "the agent did not generate, and writes were halted before the "
+            f"next one (docs/designs/coexistence.md \u00a76.0). Most recent: "
+            f"{latest['message']} You MUST explicitly acknowledge this "
+            "interruption in any summary, report, or completion claim you "
+            "give the user - never report unqualified success or that the "
+            "task completed cleanly without mentioning it."
+        )
         return HookResult(
             action="inject_context",
             context_injection=(
-                "SAFETY NOTICE (computer-use human/agent coexistence guard): "
-                f"{len(notices)} human-detected interruption(s) occurred during "
-                "this driving session - a person at the machine produced input "
-                "the agent did not generate, and writes were halted before the "
-                f"next one (docs/designs/coexistence.md \u00a76.0). Most recent: "
-                f"{latest['message']} You MUST explicitly acknowledge this "
-                "interruption in any summary, report, or completion claim you "
-                "give the user - never report unqualified success or that the "
-                "task completed cleanly without mentioning it."
+                f'<system-reminder source="hook-computer-use">\n{safety_notice}\n</system-reminder>'
             ),
             context_injection_role="system",
             ephemeral=True,

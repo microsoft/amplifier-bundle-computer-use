@@ -267,3 +267,40 @@ def test_halt_notice_handler_repeats_the_reminder_every_subsequent_call():
 
     assert first.action == "inject_context"
     assert second.action == "inject_context"
+
+
+def test_halt_notice_handler_wraps_injection_in_system_reminder():
+    """The injected safety notice must be wrapped in <system-reminder source="...">
+    tags per the ecosystem convention (see hooks-status-context /
+    hooks-todo-reminder for the reference shape), so models can distinguish
+    this system-injected content from an actual user request. The notice
+    text itself must remain byte-identical inside the wrapper."""
+    notices = [
+        {
+            "at": 0.0,
+            "action": "left_click",
+            "message": "halted: a human at this machine produced input 12.0ms ago",
+            "margin_ms": 30.0,
+            "guard_ms": 5.0,
+            "last_human_input_ago_ms": 12.0,
+        }
+    ]
+    coord = _FakeCoordinator({"computer": _ToolWithNotices(notices)})
+    handler = hook_mod._make_halt_notice_handler(coord)
+
+    result = _run(handler("tool:post", {"tool_name": "computer", "tool_input": {}}))
+
+    assert result.action == "inject_context"
+    assert result.context_injection is not None
+    assert result.context_injection.startswith(
+        '<system-reminder source="hook-computer-use">'
+    ), (
+        f"Injection should open with the system-reminder wrapper; got: {result.context_injection!r}"
+    )
+    assert result.context_injection.endswith("</system-reminder>"), (
+        f"Injection should close with the system-reminder wrapper; got: {result.context_injection!r}"
+    )
+    assert (
+        "SAFETY NOTICE (computer-use human/agent coexistence guard): "
+        "1 human-detected interruption(s) occurred during this driving session"
+    ) in result.context_injection
