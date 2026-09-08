@@ -1,18 +1,18 @@
 {
   "anthropic": {
-    "checked_at": "2026-08-03T08:31:38+00:00",
-    "commit_sha": "fd188234d314e0afa616500330b90f28563be0a1",
+    "checked_at": "2026-09-08T13:00:45.395133+00:00",
+    "commit_sha": "f857f40b963d2747a666fb9c9fe3185ff745a84d",
     "error": null,
     "http_status": 200,
     "model": "claude-sonnet-4-5-20250929",
     "tool_type": "computer_20250124"
   },
   "openai": {
-    "checked_at": "2026-08-03T08:31:39+00:00",
-    "commit_sha": "fd188234d314e0afa616500330b90f28563be0a1",
+    "checked_at": "2026-09-08T13:00:46.761402+00:00",
+    "commit_sha": "f857f40b963d2747a666fb9c9fe3185ff745a84d",
     "error": null,
     "http_status": 200,
-    "model": "gpt-5.5",
+    "model": "gpt-5.6-terra",
     "tool_type": "computer"
   }
 }
