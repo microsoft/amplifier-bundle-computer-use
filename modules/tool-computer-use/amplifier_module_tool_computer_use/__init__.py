@@ -72,7 +72,7 @@ from .presence import (
     PresenceSnapshot,
     PresenceState,
 )
-from .providers import dialect_for_tool_type, read_call
+from .providers import ANTHROPIC, dialect_for_tool_type, read_call
 from .registry import _TARGET_MODEL, NoBackendAvailable, select_backend
 from .tool_versions import (
     beta_header_for,
@@ -310,6 +310,7 @@ class ComputerTool:
         self._tool_version: str = require_static_pairing(
             self._model_hint, self._configured_tool_version
         )
+        self._cross_dialect_override_notices: set[tuple[str, str]] = set()
 
         # -- remote-target safety posture ------------------------------------
         # `is_remote` is a plain attribute (not an isinstance/import check) so
@@ -1198,56 +1199,66 @@ class ComputerTool:
         A caller must send no header for `None`, never an empty one."""
         return beta_header_for(self._tool_version)
 
+    def select_provider_native_tool_type(
+        self, native_tool_type: str, model: str | None = None
+    ) -> None:
+        """Select the provider-proven native dialect before building its spec."""
+        selected_dialect = dialect_for_tool_type(native_tool_type)
+        configured = self._configured_tool_version
+        if configured and dialect_for_tool_type(configured) is not selected_dialect:
+            notice = (native_tool_type, configured)
+            if notice not in self._cross_dialect_override_notices:
+                logger.info(
+                    "computer-use: ignoring cross-dialect configured tool_version %r "
+                    "while provider selected native type %r",
+                    configured,
+                    native_tool_type,
+                )
+                self._cross_dialect_override_notices.add(notice)
+
+        if selected_dialect is not ANTHROPIC:
+            if self._tool_version != native_tool_type:
+                self._tool_version = native_tool_type
+            return
+
+        anthro_configured = (
+            configured
+            if configured and dialect_for_tool_type(configured) is ANTHROPIC
+            else None
+        )
+        anthro_previous = (
+            self._tool_version
+            if dialect_for_tool_type(self._tool_version) is ANTHROPIC
+            else None
+        )
+        resolved, corrected = resolve_tool_version(
+            model, anthro_configured, previous=anthro_previous
+        )
+        if dialect_for_tool_type(resolved) is not ANTHROPIC:
+            resolved, corrected = resolve_tool_version(
+                None, anthro_configured, previous=anthro_previous
+            )
+        if corrected:
+            logger.info(
+                "computer-use: model %r requires tool_version %r; correcting "
+                "from %r to avoid the API rejecting every request with this pairing "
+                "(see tool_versions.py)",
+                model,
+                resolved,
+                self._tool_version,
+            )
+        if self._tool_version != resolved:
+            self._tool_version = resolved
+
     def note_model(self, model: str | None) -> None:
-        """Re-resolve `tool_version` for the model about to receive a request.
+        """Legacy model-only correction path for tools without provider dialect selection.
 
-        Called by hook-computer-use (`_note_model_on_computer_tool`,
-        `hook-computer-use/__init__.py`) from two sites - see `tool_versions.py`
-        module docstring for the resolution policy this applies:
-
-        1. Once at wrap time (mount-priming), with the provider's own
-           `default_model`, BEFORE this session's first `native_tool_spec` read.
-        2. On every subsequent `provider.complete()` call, with
-           `request.model or provider.default_model`.
-
-        Site 1 exists because site 2 alone is one turn late: `native_tool_spec`
-        is read earlier in the same turn, by the orchestrator's own `ToolSpec`
-        construction, before `provider.complete()` is ever called - so a
-        correction inside `complete()` lands one turn ahead of the read it
-        protects, not retroactively inside the same turn. A long-lived parent
-        session survives that lag (session continuity carries `_tool_version`
-        into the next turn). A short-lived sub-agent does not: its first
-        request is also its only one, so nothing inside `complete()` can ever
-        correct it in time - the correction has to already be in place before
-        that first read, which is exactly what wrap-time priming provides.
+        `hook-computer-use` prefers `select_provider_native_tool_type()` so the
+        provider-selected dialect is authoritative. This remains for legacy
+        hooks and fake tools that only supply the model.
 
         Never raises: a mid-session exception here would take down the whole
-        request, the exact class of bug D3 already fixed once for
-        `native_tool_spec` itself.
-
-        Logged at INFO, not WARNING (bug-hunt defect A): this correction is
-        working exactly as designed - a known model always wins per
-        `resolve_tool_version`'s resolution order, so `corrected` fires
-        whenever a NEW `ComputerTool` mount's first-seen model differs from
-        its mount-time default (e.g. a Haiku sub-agent primed from an Opus
-        parent's config - see call site 1's docstring above). It is not one
-        rare event: empirically it fires once per FRESH mount that needs it
-        (three independent `ComputerTool()` instances each logged their own
-        correction in one process), so a session that spawns many
-        short-lived sub-agents (a session-naming hook, for instance) sees it
-        recur, not once. Nothing about it is actionable by a human, and it
-        is not a signal of failure - the same distinction `_wrap_provider`'s
-        own WARNING-vs-INFO choice already draws for a REAL capability gap
-        (`hook-computer-use/__init__.py`, "WARNING, not info" comment):
-        WARNING is this codebase's reserved level for operator-facing,
-        actionable lines under the default logging configuration (no
-        handlers anywhere, root effective level WARNING); INFO already is,
-        and is meant to be, invisible under that default - exactly like the
-        "guard built" line in `_build_coexistence_guard` below. That default
-        invisibility is not a downgrade to "still in a log file somewhere" -
-        there is no `FileHandler` anywhere in this stack - it is the same
-        audience routing every other benign state transition in this module
-        already receives.
+        request.
         """
         resolved, corrected = resolve_tool_version(
             model, self._configured_tool_version, previous=self._tool_version

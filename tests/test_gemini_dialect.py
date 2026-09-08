@@ -272,44 +272,6 @@ def test_closed_gap_beta_header_for_gemini_is_none_not_anthropics_header():
     assert beta_header_for("computer_99999999") == "computer-use-2025-11-24"
 
 
-def test_closed_gap_hook_resolves_the_right_tool_type_for_gemini():
-    """WAS `test_seam_gap_hook_resolves_the_wrong_tool_type_for_gemini`, which
-    pinned the wrong answer `"computer_20251124"` (Anthropic's) for a Gemini
-    session.
-
-    `hook-computer-use._resolve_native_tool_type` used to read the mounted
-    tool's `native_tool_spec` and take `native.get("type")` - recovering a
-    vendor-neutral fact by parsing a vendor-shaped artifact. Gemini's
-    declaration has no `type`, so it fell back to `_DEFAULT_PROBE_TOOL_TYPE`
-    and probed the provider for the wrong vendor's wire convention.
-
-    The hook still declares `dependencies = []` and still cannot import
-    `providers.py` - and does not need to. It reads the tool's STATED
-    `native_tool_type`, one string, by the same duck-typed attribute access it
-    already used for `native_tool_spec`. No import, no `try/except
-    ImportError`, no wire-format knowledge in the hook."""
-    import amplifier_module_hook_computer_use as hook_mod
-
-    class _GeminiToolStub:
-        @property
-        def native_tool_type(self) -> str:
-            return "computer_use"
-
-        @property
-        def native_tool_spec(self) -> dict:
-            return providers.GEMINI.declare(
-                "computer_use", width=1280, height=720, enable_zoom=False
-            )
-
-    class _Coordinator:
-        def get(self, kind, name=None):
-            return _GeminiToolStub() if (kind, name) == ("tools", "computer") else None
-
-    resolved = hook_mod._resolve_native_tool_type(_Coordinator())
-    assert resolved == "computer_use"
-    assert resolved != hook_mod._DEFAULT_PROBE_TOOL_TYPE
-
-
 # ===========================================================================
 # WHAT STILL DOES NOT FIT
 # ===========================================================================

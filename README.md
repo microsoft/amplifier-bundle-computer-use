@@ -55,8 +55,8 @@ file:///path/to/amplifier-bundle-computer-use` instead.
 
 **Registering the bundle is not the same as the tools working.** See
 **[docs/SETUP.md](docs/SETUP.md)** for the four things that decide whether `computer` and
-`desktop` actually function once a session starts: upstream module versions, a model with
-native computer-use support, a reachable target machine, and (for remote targets) SSH.
+`desktop` actually function once a session starts: upstream module versions, endpoint
+support, a reachable target machine, and (for remote targets) SSH.
 
 ---
 
@@ -85,11 +85,10 @@ end-to-end against a real remote desktop. A Gemini dialect record exists
 (`gemini-2.5-computer-use`), transcribed from captured traffic — no live end-to-end run
 through this bundle is claimed for it.
 
-Model support is **capability-gated upstream**: `provider-openai` and
-`provider-anthropic` both expose `supports_native_computer_use` on `ModelCapabilities`,
-and a model without it cannot use this bundle. See `docs/SETUP.md` §2 for the exact
-rules (OpenAI: `minor >= 4` and not `-nano`; Anthropic: per-family version thresholds
-mapping to a specific `computer_YYYYMMDD` wire type).
+The hook selects the provider's native declaration by behavior: Anthropic's beta
+derivation selects its canonical dated type; OpenAI's conversion selects bare
+`computer`. This is dialect plumbing, not a model capability verdict: the server remains
+the authority on whether an endpoint accepts computer use.
 
 ## The one thing that had to be solved
 
@@ -196,8 +195,9 @@ typical bundle.** In brief:
   code at mount time rather than trusting a version string, and refuses to mount (naming
   the exact commit to upgrade to) if the orchestrator cannot carry the native tool form.
   See `docs/SETUP.md` §1 for how the probe works.
-- **A model with `supports_native_computer_use`** — OpenAI: `minor >= 4`, not `-nano`.
-  Anthropic: per-family version thresholds. §2 of the setup doc has the tables.
+- **An endpoint that accepts native computer use** — the hook proves provider wire
+  plumbing, not model availability; the server remains authoritative. §2 of the setup
+  doc explains the boundary.
 - **A target machine** — local or remote over SSH — meeting its platform's **hard**
   prerequisites. These are not optional, and two of the three are not caught at mount:
   - **Windows: WSL2 is required.** There is no native-Windows code path. `windows.py` is a
@@ -298,10 +298,12 @@ complete: markers=1 messages_with_blocks=3
 No `markers=` line → screenshots are not reaching the model. A mount-time
 `ComputerUseNativeToolPassthroughUnsupportedError` means the installed `loop-streaming`
 does not yet carry `computer`'s native tool form to the wire on its own — see that
-error's message for the exact commit to upgrade to. A provider that fails its capability
+error's message for the exact commit to upgrade to. A provider that fails its wire
 probe does **not** raise; the hook logs which integration points it tried
-(`_derive_native_tool_betas` for Anthropic's dated types, `_convert_tools_from_request`
-for OpenAI's bare `computer`) and wraps nothing.
+(`_derive_native_tool_betas` for Anthropic's dated types,
+`get_native_computer_tool_spec` for OpenAI's pure bare-`computer` seam, and
+legacy `_convert_tools_from_request` only when `tool_search_mode == "off"`) and
+wraps nothing.
 
 ## Tests
 

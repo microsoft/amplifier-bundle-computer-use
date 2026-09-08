@@ -1,6 +1,4 @@
-"""Unit tests proving `note_model()` is actually wired from hook-computer-use's
-`provider.complete()` wrapper into the mounted `computer` tool (Plan A1,
-`docs/designs/phase2-plans.md`).
+"""Unit tests for provider-native tool selection in hook-computer-use.
 
 `ComputerTool.note_model()` existed with zero callers before this fix - its own
 docstring and a comment in tool-computer-use's `__init__.py` (~line 190) both
@@ -10,10 +8,8 @@ once at mount from `config["model"]` and never corrected, even though the
 exact defect `tool_versions.py` exists to prevent (a model/tool_version
 mismatch 400s *every* request) requires exactly this correction to fire.
 
-These tests FAIL against the pre-fix `_wrap_provider` (no `note_model` call at
-all - `test_wrapped_complete_forwards_request_model_to_note_model_...` is the
-one that demonstrates the gap) and PASS once the wrapped `complete()` forwards
-`request.model` to the mounted `computer` tool's `note_model()`.
+The hook selects a provider's wire dialect before the orchestrator reads the
+mounted tool's native spec, then reselects it for each wrapped request.
 """
 
 from __future__ import annotations
@@ -79,10 +75,75 @@ class _AnthropicProviderNoStream:
         return ["computer-use-2025-11-24"] if tools else []
 
 
+class _OpenAIProviderNoStream:
+    __module__ = "amplifier_module_provider_openai"
+    tool_search_mode = "off"
+
+    def __init__(self, default_model: str | None = None) -> None:
+        self.default_model = default_model
+        self.helper_calls = 0
+
+    async def complete(self, request, **kwargs):
+        return "ok"
+
+    def get_native_computer_tool_spec(self):
+        self.helper_calls += 1
+        return {"type": "computer"}
+
+    def _convert_tools_from_request(self, tools, model_name=None):
+        converted = []
+        for tool in tools:
+            if getattr(tool, "type", None) == "computer":
+                converted.append({"type": "computer"})
+            else:
+                converted.append(
+                    {
+                        "type": "function",
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": tool.parameters,
+                    }
+                )
+        return converted
+
+
+class _OpenAIProviderFunctionFallback(_OpenAIProviderNoStream):
+    """A valid function-tool conversion proves the probe is ToolSpec-shaped."""
+
+    get_native_computer_tool_spec = None
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.probe_fields: list[tuple[str, str, dict, str | None]] = []
+
+    def _convert_tools_from_request(self, tools, model_name=None):
+        self.probe_fields = [
+            (tool.name, tool.description, tool.parameters, getattr(tool, "type", None))
+            for tool in tools
+        ]
+        return [
+            {
+                "type": "function",
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": tool.parameters,
+            }
+            for tool in tools
+        ]
+
+
 class _FakeRequest:
     def __init__(self, model: str | None) -> None:
         self.messages: list = []
         self.model = model
+
+
+class _HookRegistry:
+    def __init__(self) -> None:
+        self.handlers: dict[str, object] = {}
+
+    def register(self, event, handler, **kwargs) -> None:
+        self.handlers[event] = handler
 
 
 class _FakeCoordinator:
@@ -92,17 +153,181 @@ class _FakeCoordinator:
     returns `None`, so `_fail_if_native_tool_passthrough_unsupported`'s
     orchestrator probe finds nothing to probe and skips it."""
 
-    def __init__(self, tools: dict) -> None:
+    def __init__(self, tools: dict, providers: dict | None = None) -> None:
         self._tools = tools
+        self._providers = providers or {}
+        self.hooks = _HookRegistry()
 
     def get(self, mount_point, name=None):
-        if mount_point != "tools":
-            return None
-        return self._tools.get(name) if name else self._tools
+        if mount_point == "tools":
+            return self._tools.get(name) if name else self._tools
+        if mount_point == "providers":
+            return self._providers.get(name) if name else self._providers
+        return None
 
 
 def _run(coro):
+    """Run a coroutine without clearing the suite's current event loop.
+
+    Some later tests use ``asyncio.get_event_loop().run_until_complete(...)``.
+    Unlike ``asyncio.run()``, this leaves that shared compatibility loop
+    available after this file's synchronous tests complete.
+    """
     return asyncio.get_event_loop().run_until_complete(coro)
+
+
+def _mount_and_dispatch_provider_request(
+    coordinator: _FakeCoordinator, provider_name: str
+) -> None:
+    _run(hook_mod.mount(coordinator))
+    handler = coordinator.hooks.handlers[hook_mod.PROVIDER_REQUEST]
+    _run(handler(hook_mod.PROVIDER_REQUEST, {"provider": provider_name}))
+
+
+@pytest.mark.parametrize(
+    "default_model",
+    [
+        "provider-alpha",
+        "provider-beta",
+        "provider-beta-max",
+        "opaque-model-a",
+        "opaque-model-b",
+        "opaque-model-v5.10-a",
+        "opaque-model-v10-b",
+        "opaque-future-model",
+    ],
+)
+def test_provider_request_selects_bare_openai_spec_for_current_and_future_aliases(
+    default_model: str,
+):
+    """The provider behavior, not alias/version parsing, selects bare computer."""
+    computer = _with_resolved_display(ComputerTool(_FakeBackend(), {}))
+    provider = _OpenAIProviderNoStream(default_model)
+    coordinator = _FakeCoordinator({"computer": computer}, {"openai": provider})
+
+    _mount_and_dispatch_provider_request(coordinator, "openai")
+
+    assert computer.native_tool_spec == {"type": "computer"}
+    assert computer.native_beta_header is None
+    assert _run(provider.complete(_FakeRequest("claude-sonnet-4-5-20250929"))) == "ok"
+    assert computer.native_tool_spec == {"type": "computer"}
+
+
+def test_complete_valid_function_fallback_is_a_negative_probe_without_traceback(caplog):
+    provider = _OpenAIProviderFunctionFallback()
+    coordinator = _FakeCoordinator({}, {"openai": provider})
+
+    with caplog.at_level(logging.DEBUG, logger=hook_mod.__name__):
+        _mount_and_dispatch_provider_request(coordinator, "openai")
+
+    assert provider.probe_fields == [
+        (
+            "__computer_use_native_computer_probe__",
+            "native computer-use compatibility probe",
+            {"type": "object", "properties": {}},
+            "computer",
+        )
+    ]
+    assert all(record.exc_info is None for record in caplog.records)
+    assert "Traceback" not in caplog.text
+    assert any(record.levelno == logging.WARNING for record in caplog.records)
+
+
+def test_provider_request_reselects_shared_tool_dialect_and_keeps_anthropic_continuity():
+    computer = _with_resolved_display(ComputerTool(_FakeBackend(), {}))
+    anthropic = _AnthropicProviderNoStream("claude-sonnet-4-5-20250929")
+    openai = _OpenAIProviderNoStream("opaque-future-model")
+    coordinator = _FakeCoordinator(
+        {"computer": computer}, {"anthropic": anthropic, "openai": openai}
+    )
+    _run(hook_mod.mount(coordinator))
+    handler = coordinator.hooks.handlers[hook_mod.PROVIDER_REQUEST]
+
+    _run(handler(hook_mod.PROVIDER_REQUEST, {"provider": "anthropic"}))
+    assert computer.native_tool_spec["type"] == "computer_20250124"
+
+    _run(handler(hook_mod.PROVIDER_REQUEST, {"provider": "anthropic"}))
+    assert computer.native_tool_spec["type"] == "computer_20250124"
+
+    _run(handler(hook_mod.PROVIDER_REQUEST, {"provider": "openai"}))
+    assert computer.native_tool_spec == {"type": "computer"}
+
+    _run(handler(hook_mod.PROVIDER_REQUEST, {"provider": "openai"}))
+    assert computer.native_tool_spec == {"type": "computer"}
+    assert openai.helper_calls == 1
+
+    # The same, already-wrapped provider comes back with an unknown model after
+    # a cross-dialect switch, so it resets to its canonical seed.
+    anthropic.default_model = "opaque-future-model"
+    _run(handler(hook_mod.PROVIDER_REQUEST, {"provider": "anthropic"}))
+    assert computer.native_tool_spec["type"] == "computer_20251124"
+
+    # Once a same-dialect model resolves, an unknown successor keeps it.
+    anthropic.default_model = "claude-sonnet-4-5-20250929"
+    _run(handler(hook_mod.PROVIDER_REQUEST, {"provider": "anthropic"}))
+    assert computer.native_tool_spec["type"] == "computer_20250124"
+    anthropic.default_model = "opaque-future-model"
+    _run(handler(hook_mod.PROVIDER_REQUEST, {"provider": "anthropic"}))
+    assert computer.native_tool_spec["type"] == "computer_20250124"
+
+
+def test_provider_selection_preserves_same_dialect_overrides_and_ignores_cross_dialect(
+    caplog: pytest.LogCaptureFixture,
+):
+    computer = _with_resolved_display(
+        ComputerTool(_FakeBackend(), {"tool_version": "computer_20250124"})
+    )
+    anthropic = _AnthropicProviderNoStream("opaque-future-model")
+    openai = _OpenAIProviderNoStream("opaque-future-model")
+    coordinator = _FakeCoordinator(
+        {"computer": computer}, {"anthropic": anthropic, "openai": openai}
+    )
+    _run(hook_mod.mount(coordinator))
+    handler = coordinator.hooks.handlers[hook_mod.PROVIDER_REQUEST]
+
+    _run(handler(hook_mod.PROVIDER_REQUEST, {"provider": "anthropic"}))
+    assert computer.native_tool_spec["type"] == "computer_20250124"
+    _run(handler(hook_mod.PROVIDER_REQUEST, {"provider": "openai"}))
+    assert computer.native_tool_spec == {"type": "computer"}
+
+    cross_dialect = _with_resolved_display(
+        ComputerTool(_FakeBackend(), {"tool_version": "computer"})
+    )
+    cross_coordinator = _FakeCoordinator(
+        {"computer": cross_dialect}, {"anthropic": anthropic}
+    )
+    _run(hook_mod.mount(cross_coordinator))
+    cross_handler = cross_coordinator.hooks.handlers[hook_mod.PROVIDER_REQUEST]
+    caplog.set_level(logging.INFO, logger="amplifier_module_tool_computer_use")
+    _run(cross_handler(hook_mod.PROVIDER_REQUEST, {"provider": "anthropic"}))
+    _run(cross_handler(hook_mod.PROVIDER_REQUEST, {"provider": "anthropic"}))
+
+    assert cross_dialect.native_tool_spec["type"] == "computer_20251124"
+    assert (
+        sum(
+            "ignoring cross-dialect configured tool_version" in record.message
+            for record in caplog.records
+        )
+        == 1
+    )
+
+
+def test_provider_request_uses_note_model_for_a_legacy_tool_without_selection_api():
+    class _LegacyTool:
+        def __init__(self) -> None:
+            self.models: list[str | None] = []
+
+        def note_model(self, model: str | None) -> None:
+            self.models.append(model)
+
+    legacy_tool = _LegacyTool()
+    provider = _AnthropicProviderNoStream("claude-opus-5")
+    coordinator = _FakeCoordinator({"computer": legacy_tool}, {"anthropic": provider})
+
+    _mount_and_dispatch_provider_request(coordinator, "anthropic")
+    assert legacy_tool.models == ["claude-opus-5"]
+    assert _run(provider.complete(_FakeRequest("claude-sonnet-4-5-20250929"))) == "ok"
+    assert legacy_tool.models == ["claude-opus-5", "claude-sonnet-4-5-20250929"]
 
 
 def test_note_model_is_never_called_without_the_fix_baseline_sanity():

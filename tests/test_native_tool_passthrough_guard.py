@@ -37,12 +37,14 @@ from __future__ import annotations
 import sys
 import types
 from pathlib import Path
+from unittest.mock import MagicMock
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "modules" / "hook-computer-use"))
 
-import amplifier_module_hook_computer_use as hook_mod
-import pytest
+import amplifier_module_hook_computer_use as hook_mod  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Provider-side fakes: Anthropic's dated-type convention
@@ -55,12 +57,17 @@ class _ProviderWithWorkingBetaDerivation:
 
     __module__ = "amplifier_module_provider_anthropic"
 
+    def __init__(self) -> None:
+        self.probed_tools: list[dict[str, str]] | None = None
+
     async def complete(self, request, **kwargs):
         return "ok"
 
     def _derive_native_tool_betas(self, tools):
+        assert all(isinstance(tool, dict) for tool in tools)
+        self.probed_tools = tools
         mapping = {"computer_20251124": "computer-use-2025-11-24"}
-        return [mapping[t["type"]] for t in tools if t.get("type") in mapping]
+        return [mapping[tool["type"]] for tool in tools if tool.get("type") in mapping]
 
 
 class _ProviderPredatingPR79:
@@ -86,6 +93,7 @@ class _ProviderWithBrokenBetaDerivation:
         return "ok"
 
     def _derive_native_tool_betas(self, tools):
+        assert all(isinstance(tool, dict) for tool in tools)
         return []
 
 
@@ -99,6 +107,7 @@ class _ProviderWithWorkingBareComputerConversion:
     """Today's shape: `_convert_tools_from_request` emits `computer` bare."""
 
     __module__ = "amplifier_module_provider_openai"
+    tool_search_mode = "off"
 
     async def complete(self, request, **kwargs):
         return "ok"
@@ -128,68 +137,292 @@ class _ProviderWithBrokenBareComputerConversion:
     function tool instead of emitting it bare - a real, observable bug."""
 
     __module__ = "amplifier_module_provider_openai"
+    tool_search_mode = "off"
 
     async def complete(self, request, **kwargs):
         return "ok"
 
     def _convert_tools_from_request(self, tools, model_name=None):
         return [
-            {"type": "function", "name": getattr(t, "name", "?"), "parameters": {}}
+            {
+                "type": "function",
+                "name": t.name,
+                "description": t.description,
+                "parameters": t.parameters,
+            }
             for t in tools
         ]
 
 
-def test_provider_derives_native_tool_betas_true_for_working_provider():
-    assert (
-        hook_mod._provider_derives_native_tool_betas(
-            _ProviderWithWorkingBetaDerivation()
-        )
-        is True
-    )
+class _LegacyBareComputerConverter:
+    """A pre-seam provider shape that accepts only ToolSpec-style attributes."""
+
+    def __init__(self, mode: object = "off") -> None:
+        self.tool_search_mode = mode
+        self.calls = 0
+        self.probe = None
+
+    def _convert_tools_from_request(self, tools, model_name=None):
+        self.calls += 1
+        self.probe = tools[0]
+        if tools[0].type == "computer":
+            return [{"type": "computer"}]
+        return [{"type": "function", "name": tools[0].name}]
 
 
-def test_provider_derives_native_tool_betas_false_when_method_absent():
+class _LegacyFunctionFallback(_LegacyBareComputerConverter):
+    def _convert_tools_from_request(self, tools, model_name=None):
+        self.calls += 1
+        self.probe = tools[0]
+        return [{"type": "function", "name": tools[0].name}]
+
+
+class _InvalidNativeComputerSpec:
+    tool_search_mode = "off"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def get_native_computer_tool_spec(self):
+        return {"type": "computer", "unexpected": True}
+
+    def _convert_tools_from_request(self, tools, model_name=None):
+        self.calls += 1
+        return [{"type": "computer"}]
+
+
+class _RaisingNativeComputerSpec(_InvalidNativeComputerSpec):
+    def get_native_computer_tool_spec(self):
+        raise RuntimeError("probe failure")
+
+
+class _DictSubclassNativeComputerSpec(_InvalidNativeComputerSpec):
+    def get_native_computer_tool_spec(self):
+        class _BareComputerSpec(dict):
+            pass
+
+        return _BareComputerSpec(type="computer")
+
+
+def test_provider_derives_native_tool_betas_returns_its_canonical_type():
+    provider = _ProviderWithWorkingBetaDerivation()
+
+    assert hook_mod._provider_derives_native_tool_betas(provider) == "computer_20251124"
+    assert provider.probed_tools == [{"type": "computer_20251124", "name": "computer"}]
+
+
+def test_real_anthropic_provider_derives_native_computer_beta():
+    """Optional cross-repo check; standalone bundle CI does not import it."""
+    provider_module = pytest.importorskip("amplifier_module_provider_anthropic")
+    provider_class = getattr(provider_module, "AnthropicProvider", None)
+    if provider_class is None:
+        pytest.skip("requires amplifier-module-provider-anthropic")
+    provider = provider_class(api_key="test", config={})
+
+    assert hook_mod._provider_derives_native_tool_betas(provider) == "computer_20251124"
+
+
+def test_provider_derives_native_tool_betas_returns_none_when_method_absent():
     """A pure capability probe cannot tell "predates the fix" apart from "wrong
     vendor entirely" - both simply lack the integration point. See module
     docstring for why that is an accepted, honest trade-off of removing the
     module-name check."""
     assert (
-        hook_mod._provider_derives_native_tool_betas(_ProviderPredatingPR79()) is False
+        hook_mod._provider_derives_native_tool_betas(_ProviderPredatingPR79()) is None
     )
 
 
-def test_provider_derives_native_tool_betas_false_when_broken():
+def test_provider_derives_native_tool_betas_returns_none_when_broken():
     assert (
         hook_mod._provider_derives_native_tool_betas(
             _ProviderWithBrokenBetaDerivation()
         )
-        is False
+        is None
     )
 
 
-def test_provider_recognizes_bare_computer_tool_true_for_working_provider():
+def test_provider_recognizes_bare_computer_tool_returns_its_canonical_type():
     assert (
         hook_mod._provider_recognizes_bare_computer_tool(
             _ProviderWithWorkingBareComputerConversion()
         )
-        is True
+        == "computer"
     )
 
 
-def test_provider_recognizes_bare_computer_tool_false_when_method_absent():
+def test_provider_recognizes_bare_computer_tool_returns_none_when_method_absent():
     assert (
         hook_mod._provider_recognizes_bare_computer_tool(_ProviderPredatingPR58())
-        is False
+        is None
     )
 
 
-def test_provider_recognizes_bare_computer_tool_false_when_broken():
-    assert (
-        hook_mod._provider_recognizes_bare_computer_tool(
+def test_provider_recognizes_bare_computer_tool_returns_none_when_broken(caplog):
+    with caplog.at_level("DEBUG", logger=hook_mod.__name__):
+        result = hook_mod._provider_recognizes_bare_computer_tool(
             _ProviderWithBrokenBareComputerConversion()
         )
-        is False
+
+    assert result is None
+    assert all(record.exc_info is None for record in caplog.records)
+    assert "Traceback" not in caplog.text
+
+
+def test_legacy_converter_probe_is_attribute_only_and_schema_complete():
+    provider = _LegacyBareComputerConverter()
+
+    assert hook_mod._provider_recognizes_bare_computer_tool(provider) == "computer"
+    assert provider.calls == 1
+    assert not isinstance(provider.probe, dict)
+    assert provider.probe.name == "__computer_use_native_computer_probe__"
+    assert provider.probe.description == "native computer-use compatibility probe"
+    assert provider.probe.type == "computer"
+    assert provider.probe.parameters == {"type": "object", "properties": {}}
+    assert provider.probe.input_schema == {"type": "object", "properties": {}}
+
+
+def test_legacy_converter_probe_schema_is_fresh_for_each_probe():
+    first = hook_mod._NativeComputerToolProbe("computer")
+    second = hook_mod._NativeComputerToolProbe("computer")
+
+    first.parameters["properties"]["mutated"] = {"type": "string"}
+
+    assert second.parameters == {"type": "object", "properties": {}}
+    assert first.input_schema is first.parameters
+    assert second.input_schema is second.parameters
+
+
+def test_legacy_function_fallback_is_negative_without_traceback(caplog):
+    provider = _LegacyFunctionFallback()
+
+    with caplog.at_level("DEBUG", logger=hook_mod.__name__):
+        result = hook_mod._provider_recognizes_bare_computer_tool(provider)
+
+    assert result is None
+    assert provider.calls == 1
+    assert all(record.exc_info is None for record in caplog.records)
+    assert "Traceback" not in caplog.text
+
+
+@pytest.mark.parametrize("mode", [None, "namespaced", "unknown"])
+def test_legacy_converter_is_not_called_without_explicit_off_mode(mode, caplog):
+    provider = _LegacyBareComputerConverter(mode)
+    if mode is None:
+        del provider.tool_search_mode
+
+    with caplog.at_level("DEBUG", logger=hook_mod.__name__):
+        result = hook_mod._provider_recognizes_bare_computer_tool(provider)
+
+    assert result is None
+    assert provider.calls == 0
+    assert all(record.exc_info is None for record in caplog.records)
+    assert "Traceback" not in caplog.text
+
+
+def test_invalid_or_raising_seam_uses_safe_legacy_converter_only(caplog):
+    invalid = _InvalidNativeComputerSpec()
+    raising = _RaisingNativeComputerSpec()
+
+    with caplog.at_level("DEBUG", logger=hook_mod.__name__):
+        assert hook_mod._provider_recognizes_bare_computer_tool(invalid) == "computer"
+        assert hook_mod._provider_recognizes_bare_computer_tool(raising) == "computer"
+
+    assert invalid.calls == raising.calls == 1
+    assert all(record.exc_info is None for record in caplog.records)
+    assert "Traceback" not in caplog.text
+
+
+def test_helper_accepts_only_an_exact_bare_dict_before_safe_legacy_fallback(caplog):
+    provider = _DictSubclassNativeComputerSpec()
+
+    with caplog.at_level("DEBUG", logger=hook_mod.__name__):
+        assert hook_mod._provider_recognizes_bare_computer_tool(provider) == "computer"
+
+    assert provider.calls == 1
+    assert all(record.exc_info is None for record in caplog.records)
+    assert "Traceback" not in caplog.text
+
+
+def test_native_dialect_probe_is_cached_per_provider_instance():
+    provider = _LegacyBareComputerConverter()
+
+    assert hook_mod._provider_supports_native_computer_tool(provider) == "computer"
+    assert hook_mod._provider_supports_native_computer_tool(provider) == "computer"
+    assert provider.calls == 1
+
+
+def test_real_namespaced_openai_provider_uses_pure_seam_without_state_mutation():
+    """Optional cross-repo check; standalone bundle CI does not import it."""
+    provider_module = pytest.importorskip("amplifier_module_provider_openai")
+    provider_class = getattr(provider_module, "OpenAIProvider", None)
+    if provider_class is None:
+        pytest.skip("requires amplifier-module-provider-openai")
+    coordinator = MagicMock()
+    coordinator.get_capability.return_value = None
+    provider = provider_class(
+        api_key="test-key",
+        config={"tool_search": {"mode": "namespaced"}},
+        coordinator=coordinator,
     )
+    state_before = (
+        provider._tool_search_roster,
+        dict(provider._tool_search_extra),
+        provider._pending_additional_tools_item,
+        provider._apply_patch_native,
+    )
+    provider._convert_tools_from_request = MagicMock(
+        side_effect=AssertionError("pure seam must not call converter")
+    )
+    provider.get_native_computer_tool_spec = MagicMock(
+        wraps=provider.get_native_computer_tool_spec
+    )
+
+    assert hook_mod._provider_supports_native_computer_tool(provider) == "computer"
+    assert hook_mod._provider_supports_native_computer_tool(provider) == "computer"
+    assert (
+        provider._tool_search_roster,
+        provider._tool_search_extra,
+        provider._pending_additional_tools_item,
+        provider._apply_patch_native,
+    ) == state_before
+    provider._convert_tools_from_request.assert_not_called()
+    provider.get_native_computer_tool_spec.assert_called_once_with()
+
+
+@pytest.mark.parametrize(
+    "native_tool_spec",
+    [
+        {"type": "computer"},
+        {
+            "type": "computer_20251124",
+            "name": "computer",
+            "display_width_px": 1280,
+            "display_height_px": 720,
+        },
+    ],
+)
+def test_real_loop_build_tool_spec_preserves_both_computer_dialects(
+    native_tool_spec: dict[str, object],
+):
+    """Exercise loop-streaming's actual builder, not this file's stub."""
+    loop_module = pytest.importorskip("amplifier_module_loop_streaming")
+    build_tool_spec = getattr(loop_module, "_build_tool_spec", None)
+    if not callable(build_tool_spec):
+        pytest.skip("requires amplifier-module-loop-streaming")
+
+    class _NativeComputerTool:
+        name = "computer"
+        description = "native computer tool"
+        input_schema = {"type": "object", "properties": {}}
+
+        @property
+        def native_tool_spec(self) -> dict[str, object]:
+            return native_tool_spec
+
+    emitted = build_tool_spec(_NativeComputerTool()).model_dump()
+
+    for key, value in native_tool_spec.items():
+        assert emitted[key] == value
 
 
 # ---------------------------------------------------------------------------
@@ -197,25 +430,25 @@ def test_provider_recognizes_bare_computer_tool_false_when_broken():
 # ---------------------------------------------------------------------------
 
 
-def test_provider_supports_native_computer_tool_true_for_anthropic_shape():
+def test_provider_supports_native_computer_tool_selects_anthropic_type():
     assert (
         hook_mod._provider_supports_native_computer_tool(
-            _ProviderWithWorkingBetaDerivation(), "computer_20251124"
+            _ProviderWithWorkingBetaDerivation()
         )
-        is True
+        == "computer_20251124"
     )
 
 
-def test_provider_supports_native_computer_tool_true_for_openai_shape():
+def test_provider_supports_native_computer_tool_selects_openai_type():
     assert (
         hook_mod._provider_supports_native_computer_tool(
-            _ProviderWithWorkingBareComputerConversion(), "computer"
+            _ProviderWithWorkingBareComputerConversion()
         )
-        is True
+        == "computer"
     )
 
 
-def test_provider_supports_native_computer_tool_false_for_neither_shape():
+def test_provider_supports_native_computer_tool_returns_none_for_neither_shape():
     class _TotallyUnrelatedProvider:
         __module__ = "some_other_vendor.provider"
 
@@ -223,28 +456,8 @@ def test_provider_supports_native_computer_tool_false_for_neither_shape():
             return "ok"
 
     assert (
-        hook_mod._provider_supports_native_computer_tool(
-            _TotallyUnrelatedProvider(), "computer_20251124"
-        )
-        is False
-    )
-
-
-def test_provider_supports_native_computer_tool_false_when_type_mismatched():
-    """A real Anthropic-shaped provider asked about OpenAI's bare type (or vice
-    versa) correctly reports no support - the probe is honest about which
-    exact type it verified, never conflating the two conventions."""
-    assert (
-        hook_mod._provider_supports_native_computer_tool(
-            _ProviderWithWorkingBetaDerivation(), "computer"
-        )
-        is False
-    )
-    assert (
-        hook_mod._provider_supports_native_computer_tool(
-            _ProviderWithWorkingBareComputerConversion(), "computer_20251124"
-        )
-        is False
+        hook_mod._provider_supports_native_computer_tool(_TotallyUnrelatedProvider())
+        is None
     )
 
 
@@ -475,9 +688,11 @@ def test_capability_probe_rejection_is_operator_actionable(caplog):
     records = [r for r in caplog.records if r.levelname == "WARNING"]
     assert records, "capability-probe rejection must be visible at WARNING, not INFO"
     message = records[0].getMessage()
-    assert "does not carry native tool type" not in message  # old, INFO-only wording
-    assert "NOT enabled" in message
-    assert "what to do" in message.lower()
+    assert "native computer use is disabled" in message.lower()
+    assert "_derive_native_tool_betas" in message
+    assert "get_native_computer_tool_spec" in message
+    assert "_convert_tools_from_request" in message
+    assert "tool_search_mode='off'" in message
 
 
 def test_wrap_provider_wraps_openai_shaped_provider():
@@ -485,103 +700,12 @@ def test_wrap_provider_wraps_openai_shaped_provider():
     provider with working bare-computer-tool passthrough gets wrapped, exactly
     like an Anthropic-shaped one already does elsewhere in this suite.
 
-    Registers a fake `computer` tool declaring the bare `"computer"` type -
-    `_resolve_native_tool_type` reads that real, mounted type rather than
-    falling back to the Anthropic-shaped default, so the probe checks
-    against the type this session actually declares."""
-    coord = _FakeCoordinatorWithOrchestrator(orchestrator=None, tool_type="computer")
+    The provider probe chooses its own bare canonical type, independent of
+    any mounted tool state."""
+    coord = _FakeCoordinatorWithOrchestrator(orchestrator=None)
     provider = _ProviderWithWorkingBareComputerConversion()
 
     wrapped = hook_mod._wrap_provider(provider, coord, max_inline=3)
 
     assert wrapped is True
     assert getattr(provider, hook_mod._WRAPPED_FLAG, False) is True
-
-
-# ---------------------------------------------------------------------------
-# _resolve_native_tool_type: read the fact, do not infer it from the artifact
-# ---------------------------------------------------------------------------
-
-
-class _CoordinatorWithTool:
-    def __init__(self, tool) -> None:
-        self._tool = tool
-
-    def get(self, mount_point, name=None):
-        return self._tool if (mount_point, name) == ("tools", "computer") else None
-
-
-def test_resolve_native_tool_type_prefers_the_tools_own_statement():
-    """`native_tool_type` is the tool STATING which type it is declaring.
-    `native_tool_spec["type"]` is that same fact INFERRED from a vendor-shaped
-    wire dict. When both exist the stated one wins - it is the authority, and
-    the wire dict is only ever a projection of it."""
-
-    class _StatesAndDeclares:
-        @property
-        def native_tool_type(self) -> str:
-            return "computer_20250124"
-
-        @property
-        def native_tool_spec(self) -> dict:
-            return {"type": "computer_20250124", "name": "computer"}
-
-    assert (
-        hook_mod._resolve_native_tool_type(_CoordinatorWithTool(_StatesAndDeclares()))
-        == "computer_20250124"
-    )
-
-
-def test_resolve_native_tool_type_falls_back_to_the_wire_type_when_not_stated():
-    """Unchanged behaviour for anything mounted under `computer` that predates
-    `native_tool_type` - including this file's own `_FakeComputerTool`."""
-    coord = _CoordinatorWithTool(_FakeComputerTool("computer"))
-    assert hook_mod._resolve_native_tool_type(coord) == "computer"
-
-
-def test_resolve_native_tool_type_answers_for_a_declaration_with_no_wire_type():
-    """THE GAP THIS CLOSES. A vendor whose declaration is discriminated by its
-    own key has no top-level `type`, so the old inference returned `None` and
-    this function fell through to `_DEFAULT_PROBE_TOOL_TYPE` - a DIFFERENT
-    vendor's type - and then probed the mounted provider for the wrong wire
-    convention, silently. Reading the stated fact answers correctly without
-    this module knowing any wire format, and without importing anything (it
-    declares `dependencies = []`)."""
-
-    class _NoWireType:
-        @property
-        def native_tool_type(self) -> str:
-            return "some_vendor_tool"
-
-        @property
-        def native_tool_spec(self) -> dict:
-            return {"some_vendor_tool": {"environment": "DESKTOP"}}
-
-    resolved = hook_mod._resolve_native_tool_type(_CoordinatorWithTool(_NoWireType()))
-    assert resolved == "some_vendor_tool"
-    assert resolved != hook_mod._DEFAULT_PROBE_TOOL_TYPE
-
-
-def test_resolve_native_tool_type_survives_a_raising_stated_type():
-    """Both sources are properties, and a property that raises must not take
-    down the request path (the D3 class of bug). A raising `native_tool_type`
-    logs and falls through to the wire type rather than propagating."""
-
-    class _RaisesThenDeclares:
-        @property
-        def native_tool_type(self) -> str:
-            raise RuntimeError("boom")
-
-        @property
-        def native_tool_spec(self) -> dict:
-            return {"type": "computer_20241022"}
-
-    coord = _CoordinatorWithTool(_RaisesThenDeclares())
-    assert hook_mod._resolve_native_tool_type(coord) == "computer_20241022"
-
-
-def test_resolve_native_tool_type_falls_back_when_nothing_is_mounted():
-    assert (
-        hook_mod._resolve_native_tool_type(_CoordinatorWithTool(None))
-        == hook_mod._DEFAULT_PROBE_TOOL_TYPE
-    )

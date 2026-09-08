@@ -8,7 +8,7 @@ that live outside this repository:
 | # | What you must get right | Fails how |
 |---|---|---|
 | 1 | **Upstream module versions** — `loop-streaming`, `provider-anthropic` / `provider-openai` | Bundle refuses to mount, or silently degrades to a weaker function tool |
-| 2 | **A model that supports native computer use** | Provider reports no capability; the tool is dead weight |
+| 2 | **An endpoint that accepts native computer use** | Server rejects the request |
 | 3 | **A target machine, and its per-platform prerequisites** — Windows **requires WSL2**; macOS requires **two** TCC grants; Linux requires **X11** (not Wayland) | Backend probe fails and tools never appear — or, on macOS and Linux, they appear and fail on first use |
 | 4 | **For remote targets: SSH, key auth, and `uv` on the far end** | Connect-time error (missing `uv`, untrusted host key, no key-based auth) |
 
@@ -60,7 +60,7 @@ bundle (`bundle.md` at the repo root, name `computer-use`), so the standard
    doesn't, registration itself failed and nothing below this point will work either.
 
 That's registration. It does **not** mean the tools will work yet — that depends on the
-four moving parts below (module versions, model capability, a reachable target machine,
+four moving parts below (module versions, endpoint support, a reachable target machine,
 and, for remote targets, SSH). Read on for those.
 
 ---
@@ -101,11 +101,14 @@ shallow clone may not have one. `hook-computer-use` drives the actually-installe
 with throwaway probes and reads the real output:
 
 - `_provider_derives_native_tool_betas` — calls the provider's own
-  `_derive_native_tool_betas([{"type": "computer_20251124"}])` and checks the returned
-  betas mention computer-use. (Anthropic convention.)
-- `_provider_recognizes_bare_computer_tool` — calls the provider's own
-  `_convert_tools_from_request(...)` and checks the emitted dict is *exactly*
-  `[{"type": "computer"}]` and nothing else. (OpenAI convention.)
+  `_derive_native_tool_betas([{"type": "computer_20251124", "name": "computer"}])`
+  and checks the returned betas mention computer-use. (Anthropic convention.)
+- `_provider_recognizes_bare_computer_tool` — first calls OpenAI's pure,
+  argument-free `get_native_computer_tool_spec()` seam and accepts only an
+  exact `{"type": "computer"}` result. For a legacy provider without a usable
+  seam, it calls `_convert_tools_from_request(...)` only when that provider
+  explicitly reports `tool_search_mode == "off"`; namespaced conversion is
+  stateful and is never probed. (OpenAI convention.)
 - `_orchestrator_preserves_native_tool_spec` — drives loop-streaming's own
   `_build_tool_spec()` against a stub and checks the native `type` survives.
 
@@ -121,28 +124,17 @@ it is.
 
 ---
 
-## 2. The model must support native computer use
+## 2. The endpoint must support native computer use
 
-A model without the capability cannot use this bundle. Both providers now gate on
-`ModelCapabilities.supports_native_computer_use`.
+The hook verifies only wire plumbing, not endpoint availability. It selects Anthropic's
+dated tool dialect when beta derivation recognizes its canonical probe and OpenAI's bare
+`computer` dialect when conversion preserves its canonical probe. No alias or version
+table is a capability gate; the server remains authoritative for acceptance.
 
 ### OpenAI
 
-Rule, from `_capabilities.py` (empirical, live-API basis 2026-08-03):
-
-```
-supports_computer_use = minor >= 4 and "-nano" not in model_id
-```
-
-| Model | Supported |
-|---|---|
-| `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.4-pro` | Yes |
-| `gpt-5.5`, `gpt-5.5-pro`, `gpt-5.6` | Yes |
-| `gpt-5.4-nano` | **No** — size gates this tool, not just version |
-| anything below `gpt-5.4` | No |
-
-Note this is the inverse distribution from `supports_native_apply_patch`, where size made
-no difference. Do not reason across from one to the other.
+The converter's successful bare `computer` probe selects the dialect for every alias or
+future model identifier. It does not predict which identifiers the server will accept.
 
 ### Anthropic
 

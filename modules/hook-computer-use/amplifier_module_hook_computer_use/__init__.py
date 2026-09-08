@@ -155,26 +155,34 @@ class ComputerUseNativeToolPassthroughUnsupportedError(RuntimeError):
     """
 
 
-#: Representative native `computer` tool type strings, used as the fallback
-#: probe value when no real, mounted `computer` tool is available to ask
-#: (see `_resolve_native_tool_type`). Picking this as a *default* is
-#: arbitrary; picking the tool's own, currently-resolved `_tool_version`
-#: (when available) never is - see that function's docstring.
-_DEFAULT_PROBE_TOOL_TYPE = "computer_20251124"
+_ANTHROPIC_PROBE_TOOL_TYPE = "computer_20251124"
+_OPENAI_PROBE_TOOL_TYPE = "computer"
+_NATIVE_COMPUTER_DIALECT_CACHE_ATTR = "_amplifier_computer_use_native_computer_dialect"
+_NATIVE_COMPUTER_DIALECT_UNRESOLVED = object()
 
 
-def _provider_derives_native_tool_betas(
-    provider: Any, tool_type: str = _DEFAULT_PROBE_TOOL_TYPE
-) -> bool:
+class _NativeComputerToolProbe:
+    """Attribute-only, schema-complete stand-in for a native ToolSpec."""
+
+    name = "__computer_use_native_computer_probe__"
+    description = "native computer-use compatibility probe"
+
+    def __init__(self, tool_type: str) -> None:
+        self.type = tool_type
+        self.parameters: dict[str, Any] = {"type": "object", "properties": {}}
+        self.input_schema = self.parameters
+
+
+def _provider_derives_native_tool_betas(provider: Any) -> str | None:
     """Real capability probe for Anthropic's wire convention: does `provider`
     self-derive the `anthropic-beta` header required to opt `tool_type` into
     native tool_use (amplifier-module-provider-anthropic PR #79)?
 
     Drives the provider's own `_derive_native_tool_betas()` (if present) with
-    a throwaway `{"type": tool_type}` tool list and checks that the returned
-    beta header actually mentions computer-use - never trusts the provider's
+    a throwaway native tool dict and checks that the returned beta header
+    actually mentions computer-use - never trusts the provider's
     class name or module path to answer this. A provider with no such method,
-    or one that does not recognise `tool_type`, returns `False` here exactly
+    or one that does not recognise that type, returns `None` here exactly
     like a provider that was never Anthropic-shaped at all: this probe has no
     way to tell those two apart, and does not claim to (see
     `_provider_supports_native_computer_tool`'s docstring for why that is an
@@ -182,21 +190,29 @@ def _provider_derives_native_tool_betas(
     """
     derive = getattr(provider, "_derive_native_tool_betas", None)
     if not callable(derive):
-        return False
+        logger.debug(
+            "computer-use: provider %s has no _derive_native_tool_betas integration",
+            type(provider).__name__,
+        )
+        return None
     try:
-        betas = derive([{"type": tool_type}])
+        betas = derive([{"type": _ANTHROPIC_PROBE_TOOL_TYPE, "name": "computer"}])
     except Exception:
-        logger.exception(
+        logger.debug(
             "computer-use: _derive_native_tool_betas probe raised on %s",
             type(provider).__name__,
         )
-        return False
-    return isinstance(betas, list) and any("computer-use" in str(b) for b in betas)
+        return None
+    if isinstance(betas, list) and any("computer-use" in str(beta) for beta in betas):
+        return _ANTHROPIC_PROBE_TOOL_TYPE
+    logger.debug(
+        "computer-use: provider %s did not derive a computer-use beta",
+        type(provider).__name__,
+    )
+    return None
 
 
-def _provider_recognizes_bare_computer_tool(
-    provider: Any, tool_type: str = "computer"
-) -> bool:
+def _provider_recognizes_bare_computer_tool(provider: Any) -> str | None:
     """Real capability probe for OpenAI's wire convention: does `provider`
     place a native `computer` tool declaration on the wire completely bare -
     no `name`/`description`/`parameters` - rather than falling through to its
@@ -209,29 +225,77 @@ def _provider_recognizes_bare_computer_tool(
     here is not a weaker-but-working tool the way it can be with Anthropic -
     it is a hard, immediate request failure, which makes this probe's job
     slightly different in kind from `_provider_derives_native_tool_betas`:
-    it exercises the provider's own `_convert_tools_from_request()` (if
-    present) against a stub carrying exactly the `.type`/`.name` shape
-    amplifier-module-loop-streaming's `_build_tool_spec` produces for a tool's
-    `native_tool_spec`, and checks the emitted tool dict is the bare form and
-    nothing else - never trusts a class name or module path.
+    It first asks the optional, argument-free
+    `get_native_computer_tool_spec()` serialization seam. Only an exact
+    `{"type": "computer"}` answer is accepted. Legacy providers without a
+    usable seam may be probed through `_convert_tools_from_request()`, but only
+    while they explicitly report `tool_search_mode == "off"`: newer
+    namespaced conversion records roster and pending-tool state, so probing it
+    is not observationally safe.
     """
-    convert = getattr(provider, "_convert_tools_from_request", None)
-    if not callable(convert):
-        return False
-
-    class _NativeComputerToolProbe:
-        name = "__computer_use_native_computer_probe__"
-        type = tool_type
+    try:
+        get_spec = getattr(provider, "get_native_computer_tool_spec", None)
+    except Exception:
+        logger.debug(
+            "computer-use: get_native_computer_tool_spec was unreadable on %s",
+            type(provider).__name__,
+        )
+        get_spec = None
+    if callable(get_spec):
+        try:
+            spec = get_spec()
+            if type(spec) is dict and spec == {"type": _OPENAI_PROBE_TOOL_TYPE}:
+                return _OPENAI_PROBE_TOOL_TYPE
+        except Exception:
+            logger.debug(
+                "computer-use: get_native_computer_tool_spec probe raised on %s",
+                type(provider).__name__,
+            )
+        else:
+            logger.debug(
+                "computer-use: provider %s did not return the exact bare computer spec",
+                type(provider).__name__,
+            )
 
     try:
-        converted = convert([_NativeComputerToolProbe()])
+        legacy_converter_is_safe = getattr(provider, "tool_search_mode", None) == "off"
     except Exception:
-        logger.exception(
+        logger.debug(
+            "computer-use: provider %s did not expose a readable tool_search_mode",
+            type(provider).__name__,
+        )
+        return None
+    if not legacy_converter_is_safe:
+        logger.debug(
+            "computer-use: not probing legacy bare-computer conversion on %s "
+            "without tool_search_mode='off'",
+            type(provider).__name__,
+        )
+        return None
+
+    convert = getattr(provider, "_convert_tools_from_request", None)
+    if not callable(convert):
+        logger.debug(
+            "computer-use: provider %s has no _convert_tools_from_request integration",
+            type(provider).__name__,
+        )
+        return None
+
+    try:
+        converted = convert([_NativeComputerToolProbe(_OPENAI_PROBE_TOOL_TYPE)])
+    except Exception:
+        logger.debug(
             "computer-use: bare-computer-tool probe raised on %s",
             type(provider).__name__,
         )
-        return False
-    return converted == [{"type": tool_type}]
+        return None
+    if converted == [{"type": _OPENAI_PROBE_TOOL_TYPE}]:
+        return _OPENAI_PROBE_TOOL_TYPE
+    logger.debug(
+        "computer-use: provider %s did not preserve a bare computer tool",
+        type(provider).__name__,
+    )
+    return None
 
 
 #: Every known way an Amplifier provider module can prove it will carry a
@@ -254,7 +318,8 @@ _NATIVE_WIRE_PROBES: tuple[tuple[str, Any], ...] = (
         _provider_derives_native_tool_betas,
     ),
     (
-        "_convert_tools_from_request (bare `computer` type)",
+        "get_native_computer_tool_spec (bare `computer`; legacy "
+        "_convert_tools_from_request only when tool_search_mode='off')",
         _provider_recognizes_bare_computer_tool,
     ),
 )
@@ -264,9 +329,7 @@ def _native_wire_probe_names() -> str:
     return "; ".join(label for label, _ in _NATIVE_WIRE_PROBES)
 
 
-def _provider_supports_native_computer_tool(
-    provider: Any, tool_type: str = _DEFAULT_PROBE_TOOL_TYPE
-) -> bool:
+def _provider_supports_native_computer_tool(provider: Any) -> str | None:
     """Replaces the old `_is_anthropic()` module-name sniff as the gate for
     whether `_wrap_provider` even attempts to wrap `provider`.
 
@@ -274,10 +337,9 @@ def _provider_supports_native_computer_tool(
     nothing about what the object actually *does* - and the moment a second
     vendor (OpenAI) shipped its OWN, differently-shaped native `computer`
     tool support, "not named anthropic" stopped meaning "not compatible".
-    This checks the only thing that actually matters: will `provider` place
-    `tool_type` on the wire as a genuine native tool, or silently degrade it
-    to an ordinary function tool? Two real, independent, behavioural probes,
-    either of which is sufficient - see their docstrings:
+    This checks the only thing that actually matters: which native `computer`
+    type will `provider` place on the wire? Two real, independent behavioural
+    probes each supply their own canonical dialect seed - see their docstrings:
 
       * `_provider_derives_native_tool_betas` - Anthropic's dated
         `computer_YYYYMMDD` convention.
@@ -290,8 +352,8 @@ def _provider_supports_native_computer_tool(
     the exact fix being probed for" - both look identical from the outside
     (the integration point this probe drives simply does not exist yet). A
     module-name check could have told those apart by trusting a claimed
-    identity; a real capability check, by construction, cannot - it only
-    reports what the code in front of it actually does. `False` here means
+    identity; a real behavioural check, by construction, cannot - it only
+    reports what the code in front of it actually does. `None` here means
     "wrap nothing, log why, move on" (see `_wrap_provider`), not a raised
     error - the loud failure this bundle still guarantees is reserved for a
     provider that DOES demonstrate a working integration point but computes
@@ -300,98 +362,36 @@ def _provider_supports_native_computer_tool(
     `_fail_if_orchestrator_native_tool_spec_unsupported`, which does not have
     this ambiguity (see that function's docstring).
     """
+    try:
+        cached = getattr(
+            provider,
+            _NATIVE_COMPUTER_DIALECT_CACHE_ATTR,
+            _NATIVE_COMPUTER_DIALECT_UNRESOLVED,
+        )
+    except Exception:
+        cached = _NATIVE_COMPUTER_DIALECT_UNRESOLVED
+    if cached is None or isinstance(cached, str):
+        return cached
+
+    native_tool_type = None
     for label, probe in _NATIVE_WIRE_PROBES:
-        if probe(provider, tool_type):
+        if native_tool_type := probe(provider):
             logger.debug(
                 "computer-use: provider %s carries native tool type %r "
                 "(confirmed by %s)",
                 type(provider).__name__,
-                tool_type,
+                native_tool_type,
                 label,
             )
-            return True
-    return False
-
-
-def _resolve_native_tool_type(coordinator: Any) -> str:
-    """The native tool type the mounted `computer` tool is actually about to
-    declare this turn - never guessed from provider identity or hardcoded to
-    one vendor's convention.
-
-    Two sources, in this order, and the order is the whole point:
-
-    1. `tool.native_tool_type` - the tool STATING the fact. Preferred, because
-       "which tool type am I declaring" is a vendor-neutral question and the
-       tool is the only thing that actually knows the answer.
-    2. `tool.native_tool_spec["type"]` - the fact INFERRED from the vendor's
-       wire declaration. Kept for any `computer`-named tool that predates (1),
-       including this suite's own fakes.
-
-    Source 2 was the only source, and it is structurally unable to answer for a
-    vendor that does not put its type under a key called `type`. Not every one
-    does: a declaration can be discriminated by its own vendor key, in which
-    case `native.get("type")` is `None` and this function used to fall through
-    to `_DEFAULT_PROBE_TOOL_TYPE` - ANOTHER VENDOR'S type - and then probe the
-    mounted provider for the wrong wire convention entirely, silently. That is
-    not a fallback, it is a wrong answer wearing a fallback's clothes.
-
-    The fix is deliberately NOT "teach this module the wire formats". Those
-    live in `tool-computer-use`'s `providers.py`, and this module declares
-    `dependencies = []` and installs standalone, so it cannot import that table
-    - and a soft `try/except ImportError` around it would be exactly the silent
-    degradation this bundle exists to prevent. Nothing here needs to know a
-    wire format anyway; it needs one string. So the tool hands it over, by the
-    same duck-typed attribute read this function already does for
-    `native_tool_spec`. No import, no dependency, no inference.
-
-    `_DEFAULT_PROBE_TOOL_TYPE` remains for the case where there is genuinely no
-    answer to read: `computer` is not mounted this session (lookup fails,
-    returns `None`, or - in unit tests - a fake coordinator never registers
-    one), or the mounted object exposes neither source. That fallback is not a
-    guess about which vendor is in play; it is the same representative value
-    this module used before per-tool-type resolution existed, kept so a
-    provider capability probe run with no tool context still means something
-    (see the direct `_provider_supports_native_computer_tool`/
-    `_provider_derives_native_tool_betas` calls in this module's test suite).
-    """
-    tool = None
+            break
     try:
-        tool = coordinator.get("tools", "computer")
+        setattr(provider, _NATIVE_COMPUTER_DIALECT_CACHE_ATTR, native_tool_type)
     except Exception:
-        logger.debug("computer-use: 'computer' tool lookup failed", exc_info=True)
-    if tool is None:
-        return _DEFAULT_PROBE_TOOL_TYPE
-
-    # Class-level descriptor check, never `hasattr` on the instance: both of
-    # these are properties, and `hasattr` swallows only `AttributeError`, so a
-    # property raising anything else escapes a guard written to contain it.
-    # That exact bug (D3) took down every request on this path once already.
-    if getattr(type(tool), "native_tool_type", None) is not None:
-        try:
-            stated = tool.native_tool_type
-        except Exception:
-            logger.exception(
-                "computer-use: reading native_tool_type from the mounted "
-                "'computer' tool raised"
-            )
-        else:
-            if isinstance(stated, str) and stated:
-                return stated
-
-    if getattr(type(tool), "native_tool_spec", None) is not None:
-        try:
-            native = tool.native_tool_spec
-        except Exception:
-            logger.exception(
-                "computer-use: reading native_tool_spec from the mounted "
-                "'computer' tool raised"
-            )
-        else:
-            if isinstance(native, dict):
-                resolved = native.get("type")
-                if isinstance(resolved, str) and resolved:
-                    return resolved
-    return _DEFAULT_PROBE_TOOL_TYPE
+        logger.debug(
+            "computer-use: could not cache native computer dialect on %s",
+            type(provider).__name__,
+        )
+    return native_tool_type
 
 
 def _is_loop_streaming(orchestrator: Any) -> bool:
@@ -648,61 +648,31 @@ def _expand_tool_results(messages: list[Any], max_inline: int) -> list[Any]:
     return rewritten
 
 
-def _note_model_on_computer_tool(coordinator: Any, model: str | None) -> None:
-    """Forward the model about to receive a request to the mounted `computer`
-    tool's `note_model()`, so `ComputerTool._tool_version` never drifts out of
-    sync with the model actually in use (see `tool_versions.py`).
+def _select_provider_native_tool_type_on_computer_tool(
+    coordinator: Any, native_tool_type: str, model: str | None
+) -> None:
+    """Prime the mounted tool for a provider-selected native dialect.
 
-    This is Plan A1 (`docs/designs/phase2-plans.md`): `note_model()` existed with
-    zero callers - both its own docstring and a comment in tool-computer-use's
-    `__init__.py` asserted hook-computer-use already called it on every
-    `provider:request`. It never did. `request` (a `ChatRequest`) is one seam:
-    its `model` field is the standard, documented per-request model override
-    (`amplifier_core.message_models.ChatRequest.model`) - the same field a model
-    override, a role fallback, or a routing-matrix substitution would set before
-    this request reaches the wire. In today's default loop-streaming flow this
-    field is commonly `None` (no per-request override in play).
-
-    Issue #1 fixed two compounding gaps in how this gets called:
-
-    1. **Blind when `request.model` is `None`.** `_wrap_provider` now resolves
-       `getattr(request, "model", None) or getattr(provider, "default_model",
-       None)` before calling this - the provider's own configured model is the
-       fact actually in play whenever no per-request override exists, and
-       `request.model` alone left the corrector permanently blind for every
-       session that never sets an override (the common case).
-    2. **One turn late for a short-lived session.** `_wrap_provider` ALSO calls
-       this once, at wrap time (mount-priming), from `provider.default_model` -
-       BEFORE the orchestrator's first `native_tool_spec` read for this
-       session. `note_model` corrects `_tool_version` for the *next* read, not
-       retroactively; a long-lived parent survives being one turn behind, but
-       a short-lived sub-agent's first request is also its only one. Priming
-       at wrap time (which runs once per provider instance, before any
-       request) means the FIRST read is already correct.
-
-    Regardless of which call site invokes it, `note_model` already handles an
-    unresolvable model correctly by keeping whatever tool_version was
-    previously resolved, per `tool_versions.resolve_tool_version`'s own
-    "unknown/unset model keeps previous" rule - so calling this unconditionally,
-    from either call site, is always safe, never just a no-op wart.
-
-    Same defensive lookup shape `_make_gate_handler`/`_make_halt_notice_handler`
-    already use below (`coordinator.get("tools", "computer")` guarded by a broad
-    `except Exception`): a lookup failure (tool not mounted, coordinator quirk)
-    degrades to "nothing to notify," never a request-breaking exception.
-    `note_model()` itself is documented to never raise (see its own docstring -
-    the same class of bug D3 already fixed once for `native_tool_spec`), but the
-    call is wrapped here anyway because the failure modes this closes
-    (`coordinator.get`, `getattr`) are on the calling side, not inside
-    `note_model`.
+    Older/fake tools keep their `note_model()` compatibility path. Lookup and
+    selection failures are diagnostic only: a request must not fail here.
     """
     try:
         tool = coordinator.get("tools", "computer")
     except Exception:  # noqa: BLE001 - a lookup failure must never break a request
         logger.debug(
-            "computer-use: 'computer' tool lookup failed for note_model",
+            "computer-use: 'computer' tool lookup failed for native type selection",
             exc_info=True,
         )
+        return
+    select = getattr(tool, "select_provider_native_tool_type", None)
+    if callable(select):
+        try:
+            select(native_tool_type, model=model)
+        except Exception:  # noqa: BLE001 - selection must never take down a request
+            logger.debug(
+                "computer-use: provider native tool type selection raised unexpectedly",
+                exc_info=True,
+            )
         return
     note_model = getattr(tool, "note_model", None)
     if not callable(note_model):
@@ -710,67 +680,28 @@ def _note_model_on_computer_tool(coordinator: Any, model: str | None) -> None:
     try:
         note_model(model)
     except Exception:  # noqa: BLE001 - note_model must never take down a request
-        logger.exception("computer-use: note_model raised unexpectedly")
+        logger.debug("computer-use: note_model raised unexpectedly", exc_info=True)
 
 
 def _wrap_provider(provider: Any, coordinator: Any, max_inline: int) -> bool:
-    if getattr(provider, _WRAPPED_FLAG, False):
-        # Already wrapped for complete()-wrapping purposes, but priming must
-        # still run on EVERY turn this provider is about to handle, not only
-        # its first. `handler()` calls `_wrap_provider` unconditionally on
-        # every `PROVIDER_REQUEST` - the same event this function's wrap-time
-        # priming below relies on to run "before the orchestrator's first
-        # native_tool_spec read." Bailing out here with no priming assumed
-        # only ONE provider instance would ever share this session's mounted
-        # `computer` tool. A routing matrix breaks that assumption: distinct
-        # provider instances (e.g. an Opus `reasoning` provider and a Haiku
-        # `fast`-role provider) can share ONE coordinator and therefore ONE
-        # `computer` tool. Each provider's OWN wrap/complete cycle primes and
-        # corrects that SHARED tool for ITS OWN model - so a later turn
-        # routed to a DIFFERENT provider leaves the tool holding THAT
-        # provider's tool_version. When the routing matrix comes back to
-        # THIS (already-wrapped) provider, its own `complete()` wrapper
-        # would eventually re-correct it, but not until AFTER this turn's
-        # `native_tool_spec` has already been read and sent - one turn too
-        # late, and the exact wire error this closes: a request built with
-        # another provider's tool_version. Re-priming here, every time this
-        # hook fires for this provider, keeps the shared tool correct for
-        # THIS turn's read regardless of which other provider ran in
-        # between. Safe to call unconditionally - see `note_model`'s and
-        # `_note_model_on_computer_tool`'s own docstrings.
-        _note_model_on_computer_tool(
-            coordinator, getattr(provider, "default_model", None)
-        )
-        return False
-    tool_type = _resolve_native_tool_type(coordinator)
-    if not _provider_supports_native_computer_tool(provider, tool_type):
-        # WARNING, not info: this is the operator-facing line for a real, silent
-        # capability gap - "native computer-use is NOT enabled this session" -
-        # and INFO is routinely filtered out of default log verbosity, which is
-        # exactly how this would otherwise go unnoticed. What/why/what-to-do,
-        # not just a behavioural-probe result: `_provider_supports_native_computer_tool`'s
-        # own docstring is explicit that a negative result cannot distinguish
-        # "not a supported vendor" from "a supported vendor whose installed
-        # build predates the fix" - so both possibilities, and what to do about
-        # each, are spelled out here rather than left for a human to infer from
-        # a list of probe names.
+    native_tool_type = _provider_supports_native_computer_tool(provider)
+    if native_tool_type is None:
         logger.warning(
-            "computer-use: provider %s (%s) does NOT carry native tool type %r "
-            "to the wire - native computer-use is NOT enabled this session; "
-            "'computer' will run as an ordinary function tool instead (weaker "
-            "targeting, no native screenshot handling). Integration points "
-            "actually driven, all negative: %s. What to do: if this provider is "
-            "Anthropic or OpenAI and you expected native support, upgrade it to "
-            "a build implementing the integration point named above (see "
-            "ComputerUseNativeToolPassthroughUnsupportedError's docstring for "
-            "the exact commits/PRs); if this provider was never meant to "
-            "support computer-use, this message is expected and no action is "
-            "needed.",
+            "computer-use: provider %s (%s) did not prove native computer "
+            "passthrough; tried %s. Native computer use is disabled (the provider "
+            "may be unsupported or lack these integration points).",
             type(provider).__name__,
             type(provider).__module__,
-            tool_type,
             _native_wire_probe_names(),
         )
+        return False
+
+    _select_provider_native_tool_type_on_computer_tool(
+        coordinator, native_tool_type, getattr(provider, "default_model", None)
+    )
+    if getattr(provider, _WRAPPED_FLAG, False):
+        # The dialect is re-primed above for every provider:request, even when
+        # this provider's complete() wrapper already exists.
         return False
     # Fail loud (see ComputerUseHookIncompatibleProviderError) BEFORE wrapping, not
     # after: wrapping a stream()-capable provider would "succeed" and log
@@ -786,45 +717,15 @@ def _wrap_provider(provider: Any, coordinator: Any, max_inline: int) -> bool:
     if not hasattr(provider, "complete"):
         return False
 
-    # Prime `computer`'s resolved tool_version from this provider's
-    # EFFECTIVE model BEFORE the orchestrator's ToolSpec construction ever
-    # reads `native_tool_spec` for the first request of this session.
-    #
-    # Why this can't wait for the wrapped `complete()` below: `native_tool_spec`
-    # is read once per turn, by the orchestrator, *before* `provider.complete()`
-    # runs (`ComputerTool.native_tool_spec`'s own docstring; `note_model`'s
-    # docstring: "a correction here lands one turn ahead of the read it
-    # protects, not retroactively inside the same turn"). A long-lived parent
-    # session survives being one turn behind. A short-lived sub-agent does
-    # not: its first request is also its only chance, so the FIRST read must
-    # already be correct - which means resolving here, at wrap time (this
-    # function runs once per provider instance, gated by `_WRAPPED_FLAG`
-    # below), not only inside the per-request `complete()` wrapper.
-    #
-    # `getattr(provider, "default_model", None)` - not `ChatRequest.model` -
-    # is the right fact to prime from: `default_model` is the model this
-    # provider instance actually answers with when no per-request override is
-    # given, which is the common case (see `_note_model_on_computer_tool`'s
-    # docstring for why `request.model` is usually `None`).
-    _note_model_on_computer_tool(coordinator, getattr(provider, "default_model", None))
-
     original = provider.complete
 
     async def complete(request: Any, **kwargs: Any):
-        # Plan A1 (docs/designs/phase2-plans.md): keep `computer`'s resolved
-        # tool_version current for the model actually about to receive THIS
-        # request - see `_note_model_on_computer_tool` for the full rationale.
-        #
-        # `request.model` is only the per-request OVERRIDE and is normally
-        # `None` (no override in play); the model that will actually answer
-        # this request is the provider's own `default_model`. Prefer the
-        # override when a caller set one (it is more specific than the
-        # provider-wide default), fall back to `default_model` otherwise -
-        # never leave the corrector blind just because no override was set.
         _effective_model = getattr(request, "model", None) or getattr(
             provider, "default_model", None
         )
-        _note_model_on_computer_tool(coordinator, _effective_model)
+        _select_provider_native_tool_type_on_computer_tool(
+            coordinator, native_tool_type, _effective_model
+        )
         try:
             messages = getattr(request, "messages", None)
             if isinstance(messages, list):
