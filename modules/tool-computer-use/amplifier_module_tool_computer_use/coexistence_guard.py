@@ -168,6 +168,10 @@ class CoexistenceGuard:
     #: escalate `_halted` from `False` to `True`, never the reverse - the
     #: same one-way-latch property `seed_halted()` already documents.
     durable_halt_poll: Callable[[], PresenceSnapshot | None] | None = None
+    #: Optional reporting-only observer for a successful live presence sample.
+    #: It never controls classification, halt eligibility, or the rest of the
+    #: guard: observer failures are contained in `_notify_presence_sample()`.
+    on_presence_sample: Callable[[PresenceSnapshot], None] | None = None
     pause: PauseController = field(default_factory=PauseController)
     exclusion: ExclusionZone = field(default_factory=ExclusionZone)
     binding: TargetBinding = field(default_factory=TargetBinding)
@@ -247,6 +251,7 @@ class CoexistenceGuard:
         """
         self._poll_durable_halt()
         snap = self.presence.sample()
+        self._notify_presence_sample(snap)
         if snap.state is PresenceState.HUMAN_ACTIVE:
             self._halted = True
             self._halt_snapshot = snap
@@ -273,6 +278,21 @@ class CoexistenceGuard:
         except TargetChangedError:
             self.release_all("target_changed")
             raise
+
+    def _notify_presence_sample(self, snapshot: PresenceSnapshot) -> None:
+        """Run optional reporting after a successful sample without letting it
+        weaken the halt/pause/target-binding path.
+
+        Observers are deliberately called immediately after `sample()` and
+        before classification can halt the write. A broken observer is only a
+        reporting failure; it must never turn a detected human into a write.
+        """
+        if self.on_presence_sample is None:
+            return
+        try:
+            self.on_presence_sample(snapshot)
+        except Exception:  # noqa: BLE001 - reporting must not weaken safety
+            logger.exception("coexistence: presence sample observer failed")
 
     def seed_halted(self, snapshot: PresenceSnapshot) -> None:
         """Mark this guard as already-halted, from construction, because a

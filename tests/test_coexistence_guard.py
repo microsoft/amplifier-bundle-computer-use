@@ -108,6 +108,33 @@ def test_human_detected_mid_session_halts_and_releases(monkeypatch):
         guard.before_event()
 
 
+def test_presence_observer_exception_cannot_bypass_human_halt_or_release(monkeypatch):
+    """Remote transport reporting is optional: a broken observer must not
+    weaken the existing detected-human path after our own injection."""
+    import amplifier_module_tool_computer_use.presence as presence_module
+
+    clock = FakeClock()
+    monkeypatch.setattr(presence_module.time, "monotonic", lambda: clock.now)
+    observed: list[PresenceSnapshot] = []
+
+    def broken_observer(snapshot: PresenceSnapshot) -> None:
+        observed.append(snapshot)
+        raise RuntimeError("simulated reporting failure")
+
+    guard, released = make_guard(clock, on_presence_sample=broken_observer)
+    guard.before_event()
+    guard.after_event()
+    clock.advance(0.030)
+    clock.touch()
+
+    with pytest.raises(HaltedError):
+        guard.before_event()
+
+    assert len(observed) == 2
+    assert guard.halted is True
+    assert released == ["halted"]
+
+
 # -- pause -------------------------------------------------------------------
 
 

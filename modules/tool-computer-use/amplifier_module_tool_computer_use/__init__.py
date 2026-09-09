@@ -89,6 +89,11 @@ __version__ = "0.2.0"
 #: Marker key the companion hook looks for in tool output.
 MARKER = "__amplifier_computer_use__"
 
+#: Reporting-only threshold for a successful remote presence read. It is
+#: deliberately separate from `presence.GUARD_MS`: no timeout, action gate,
+#: classification, or halt decision reads this value.
+REMOTE_TRANSPORT_WARNING_MS = 2000.0
+
 SHOT_DIR = Path.home() / ".amplifier" / "computer-use" / "shots"
 SHOT_TTL_SECONDS = 2 * 60 * 60
 
@@ -3523,6 +3528,11 @@ def _build_coexistence_guard(
         # safe, so it does not silently stop applying the moment this
         # ships - see `_legacy_halt_key`'s docstring.
         durable_halt_poll=_durable_halt_poll_for(backend),
+        on_presence_sample=(
+            _remote_transport_warning_observer(channel_key, backend.name)
+            if bool(getattr(backend, "is_remote", False))
+            else None
+        ),
     )
     logger.info(
         "coexistence: guard built for backend %r (guard_ms=%.1f, measured=%s)",
@@ -3530,45 +3540,6 @@ def _build_coexistence_guard(
         presence.guard_ms,
         presence.guard_measured,
     )
-    # \u00a75.7 (measured safety gap, docs/designs/coexistence.md): a remote
-    # backend's presence_idle_ms() is an SSH round trip (plus, on Windows, a
-    # per-op powershell.exe spawn) - not the in-process microsecond call
-    # `guard_ms` was measured against. Measured on windows-host (n=80,
-    # key("shift")): 296-875ms. Declared HERE, at construction, the same
-    # place every other coexistence capability already declares what it can
-    # and cannot promise (\u00a75.5's Windows intra-type_text declaration) -
-    # never left for a caller to discover only by noticing a halt came late.
-    # Every live sample ALSO carries its own measured
-    # transport_latency_ms/effective_staleness_ms (presence.PresenceSnapshot)
-    # so this is a standing notice, not the only place it is visible.
-    # Bug-hunt defect B fix: printed at most once per PHYSICAL channel per
-    # process, not once per `_build_coexistence_guard()` call. This describes
-    # a property of the backend/channel (its transport latency), not of any
-    # one session, so a root session's own mount() and a delegated child's
-    # mount() against the SAME remote target (`_channel_identity` - the
-    # normal shape of activate() then delegate to computer-operator) each
-    # independently built a guard and each logged this WARNING - twice for
-    # one fact. Deduped with `_remote_latency_warned`/`_channel_registry_lock`
-    # below, the SAME mechanism (and the same lock, reused rather than
-    # duplicated) `_announcement_decisions` already uses to solve this exact
-    # "more than one mount() in this process, one physical channel" problem
-    # for session-start disclosure - see that dict's own docstring. Stays a
-    # real `logger.warning` (never silenced, never demoted): unlike defect A,
-    # this IS safety-relevant and must remain visible - only the per-mount
-    # duplication is the noise being removed, not the warning itself.
-    if bool(getattr(backend, "is_remote", False)) and _mark_remote_latency_warned(
-        channel_key
-    ):
-        logger.warning(
-            "coexistence: backend %r is remote - every presence sample "
-            "crosses a transport whose measured latency (296-875ms, "
-            "windows-host n=80) is up to ~40x this platform's %.1fms "
-            "guard_ms. Do not read guard_ms alone as the size of this "
-            "session's blind window; each sample's own "
-            "effective_staleness_ms is the honest figure.",
-            backend.name,
-            presence.guard_ms,
-        )
     # Defect 2 fix: a brand-new guard has no memory of a human detected in a
     # PRIOR session against this same backend - `_halted` is a plain
     # in-memory field on an object that stops existing when its mount does
@@ -4023,6 +3994,33 @@ def _mark_remote_latency_warned(channel_key: str) -> bool:
             return False
         _remote_latency_warned.add(channel_key)
         return True
+
+
+def _remote_transport_warning_observer(
+    channel_key: str, backend_name: str
+) -> Callable[[PresenceSnapshot], None]:
+    """Make the remote guard's reporting-only sample observer.
+
+    Construction is intentionally quiet: only a successful, measured presence
+    sample above `REMOTE_TRANSPORT_WARNING_MS` can log. This observer does not
+    participate in presence classification or any write eligibility decision.
+    """
+
+    def _observe(snapshot: PresenceSnapshot) -> None:
+        latency_ms = snapshot.transport_latency_ms
+        if latency_ms <= REMOTE_TRANSPORT_WARNING_MS:
+            return
+        if _mark_remote_latency_warned(channel_key):
+            logger.warning(
+                "coexistence: remote presence sample on backend %r took %.3fms "
+                "(threshold=%.1fms); reporting only - human detection and write "
+                "eligibility are unchanged",
+                backend_name,
+                latency_ms,
+                REMOTE_TRANSPORT_WARNING_MS,
+            )
+
+    return _observe
 
 
 #: Third-instance-of-a-defect-class fix (`_resolve_display_for_target`'s

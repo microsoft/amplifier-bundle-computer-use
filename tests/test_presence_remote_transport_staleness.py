@@ -1,8 +1,7 @@
 """Unit tests for the §5.7 fix (`docs/designs/coexistence.md`): a remote
 backend's `idle_source()` is not free (an SSH round trip - on Windows, a
-`powershell.exe` spawn per read), and reasoning about the result with only
-`guard_ms` silently presents a locally-measured band as if it applied to
-data that is up to ~40x staler (measured `windows-host`, n=80: 296-875ms).
+`powershell.exe` spawn per read), so each snapshot reports its measured cost
+without changing the platform guard or human-input classification.
 
 No real SSH, no real PowerShell, no remote host - a plain `idle_source`
 closure that sleeps real wall-clock time stands in for the transport, so the
@@ -13,7 +12,6 @@ of `time.monotonic` itself.
 
 from __future__ import annotations
 
-import logging
 import sys
 import time
 from pathlib import Path
@@ -21,7 +19,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "modules" / "tool-computer-use"))
 
-from amplifier_module_tool_computer_use import _build_coexistence_guard
 from amplifier_module_tool_computer_use.coexistence_guard import HaltedError
 from amplifier_module_tool_computer_use.halt_state import (
     PERSISTED_BASIS,
@@ -184,49 +181,6 @@ def test_quiet_session_over_a_slow_transport_stays_quiet():
 
     assert snap.transport_latency_ms >= 130.0
     assert snap.state is not PresenceState.HUMAN_ACTIVE
-
-
-# -- declaration at guard-construction time for remote backends -------------
-
-
-class _FakeRemoteBackend:
-    """Minimal stand-in with the two attributes `_build_coexistence_guard`
-    actually reads for remote resolution + declaration:
-    `presence_platform` (§ existing coverage-gap fix) and `is_remote`
-    (`RemoteBackend`'s real class attribute, §5.7's new declare-at-mount
-    log line)."""
-
-    def __init__(self, remote_platform: str = "windows-wsl2") -> None:
-        self.name = f"remote-ssh:{remote_platform}"
-        self.presence_platform = remote_platform
-        self.is_remote = True
-
-    def presence_idle_ms(self) -> float:
-        return 999_999.0
-
-
-class _FakeLocalBackend:
-    name = "linux-x11"
-
-    def presence_idle_ms(self) -> float:
-        return 999_999.0
-
-
-def test_remote_backend_construction_logs_a_transport_declaration(caplog):
-    with caplog.at_level(logging.WARNING):
-        guard = _build_coexistence_guard(_FakeRemoteBackend(), {})
-    assert guard is not None
-    messages = "\n".join(r.message for r in caplog.records)
-    assert "remote" in messages.lower()
-    assert "transport" in messages.lower()
-
-
-def test_local_backend_construction_does_not_log_a_transport_declaration(caplog):
-    with caplog.at_level(logging.WARNING):
-        guard = _build_coexistence_guard(_FakeLocalBackend(), {})
-    assert guard is not None
-    messages = "\n".join(r.message for r in caplog.records)
-    assert "is remote" not in messages.lower()
 
 
 # -- HaltedError message declares transport cost when it is non-trivial -----

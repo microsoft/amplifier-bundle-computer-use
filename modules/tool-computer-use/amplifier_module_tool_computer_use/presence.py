@@ -231,28 +231,15 @@ class IdleUnreadableError(RuntimeError):
 class PresenceSnapshot:
     """The `presence` block attached to every result, \u00a75.3.
 
-    `transport_latency_ms` / `effective_staleness_ms` (\u00a75.7): a measured safety
-    gap, not a hypothetical one. Over a remote backend (`RemoteBackend`,
-    `docs/designs/remote-transport.md`), `idle_source()` is not an in-process
-    syscall - it is an SSH round trip plus (on Windows) a fresh
-    `powershell.exe` spawn per read. Measured on `windows-host` (n=80,
-    `key("shift")`, 80/80 registration): min=296.0 p50=781.0 p90=828.0
-    p95=843.0 p99=875.0 max=875.0 mean=779.6 ms. Reasoning about that
-    observation with only `guard_ms` (20.0 for `windows-wsl2`) silently
-    presents a 20ms band as if it applied to data that is up to ~40x staler
-    - exactly the "claims a guarantee it does not have" failure \u00a75.5 already
-    refuses for Windows intra-`type_text` detection. `transport_latency_ms`
-    is the ACTUAL measured wall-clock cost of the `idle_source()` call this
-    snapshot came from (near-zero for an in-process Linux/macOS/Windows-local
-    read, real and large for anything crossing a transport) - never a fixed,
-    invented, or looked-up constant, so it tracks whatever the live
-    connection is actually doing rather than baking in one box's network
-    conditions. `effective_staleness_ms = guard_ms + transport_latency_ms` is
-    the single honest number for "how wide is the window in which a human
-    touch on this backend could go undetected by this sample" - reported
-    for every backend (it is `~guard_ms` for a local one), never gating
-    `_classify()`'s comparison itself (see that method's docstring for why
-    widening the THRESHOLD is the wrong fix, not merely an unproven one).
+    `transport_latency_ms` / `effective_staleness_ms` (\u00a75.7): a remote
+    `idle_source()` crosses SSH (and, on Windows, may start PowerShell), while
+    a local read is in-process. `transport_latency_ms` is the ACTUAL
+    wall-clock cost of this snapshot's idle read; it is never a fixed,
+    invented, or looked-up network value. A former Windows-host benchmark
+    (n=80, 296-875ms) is historical evidence that motivated measurement, not
+    a statement about this connection. `effective_staleness_ms = guard_ms +
+    transport_latency_ms` reports the sample's measured blind window. It
+    never changes `_classify()` or the platform `guard_ms` threshold.
     """
 
     state: PresenceState
@@ -369,8 +356,8 @@ class PresenceMonitor:
         matter whether `now` is captured immediately before or after that
         call. For a REMOTE `idle_source()` (`RemoteBackend.presence_idle_ms`,
         an SSH round trip - and on Windows a fresh `powershell.exe` spawn per
-        read - measured 296-875ms, windows-host, n=80) it matters enormously:
-        capturing `now` BEFORE issuing that call (the previous behavior)
+        read) it matters: the read returns after the target observation.
+        Capturing `now` BEFORE issuing that call (the previous behavior)
         anchors every comparison to a moment up to a full round trip BEFORE
         `idle_ms` was actually valid, which silently manufactures staleness on
         top of whatever the transport already costs - `idle_ms` reflects the

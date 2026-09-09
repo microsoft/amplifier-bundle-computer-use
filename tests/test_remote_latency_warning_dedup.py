@@ -1,23 +1,8 @@
-"""Bug-hunt defect B: the remote-latency safety notice
-(`_build_coexistence_guard`, `__init__.py`) printed TWICE for one real
-session - once when the root session's own `mount()` built its guard against
-`remote-ssh:macos`, and again when the delegated `computer-use:computer-operator`
-sub-agent's `mount()` built its OWN guard against the SAME physical machine.
+"""Offline coverage for remote transport reporting.
 
-The notice describes a property of the BACKEND/CHANNEL (its measured
-transport latency), not of any one session, so two mounts against the same
-target logging it twice is noise that dilutes a real safety warning - not a
-second, distinct fact. It must still fire (this is safety-relevant, never
-silenced - see docs/designs/coexistence.md §5.7), just once per physical
-channel per process, mirroring the exact mechanism `_announcement_decisions`
-already uses to solve "more than one mount() in this process, one physical
-channel" for session-start disclosure (see that dict's own docstring).
-
-No real SSH, no real display server - a fake `Backend`-shaped stand-in with
-just enough surface (`is_remote`, `user_host`, `presence_idle_ms`,
-`presence_platform`) for `_build_coexistence_guard` to exercise its real
-decision logic, same no-real-backend approach as
-`test_coexistence_guard_windows_remote.py`.
+Remote guard construction is intentionally quiet. A warning is emitted only
+when an actual successful presence sample measures transport strictly above
+`REMOTE_TRANSPORT_WARNING_MS`, and is deduplicated per physical channel.
 """
 
 from __future__ import annotations
@@ -26,18 +11,26 @@ import logging
 import sys
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "modules" / "tool-computer-use"))
 
-from amplifier_module_tool_computer_use import _build_coexistence_guard
+from amplifier_module_tool_computer_use import (
+    REMOTE_TRANSPORT_WARNING_MS,
+    _build_coexistence_guard,
+)
+from amplifier_module_tool_computer_use.coexistence_guard import HaltedError
+from amplifier_module_tool_computer_use.presence import (
+    Confidence,
+    IdleUnreadableError,
+    PresenceSnapshot,
+    PresenceState,
+)
 
 
 class _FakeRemoteBackend:
-    """Stands in for `RemoteBackend`: `is_remote = True`, a composite `name`
-    (never a `GUARD_MS` key by design), `presence_platform` resolving to the
-    real remote platform, and `user_host` - the actual `user@host` string
-    `_channel_identity` keys on so two DIFFERENT hosts of the same platform
-    are never conflated (see that function's own docstring)."""
+    """Remote-shaped backend with a counted, entirely offline idle read."""
 
     is_remote = True
 
@@ -45,69 +38,159 @@ class _FakeRemoteBackend:
         self.name = f"remote-ssh:{remote_platform}"
         self.presence_platform = remote_platform
         self.user_host = user_host
+        self.idle_reads = 0
+
+    def presence_idle_ms(self) -> float:
+        self.idle_reads += 1
+        return 999_999.0
+
+
+class _FakeLocalBackend:
+    name = "linux-x11"
 
     def presence_idle_ms(self) -> float:
         return 999_999.0
 
 
-def _remote_latency_records(records) -> list:
-    return [r for r in records if "is remote - every presence sample" in r.message]
-
-
-def test_remote_latency_warning_fires_once_across_two_mounts_of_the_same_channel(
-    caplog,
-):
-    """The exact reported shape: a root session's mount() and a delegated
-    child's mount() against the SAME `user@host` - two SEPARATE `Backend`
-    instances (each mount() constructs its own), same physical channel.
-    Must warn once between them, not once each."""
-    caplog.set_level(logging.WARNING, logger="amplifier_module_tool_computer_use")
-
-    root_backend = _FakeRemoteBackend("macos", "a-user@example-macbook")
-    child_backend = _FakeRemoteBackend("macos", "a-user@example-macbook")
-
-    guard1 = _build_coexistence_guard(root_backend, {})
-    guard2 = _build_coexistence_guard(child_backend, {})
-
-    assert guard1 is not None
-    assert guard2 is not None
-    hits = _remote_latency_records(caplog.records)
-    assert len(hits) == 1, (
-        f"expected exactly one remote-latency warning across two mounts of "
-        f"the same channel, got {len(hits)}: {[r.message for r in hits]}"
+def _sample(latency_ms: float) -> PresenceSnapshot:
+    return PresenceSnapshot(
+        state=PresenceState.QUIET,
+        confidence=Confidence.HIGH,
+        basis="idle_reconciliation",
+        last_human_input_ago_ms=999_999.0,
+        margin_ms=None,
+        guard_ms=5.0,
+        guard_measured=True,
+        sample_interval_ms=None,
+        latched_until_ms=None,
+        transport_latency_ms=latency_ms,
     )
 
 
-def test_remote_latency_warning_still_fires_at_all_for_a_fresh_channel(caplog):
-    """Never silenced (§5.7 of docs/designs/coexistence.md): a genuinely NEW
-    physical channel (different `user_host`) must still get its own warning -
-    proves the fix dedups per-channel, not process-wide-forever."""
-    caplog.set_level(logging.WARNING, logger="amplifier_module_tool_computer_use")
+def _transport_warnings(records) -> list:
+    return [r for r in records if "remote presence sample" in r.message]
 
-    backend = _FakeRemoteBackend("macos", "a-user@some-other-mac")
+
+def _sample_guard(guard, latency_ms: float) -> None:
+    guard.presence.sample = lambda: _sample(latency_ms)  # type: ignore[method-assign]
+    guard.before_event()
+
+
+def test_remote_guard_construction_is_quiet_and_does_not_read_presence(caplog):
+    caplog.set_level(logging.WARNING, logger="amplifier_module_tool_computer_use")
+    backend = _FakeRemoteBackend("macos", "a-user@example-macbook")
+
     guard = _build_coexistence_guard(backend, {})
 
     assert guard is not None
-    hits = _remote_latency_records(caplog.records)
-    assert len(hits) == 1
+    assert backend.idle_reads == 0
+    assert _transport_warnings(caplog.records) == []
 
 
-def test_remote_latency_warning_dedups_independently_per_channel(caplog):
-    """Two DIFFERENT physical channels each get their own warning - the dedup
-    key is `_channel_identity` (per physical machine), not a single global
-    once-ever flag."""
+@pytest.mark.parametrize("latency_ms", [800.0, 1500.0, REMOTE_TRANSPORT_WARNING_MS])
+def test_remote_samples_at_or_below_threshold_are_quiet(caplog, latency_ms):
     caplog.set_level(logging.WARNING, logger="amplifier_module_tool_computer_use")
-
-    mac = _FakeRemoteBackend("macos", "a-user@example-macbook")
-    windows = _FakeRemoteBackend("windows-wsl2", "a-user@example-desktop")
-
-    _build_coexistence_guard(mac, {})
-    _build_coexistence_guard(windows, {})
-    # A second mount against the FIRST channel again - still must not re-warn.
-    _build_coexistence_guard(_FakeRemoteBackend("macos", "a-user@example-macbook"), {})
-
-    hits = _remote_latency_records(caplog.records)
-    assert len(hits) == 2, (
-        f"expected one warning per distinct channel (2 channels), got "
-        f"{len(hits)}: {[r.message for r in hits]}"
+    guard = _build_coexistence_guard(
+        _FakeRemoteBackend("macos", f"quiet-{latency_ms}@example-macbook"), {}
     )
+    assert guard is not None
+
+    _sample_guard(guard, latency_ms)
+
+    assert _transport_warnings(caplog.records) == []
+
+
+def test_first_over_threshold_remote_sample_warns_once_across_same_channel(
+    caplog, monkeypatch
+):
+    """The first warning comes from the real `PresenceMonitor.sample()` path,
+    not from a construction-time estimate or a separately polled transport."""
+    import amplifier_module_tool_computer_use.presence as presence_module
+
+    caplog.set_level(logging.WARNING, logger="amplifier_module_tool_computer_use")
+    root_backend = _FakeRemoteBackend("macos", "a-user@example-macbook")
+    root_guard = _build_coexistence_guard(root_backend, {})
+    child_guard = _build_coexistence_guard(
+        _FakeRemoteBackend("macos", "a-user@example-macbook"), {}
+    )
+    assert root_guard is not None
+    assert child_guard is not None
+    timestamps = iter([100.0, 102.000001])
+    monkeypatch.setattr(presence_module.time, "monotonic", lambda: next(timestamps))
+
+    root_guard.before_event()
+    _sample_guard(child_guard, REMOTE_TRANSPORT_WARNING_MS + 250.0)
+
+    assert root_backend.idle_reads == 1
+    hits = _transport_warnings(caplog.records)
+    assert len(hits) == 1
+    assert "2000.001ms" in hits[0].message
+    assert "reporting only" in hits[0].message
+
+
+def test_human_after_own_injection_still_halts_on_slow_transport(caplog):
+    caplog.set_level(logging.WARNING, logger="amplifier_module_tool_computer_use")
+    guard = _build_coexistence_guard(
+        _FakeRemoteBackend("macos", "human-after-write@example-macbook"), {}
+    )
+    assert guard is not None
+    guard.after_event()
+    guard.presence.sample = lambda: PresenceSnapshot(  # type: ignore[method-assign]
+        state=PresenceState.HUMAN_ACTIVE,
+        confidence=Confidence.HIGH,
+        basis="idle_reconciliation",
+        last_human_input_ago_ms=12.0,
+        margin_ms=30.0,
+        guard_ms=5.0,
+        guard_measured=True,
+        sample_interval_ms=60.0,
+        latched_until_ms=None,
+        transport_latency_ms=REMOTE_TRANSPORT_WARNING_MS + 1.0,
+    )
+
+    with pytest.raises(HaltedError):
+        guard.before_event()
+
+    assert guard.halted is True
+    assert len(_transport_warnings(caplog.records)) == 1
+
+
+def test_over_threshold_remote_samples_warn_independently_per_channel(caplog):
+    caplog.set_level(logging.WARNING, logger="amplifier_module_tool_computer_use")
+    mac_guard = _build_coexistence_guard(
+        _FakeRemoteBackend("macos", "a-user@example-macbook"), {}
+    )
+    windows_guard = _build_coexistence_guard(
+        _FakeRemoteBackend("windows-wsl2", "a-user@example-desktop"), {}
+    )
+    assert mac_guard is not None
+    assert windows_guard is not None
+
+    _sample_guard(mac_guard, REMOTE_TRANSPORT_WARNING_MS + 1.0)
+    _sample_guard(windows_guard, REMOTE_TRANSPORT_WARNING_MS + 1.0)
+
+    assert len(_transport_warnings(caplog.records)) == 2
+
+
+def test_failed_remote_idle_read_uses_existing_hard_failure_without_warning(caplog):
+    caplog.set_level(logging.WARNING, logger="amplifier_module_tool_computer_use")
+    guard = _build_coexistence_guard(
+        _FakeRemoteBackend("macos", "failed-read@example-macbook"), {}
+    )
+    assert guard is not None
+
+    def _fail() -> PresenceSnapshot:
+        raise IdleUnreadableError("simulated failed remote read")
+
+    guard.presence.sample = _fail  # type: ignore[method-assign]
+    with pytest.raises(IdleUnreadableError):
+        guard.before_event()
+
+    assert _transport_warnings(caplog.records) == []
+
+
+def test_local_guard_has_no_transport_observer():
+    guard = _build_coexistence_guard(_FakeLocalBackend(), {})
+
+    assert guard is not None
+    assert guard.on_presence_sample is None

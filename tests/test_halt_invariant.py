@@ -79,6 +79,9 @@ def test_init_signature_has_no_halt_disabling_parameter():
         # disable the halt invariant either - see coexistence_guard.py's
         # `_poll_durable_halt` and the field's own docstring.
         "durable_halt_poll",
+        # Reporting-only: called after a successful sample inside a
+        # try/except, so it cannot suppress classification or a halt.
+        "on_presence_sample",
         "pause",
         "exclusion",
         "binding",

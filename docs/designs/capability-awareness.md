@@ -202,7 +202,7 @@ Tri-state per §3.4, plus **the exact process string** the user must find in the
 `read_only`, `gate_writes`, `clipboard_read_policy` and, for each, **whether it came from config or from the remote default** (`__init__.py:234-256`, `:353-356`). A user asking "why can't you click?" needs to know whether to change a setting or a machine.
 
 **Safety state** *(live)*
-`guard.as_dict()` (`coexistence_guard.py:328-335`), `presence.guard_measured` / `guard_ms` (`presence.py:131`, `:341`), whether a durable halt is seeded (`__init__.py:2193-2204`) and `halt_state.resolve_resume_command()` if so, and — for remote — the `effective_staleness_ms` caveat the guard already warns about at construction (`__init__.py:2170-2181`).
+`guard.as_dict()` (`coexistence_guard.py`), `presence.guard_measured` / `guard_ms` (`presence.py`), whether a durable halt is seeded and `halt_state.resolve_resume_command()` if so, and — for remote — each sample's `effective_staleness_ms`. Guard construction is quiet; a measured transport warning is emitted only after a successful remote sample exceeds the reporting threshold.
 
 **Target-mode** *(live)*
 Current monitor vs. virtual desktop (`__init__.py:672`), and the `config.target` shape fact (`registry._TARGET_MODEL`, `registry.py:36-43`) — reused verbatim, never paraphrased, so it cannot drift from the two places that already share it.
