@@ -3972,16 +3972,15 @@ def _get_channel_ledger(channel_key: str) -> HeldInputLedger:
         return ledger
 
 
-#: Bug-hunt defect B: which PHYSICAL channels have already had the remote-
-#: latency notice (`_build_coexistence_guard` above) printed once in this
-#: process - reused rather than a new lock, for the same momentary-
-#: contention reason `_channel_registry_lock` already exists (dict
-#: read/write only, never held across the actual `logger.warning` call).
+#: Bug-hunt defect B: which PHYSICAL channels have already logged a remote
+#: transport warning in this process. The warning is emitted only after an
+#: actual successful presence sample exceeds `REMOTE_TRANSPORT_WARNING_MS`;
+#: guard construction and mount are quiet. Reuses `_channel_registry_lock`
+#: because the set mutation is momentary and never surrounds `logger.warning`.
 #: Keyed exactly like `_channel_ledgers`/`_announcement_decisions`
-#: (`_channel_identity`): this is a property of the physical machine, not of
-#: any one mount() - a root session's mount() and a delegated child's
-#: mount() against the SAME remote target must warn once between them, not
-#: once each.
+#: (`_channel_identity`): the sample describes the physical machine, so a root
+#: session and delegated child against the SAME remote target share one warning
+#: rather than logging once per mount.
 _remote_latency_warned: set[str] = set()
 
 
