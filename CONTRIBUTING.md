@@ -93,7 +93,10 @@ This takes several minutes (dozens to ~100+ real trials, each a real subprocess 
 is **not** run in CI — CI runs headless with no display server at all. Run it locally,
 against a clean `Xvfb`, before cutting a release that touches the coexistence guard, the
 presence detector, or the input backends it depends on. See the script's own docstring
-for what evidence it produces and how to read the result.
+for what evidence it produces and how to read the result. The gate establishes a fresh
+`QUIET`/high-confidence baseline before **every** trial, including the first; a baseline
+that is unreadable, recent, or otherwise invalid fails the whole run and is never retried
+or excluded from its denominator. Do not publish private host details or raw run logs.
 
 `scripts/wire_check.py` is the same kind of gate for the multi-provider wire-format
 anti-regression scheme (the design notes §11.2, layer 3): it sends

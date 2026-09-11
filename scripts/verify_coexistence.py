@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import random
 import statistics
@@ -120,6 +121,7 @@ def _run_human_inject(display_name: str, delay_s: float, out_path: str) -> None:
 @dataclass
 class TrialResult:
     index: int
+    baseline_idle_ms: float
     human_delay_s: float
     detected: bool
     false_positive_before_human: bool
@@ -129,6 +131,10 @@ class TrialResult:
     chars_typed: int
     error_repr: str | None
     released_on_halt: bool
+
+
+class InvalidBaselineError(RuntimeError):
+    """The gate could not establish a fresh, safely quiet trial baseline."""
 
 
 def _run_one_trial(
@@ -141,7 +147,13 @@ def _run_one_trial(
         CoexistenceGuard,
         HaltedError,
     )
-    from amplifier_module_tool_computer_use.presence import PresenceMonitor
+    from amplifier_module_tool_computer_use.presence import (
+        QUIET_FLOOR_SECONDS,
+        Confidence,
+        IdleUnreadableError,
+        PresenceMonitor,
+        PresenceState,
+    )
 
     released: list[str] = []
 
@@ -153,6 +165,34 @@ def _run_one_trial(
         idle_source=backend.presence_idle_ms, platform="linux-x11"
     )
     guard = CoexistenceGuard(presence=presence, release_all=release_all)
+
+    # A settle sleep is not evidence that this display is quiet: another
+    # process or person could have touched it during that interval. Take a
+    # fresh production monitor sample before scheduling this trial's
+    # independent human-input child, and reject rather than dilute the gate
+    # if it cannot establish the strict quiet baseline.
+    try:
+        baseline = presence.sample()
+    except IdleUnreadableError as exc:
+        raise InvalidBaselineError(
+            f"trial {index + 1}: idle counter unreadable while establishing "
+            f"the pre-trial baseline: {exc}"
+        ) from exc
+    baseline_idle_ms = baseline.last_human_input_ago_ms
+    quiet_floor_ms = QUIET_FLOOR_SECONDS * 1000.0
+    if (
+        baseline.state is not PresenceState.QUIET
+        or baseline.confidence is not Confidence.HIGH
+        or baseline_idle_ms is None
+        or not math.isfinite(baseline_idle_ms)
+        or baseline_idle_ms <= quiet_floor_ms
+    ):
+        raise InvalidBaselineError(
+            f"trial {index + 1}: baseline is not safely quiet "
+            f"(state={baseline.state.value}, confidence={baseline.confidence.value}, "
+            f"idle_ms={baseline_idle_ms!r}; require QUIET/HIGH with finite "
+            f"idle_ms > {quiet_floor_ms:.1f})"
+        )
 
     human_delay = random.uniform(HUMAN_DELAY_MIN_S, HUMAN_DELAY_MAX_S)
     out_path = tmp_dir / f"human_{index}.json"
@@ -229,6 +269,7 @@ def _run_one_trial(
 
     return TrialResult(
         index=index,
+        baseline_idle_ms=baseline_idle_ms,
         human_delay_s=human_delay,
         detected=detected,
         false_positive_before_human=false_positive_before_human,
@@ -259,13 +300,23 @@ def _run_gate(n_trials: int, display_name: str) -> int:
         print(f"FAIL: backend unavailable on {display_name!r}: {probe.reason}")
         return 2
 
+    # LinuxX11Backend lazily verifies its discrete-input path from
+    # `type_text()`. Warm it up before any timed trial so that first-use setup
+    # neither appears in trial 0 nor injects a key. Empty text reaches that
+    # setup path but emits no input events.
+    try:
+        backend.type_text("")
+    except Exception as exc:  # noqa: BLE001 - this invalidates the ship gate
+        print(f"FAIL: setup warmup failed on {display_name!r}: {exc!r}")
+        return 2
+
     guard_ms = GUARD_MS["linux-x11"]
     predicted_masked_fraction = guard_ms / (CADENCE_S * 1000.0)
 
     tmp_dir = Path(f"/tmp/verify_coexistence_{os.getpid()}")
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
-    # Settle gap between trials (defect 1's fix, presence.py::_classify):
+    # Settle gap before every trial (defect 1's fix, presence.py::_classify):
     # each trial constructs a brand-new PresenceMonitor with no injection
     # history of its own, but all trials share ONE live display whose real
     # idle counter does not reset between them. Back-to-back trials with no
@@ -278,7 +329,7 @@ def _run_gate(n_trials: int, display_name: str) -> int:
     # method's own defect-1 comment above), not a bug in it - but it is
     # also not what this gate measures (the human-inject subprocess for
     # THIS trial hasn't even fired yet in that case). A settle gap longer
-    # than QUIET_FLOOR_SECONDS between trials gives each trial a genuinely
+    # than QUIET_FLOOR_SECONDS before each trial gives each trial a genuinely
     # quiet baseline before its own timed window starts, matching a real
     # session boundary (see `halt_state.py`'s own evaluation evidence: a
     # real handoff between sessions was ~80s apart, not milliseconds).
@@ -287,9 +338,12 @@ def _run_gate(n_trials: int, display_name: str) -> int:
     results: list[TrialResult] = []
     t_gate_start = time.monotonic()
     for i in range(n_trials):
-        if i > 0:
-            time.sleep(settle_s)
-        result = _run_one_trial(i, backend, display_name, tmp_dir)
+        time.sleep(settle_s)
+        try:
+            result = _run_one_trial(i, backend, display_name, tmp_dir)
+        except InvalidBaselineError as exc:
+            print(f"FAIL: invalid test environment: {exc}")
+            return 2
         results.append(result)
         status = "DETECTED" if result.detected else "MISSED"
         # Defect 1's fix (presence.py::_classify) makes a genuine, correct
@@ -305,7 +359,8 @@ def _run_gate(n_trials: int, display_name: str) -> int:
             f"{result.margin_ms:+.2f}ms" if result.margin_ms is not None else "n/a"
         )
         print(
-            f"trial {i + 1:>3}/{n_trials}: delay={result.human_delay_s:6.3f}s "
+            f"trial {i + 1:>3}/{n_trials}: baseline_idle_ms="
+            f"{result.baseline_idle_ms:8.1f} delay={result.human_delay_s:6.3f}s "
             f"chars_typed={result.chars_typed:>4} {status}"
             + (
                 f" margin={margin_repr} latency={result.detection_latency_ms:.2f}ms"
