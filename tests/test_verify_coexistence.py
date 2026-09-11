@@ -24,6 +24,16 @@ sys.modules[SPEC.name] = verify
 SPEC.loader.exec_module(verify)
 
 
+@pytest.fixture(autouse=True)
+def _isolate_gate_temp_directory(monkeypatch, tmp_path):
+    def script_path(value):
+        if str(value).startswith("/tmp/verify_coexistence_"):
+            return tmp_path / "gate"
+        return Path(value)
+
+    monkeypatch.setattr(verify, "Path", script_path)
+
+
 class _FakeProc:
     def poll(self):
         return 0
@@ -167,21 +177,33 @@ def test_gate_warms_up_then_settles_before_trial_zero_and_later_trials(
     from amplifier_module_tool_computer_use import linux_x11
 
     _GateBackend.instances.clear()
-    sleeps: list[float] = []
-    trial_indices: list[int] = []
-    monkeypatch.setattr(linux_x11, "LinuxX11Backend", _GateBackend)
-    monkeypatch.setattr(verify.time, "sleep", sleeps.append)
+    timeline = []
+
+    class _TimelineBackend(_GateBackend):
+        def __init__(self, config):
+            super().__init__(config)
+            self.events = timeline
+
+    monkeypatch.setattr(linux_x11, "LinuxX11Backend", _TimelineBackend)
+    monkeypatch.setattr(
+        verify.time, "sleep", lambda seconds: timeline.append(("sleep", seconds))
+    )
 
     def _run_trial(index, *_args):
-        trial_indices.append(index)
+        timeline.append(("trial", index))
         return _passing_result(index)
 
     monkeypatch.setattr(verify, "_run_one_trial", _run_trial)
 
     assert verify._run_gate(2, ":headless") == 0
-    assert _GateBackend.instances[0].events == ["probe", "warmup:''"]
-    assert sleeps == [2.5, 2.5]
-    assert trial_indices == [0, 1]
+    assert timeline == [
+        "probe",
+        "warmup:''",
+        ("sleep", 2.5),
+        ("trial", 0),
+        ("sleep", 2.5),
+        ("trial", 1),
+    ]
     assert "baseline_idle_ms=" in capsys.readouterr().out
 
 
