@@ -695,6 +695,38 @@ def test_capability_probe_rejection_is_operator_actionable(caplog):
     assert "tool_search_mode='off'" in message
 
 
+def test_unsupported_warning_is_once_per_provider_instance(caplog):
+    coord = _FakeCoordinatorWithOrchestrator(orchestrator=None)
+    first = _ProviderPredatingPR79()
+    second = _ProviderPredatingPR79()
+    original = first.complete
+    with caplog.at_level("WARNING", logger=hook_mod.__name__):
+        for provider in (first, first, second, first, second):
+            assert hook_mod._wrap_provider(provider, coord, max_inline=3) is False
+
+    warnings = [
+        r for r in caplog.records if "did not prove native computer" in r.getMessage()
+    ]
+    assert len(warnings) == 2
+    assert first.complete == original
+    assert not getattr(first, hook_mod._WRAPPED_FLAG, False)
+
+
+def test_unsupported_warning_does_not_break_immutable_provider(caplog):
+    class FrozenProvider:
+        __slots__ = ()
+
+        async def complete(self, request, **kwargs):
+            return "ok"
+
+    coord = _FakeCoordinatorWithOrchestrator(orchestrator=None)
+    provider = FrozenProvider()
+    # If a provider cannot retain the marker, repeat rather than hide the gap.
+    assert hook_mod._wrap_provider(provider, coord, max_inline=3) is False
+    assert hook_mod._wrap_provider(provider, coord, max_inline=3) is False
+    assert "did not prove native computer" in caplog.text
+
+
 def test_wrap_provider_wraps_openai_shaped_provider():
     """Regression guard for the whole point of this change: an OpenAI-shaped
     provider with working bare-computer-tool passthrough gets wrapped, exactly

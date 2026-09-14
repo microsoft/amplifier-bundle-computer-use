@@ -13,8 +13,12 @@ process had already read. See BACKLOG/PR description for the full narrative.
 from __future__ import annotations
 
 import io
+import os
 import sys
+import tempfile
+import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "modules" / "tool-computer-use"))
@@ -44,19 +48,10 @@ _UV_FETCH_STDERR = (
 )
 
 
-class _FakeStderr:
-    """One-shot `.read(n)` returning the whole payload, then empty - matches
-    `_drain_stderr_on_failure`'s single `read(4096)` call."""
-
-    def __init__(self, data: bytes) -> None:
-        self._data = data
-        self._served = False
-
-    def read(self, _n: int = 4096) -> bytes:
-        if self._served:
-            return b""
-        self._served = True
-        return self._data
+@pytest.fixture
+def stderr_file():
+    with tempfile.TemporaryFile() as stream:
+        yield stream
 
 
 class _FakeStdout:
@@ -72,15 +67,17 @@ class _FakeConnectProc:
     holds: writable stdin (payload deploy), a stdout that never yields a
     handshake line, and a stderr pre-loaded with the agent's crash output."""
 
-    def __init__(self, stderr_data: bytes) -> None:
+    def __init__(self, stderr_data: bytes, stream) -> None:
         self.stdin = io.BytesIO()
         self.stdout = _FakeStdout()
-        self.stderr = _FakeStderr(stderr_data)
+        self.stderr = stream
+        self.stderr.write(stderr_data)
+        self.stderr.seek(0)
 
 
-def _install_fake_popen(monkeypatch, stderr_data: bytes) -> None:
+def _install_fake_popen(monkeypatch, stderr_data: bytes, stream) -> None:
     def fake_popen(cmd, **kwargs):
-        return _FakeConnectProc(stderr_data)
+        return _FakeConnectProc(stderr_data, stream)
 
     monkeypatch.setattr(ssh_transport_mod.subprocess, "Popen", fake_popen)
     # Skip the real `uv` discovery probe (its own subprocess.run call) - it
@@ -93,11 +90,11 @@ def _install_fake_popen(monkeypatch, stderr_data: bytes) -> None:
 
 
 def test_handshake_timeout_carries_the_agents_stderr_not_just_a_reference(
-    monkeypatch,
+    monkeypatch, stderr_file
 ):
     """THE fix: the exception must contain the actual root cause, not send
     the operator to go find it themselves."""
-    _install_fake_popen(monkeypatch, _UV_FETCH_STDERR)
+    _install_fake_popen(monkeypatch, _UV_FETCH_STDERR, stderr_file)
     transport = SshTransport("user@macos-host", package_dir=PACKAGE_DIR)
 
     with pytest.raises(SshConnectError) as excinfo:
@@ -117,12 +114,12 @@ def test_handshake_timeout_carries_the_agents_stderr_not_just_a_reference(
 
 
 def test_handshake_timeout_message_no_longer_dangles_a_bare_stderr_reference(
-    monkeypatch,
+    monkeypatch, stderr_file
 ):
     """The old message text told the operator to go read stderr elsewhere.
     Once the content is actually attached, that dangling reference must be
     gone - there is nothing left to go looking for."""
-    _install_fake_popen(monkeypatch, _UV_FETCH_STDERR)
+    _install_fake_popen(monkeypatch, _UV_FETCH_STDERR, stderr_file)
     transport = SshTransport("user@macos-host", package_dir=PACKAGE_DIR)
 
     with pytest.raises(SshConnectError) as excinfo:
@@ -132,11 +129,11 @@ def test_handshake_timeout_message_no_longer_dangles_a_bare_stderr_reference(
 
 
 def test_handshake_timeout_with_no_captured_stderr_is_honest_about_it(
-    monkeypatch,
+    monkeypatch, stderr_file
 ):
     """No fallback, no fabricated content: when nothing could be captured,
     `agent_stderr` is None and the message says only what actually happened."""
-    _install_fake_popen(monkeypatch, b"")
+    _install_fake_popen(monkeypatch, b"", stderr_file)
     transport = SshTransport("user@macos-host", package_dir=PACKAGE_DIR)
 
     with pytest.raises(SshConnectError) as excinfo:
@@ -193,3 +190,83 @@ def test_summarize_stderr_truncates_to_head_and_tail():
     assert "line-100" not in summary  # middle noise is dropped
     assert "omitted" in summary
     assert len(summary.splitlines()) < 30
+
+
+@pytest.mark.parametrize("backlog", [b"", b"earlier startup diagnostic\n"])
+def test_request_error_does_not_wait_for_live_stderr_eof(backlog, caplog):
+    """Exercise send with a real unbuffered pipe whose writer stays open."""
+    read_fd, write_fd = os.pipe()
+    stderr = os.fdopen(read_fd, "rb", buffering=0)
+    if backlog:
+        os.write(write_fd, backlog)
+    response = b'{"id":1,"ok":false,"error":{"message":"capture failed"}}\n'
+    transport = SshTransport("user@example.invalid", package_dir=PACKAGE_DIR)
+    transport._proc = SimpleNamespace(
+        stdin=io.BytesIO(), stdout=io.BytesIO(response), stderr=stderr
+    )
+    done = threading.Event()
+    outcomes = []
+
+    def send():
+        try:
+            outcomes.append(transport.send(b'{"id":1,"op":"capture"}\n', timeout=0.05))
+        except BaseException as exc:
+            outcomes.append(exc)
+        finally:
+            done.set()
+
+    worker = threading.Thread(target=send, daemon=True)
+    worker.start()
+    try:
+        assert done.wait(0.5), "valid response blocked on an empty live stderr pipe"
+        assert outcomes == [response]
+        assert os.get_blocking(stderr.fileno()) is True
+        if backlog:
+            assert "accumulated since last drain" in caplog.text
+            assert backlog.decode().strip() in caplog.text
+    finally:
+        os.close(write_fd)
+        worker.join(2)
+        stderr.close()
+        transport._proc = None
+    assert not worker.is_alive()
+
+
+@pytest.mark.parametrize(
+    "userinfo", [b"user:private-token", b"user:private:token", b"private-token"]
+)
+def test_stderr_read_is_byte_bounded_and_redacts_console(caplog, userinfo):
+    # A regular fd avoids blocking the test's writer on a small OS pipe buffer.
+    with tempfile.TemporaryFile() as stderr:
+        payload = b"https://" + userinfo + b"@example.invalid/feed\n" + b"x" * 5000
+        stderr.write(payload)
+        stderr.seek(0)
+        transport = SshTransport("user@example.invalid", package_dir=PACKAGE_DIR)
+        transport._proc = SimpleNamespace(stderr=stderr)
+        summary = transport._drain_stderr_on_failure()
+        assert summary is not None
+        assert len(summary) <= 4096
+        assert "private" not in summary
+        assert "private" not in caplog.text
+        assert "example.invalid/feed" in summary
+        # The drain is one bounded read, even when more data is queued.
+        assert os.read(stderr.fileno(), len(payload)) == payload[4096:]
+        transport._proc = None
+
+
+def test_stderr_drain_never_falls_back_to_blocking_read(
+    monkeypatch, stderr_file, caplog
+):
+    transport = SshTransport("user@example.invalid", package_dir=PACKAGE_DIR)
+    transport._proc = SimpleNamespace(stderr=stderr_file)
+
+    def unsupported(*args):
+        raise OSError("nonblocking pipe mode unsupported")
+
+    def forbidden(*args):
+        raise AssertionError("must not read unless nonblocking mode was set")
+
+    monkeypatch.setattr(ssh_transport_mod.os, "set_blocking", unsupported)
+    monkeypatch.setattr(ssh_transport_mod.os, "read", forbidden)
+    assert transport._drain_stderr_on_failure() is None
+    assert "nonblocking stderr drain unavailable" in caplog.text

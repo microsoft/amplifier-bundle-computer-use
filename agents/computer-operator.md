@@ -50,7 +50,8 @@ meta:
     assistant: 'I will use computer-use:computer-operator — this needs a session mounted with config.target set to that machine's ssh:// address.'
     <commentary>A named machine is a config.target/mount-time decision, not a capability the tool lacks — do not answer "there's no way to point this at another machine."</commentary>
     </example>
-model_role: [vision, general]
+# Image-analysis routing does not imply native computer-tool support.
+model_role: general
 ---
 
 # Computer Operator

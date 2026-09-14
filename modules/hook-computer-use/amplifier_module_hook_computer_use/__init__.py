@@ -66,6 +66,7 @@ __version__ = "0.1.0"
 
 MARKER = "__amplifier_computer_use__"
 _WRAPPED_FLAG = "_amplifier_computer_use_wrapped"
+_UNSUPPORTED_WARNING_FLAG = "_amplifier_computer_use_unsupported_warned"
 _DEFAULT_MAX_INLINE_IMAGES = 3
 
 #: Set AMPLIFIER_COMPUTER_USE_TRACE=<path> to record what this hook did and when.
@@ -686,6 +687,16 @@ def _select_provider_native_tool_type_on_computer_tool(
 def _wrap_provider(provider: Any, coordinator: Any, max_inline: int) -> bool:
     native_tool_type = _provider_supports_native_computer_tool(provider)
     if native_tool_type is None:
+        # provider:request fires every turn. The cached negative probe must
+        # stay visible once, not drown later tool errors in identical warnings.
+        try:
+            if getattr(provider, _UNSUPPORTED_WARNING_FLAG, False) is True:
+                return False
+            setattr(provider, _UNSUPPORTED_WARNING_FLAG, True)
+        except Exception:
+            # Immutable/proxied providers may reject markers. Stay fail-loud
+            # rather than breaking the request or using a global identity cache.
+            pass
         logger.warning(
             "computer-use: provider %s (%s) did not prove native computer "
             "passthrough; tried %s. Native computer use is disabled (the provider "

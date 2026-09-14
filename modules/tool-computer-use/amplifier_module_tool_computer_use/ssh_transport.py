@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import io
 import logging
+import os
 import re
 import shlex
 import subprocess
@@ -142,7 +143,7 @@ def _ssh_opts(port: int | None) -> list[str]:
 _STDERR_HEAD_LINES = 4
 _STDERR_TAIL_LINES = 6
 _STDERR_MAX_LINES = _STDERR_HEAD_LINES + _STDERR_TAIL_LINES
-_CREDENTIAL_IN_URL_RE = re.compile(r"://([^/\s:@]+):([^/\s:@]+)@")
+_CREDENTIAL_IN_URL_RE = re.compile(r"://[^/\s@]+@")
 
 
 def _redact_credentials(text: str) -> str:
@@ -294,6 +295,9 @@ def _bootstrap_stub(deadman_seconds: float, read_only: bool) -> str:
     for the full reasoning.
     """
     read_only_arg = "true" if read_only else "false"
+    # Restrict even older Python 3.11 patch releases without tar filters to
+    # our fixed, regular-file manifest. Never fall back to arbitrary extraction.
+    allowed_names = tuple(f"{_PACKAGE_NAME}/{name}" for name in PAYLOAD_MODULES)
     return (
         "import sys,os,tarfile,io,runpy,hashlib,tempfile,atexit,shutil;"
         "buf=sys.stdin.buffer;"
@@ -303,7 +307,15 @@ def _bootstrap_stub(deadman_seconds: float, read_only: bool) -> str:
         "d=hashlib.sha256(data).hexdigest();"
         "w=tempfile.mkdtemp(prefix='amplifier-cu-agent-');"
         "atexit.register(shutil.rmtree,w,ignore_errors=True);"
-        "tarfile.open(fileobj=io.BytesIO(data),mode='r:gz').extractall(w);"
+        "t=tarfile.open(fileobj=io.BytesIO(data),mode='r:gz');"
+        f"allowed={allowed_names!r};"
+        "members=t.getmembers();"
+        "sys.exit('unsafe agent payload: expected only manifest regular files') "
+        "if sorted(m.name for m in members)!=sorted(allowed) "
+        "or any(not m.isreg() for m in members) "
+        "else None;"
+        "t.extractall(w,**({'filter':'data'} if hasattr(tarfile,'data_filter') else {}));"
+        "t.close();"
         "sys.path.insert(0,w);"
         "os.environ['AMPLIFIER_CU_AGENT_SHA256']=d;"
         f"sys.argv=['remote_agent','--deadman-seconds={deadman_seconds}',"
@@ -478,27 +490,39 @@ class SshTransport:
         return result["line"]
 
     def _drain_stderr_on_failure(self) -> str | None:
-        """Best-effort read of the agent's stderr after a failure.
+        """Read at most 4096 already-available bytes; never wait for stderr.
 
-        Logs the raw captured text at ERROR exactly as before, and ALSO
-        returns a truncated, credential-redacted summary so the caller can
-        attach it to the exception it is about to raise - see
-        `AgentStderrError`. Returns `None` when nothing could be captured
-        (no process, no pipe, empty read, or the read itself failed); this
-        is a real "nothing available" signal, not a placeholder.
+        Popen uses unbuffered pipes. An empty, still-open pipe blocks even
+        after a valid error response arrived on stdout, outside send's timeout.
+        Switch the fd to nonblocking for this read and restore its mode. If
+        the platform cannot do that, omit diagnostics rather than risk a hang.
+        Both the console and exception receive the credential-redacted summary.
+        This is accumulated output, not necessarily from the failed operation.
         """
         if self._proc is None or self._proc.stderr is None:
             return None
         try:
-            data = self._proc.stderr.read(4096)
+            fd = self._proc.stderr.fileno()
+            was_blocking = os.get_blocking(fd)
+            try:
+                os.set_blocking(fd, False)
+                data = os.read(fd, 4096)
+            finally:
+                os.set_blocking(fd, was_blocking)
+        except BlockingIOError:
+            return None
         except Exception as exc:  # noqa: BLE001 - best-effort diagnostics only
-            logger.debug("ssh-transport: stderr drain failed: %s", exc)
+            logger.warning(
+                "ssh-transport: nonblocking stderr drain unavailable: %s", exc
+            )
             return None
         if not data:
             return None
-        text = data.decode(errors="replace")
-        logger.error("ssh-transport: agent stderr: %s", text)
-        return _summarize_stderr(text)
+        summary = _summarize_stderr(data.decode(errors="replace"))
+        logger.error(
+            "ssh-transport: agent stderr (accumulated since last drain): %s", summary
+        )
+        return summary
 
     def close(self) -> None:
         """Shutdown order per \u00a710.1: release_all -> bye -> close stdin ->
