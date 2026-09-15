@@ -14,8 +14,11 @@ This session can see a real desktop and control its mouse and keyboard, using th
 provider's built-in computer-use tool. The desktop may be Windows, macOS, or Linux, and
 it may be this machine or another one reachable over your private network.
 
-Reach for it whenever a task has no API, no CLI, and no extension — a legacy desktop
-program, a proprietary UI, a dialog box, an installer, a settings panel. If a human could
-do it by looking at the screen and clicking, this can do it.
+Use desktop control only when the user explicitly requests actual rendered desktop GUI or
+screen interaction, or a required state or action is GUI-only and no suitable structured
+path exists. Prefer a browser, mobile, CLI, API, or code/file workflow when it can complete
+the task. Do not launch or explore desktop applications speculatively, or route merely
+because a request says “open,” “check,” or “navigate.” This includes legacy or proprietary
+desktop UI when no structured path is available.
 
 @computer-use:context/computer-use-awareness.md

@@ -51,7 +51,7 @@ amplifier run --bundle computer-use "What's on my screen right now?"
 Confirm it registered correctly with `amplifier bundle show computer-use` — it should
 list `tool-computer-use`, `hook-computer-use`, and `computer-use:computer-operator`.
 Working from a local clone instead of GitHub? `amplifier bundle add
-file:///path/to/amplifier-bundle-computer-use` instead.
+file:///path/to/amplifier-bundle-computer-use --app` instead.
 
 **Registering the bundle is not the same as the tools working.** See
 **[docs/SETUP.md](docs/SETUP.md)** for the four things that decide whether `computer` and

@@ -34,7 +34,7 @@ bundle (`bundle.md` at the repo root, name `computer-use`), so the standard
 
    Verified against this exact repo — the command reports back `Bundle's canonical name:
    computer-use`. Working from a local clone instead of GitHub? Use a `file://` URI
-   instead: `amplifier bundle add file:///path/to/amplifier-bundle-computer-use`.
+   instead: `amplifier bundle add file:///path/to/amplifier-bundle-computer-use --app`.
 
 2. **Use it for a session** — either per-run:
 
@@ -667,7 +667,7 @@ macOS is blocked. Windows and Linux `type` are unaffected.
 | `ComputerUseNativeToolPassthroughUnsupportedError` at mount | `loop-streaming` predates PR #36 | Upgrade — the error names the exact commit |
 | `ComputerUseHookIncompatibleProviderError` | Provider gained a `stream()` method. The hook only wraps `complete()`, and the orchestrator prefers `stream()` whenever present — wrapping would silently do nothing | Refuses to operate rather than degrade invisibly. Wrap both, or use an orchestrator that does not prefer `stream()` |
 | Log: `no provider found to wrap` | Provider lookup failed this turn; screenshots will not inline | Check the provider is mounted |
-| `'NoneType' object has no attribute 'Display'` | *(fixed)* Should now read "python-xlib is not installed" | `pip install python-xlib` into the **running** interpreter |
+| `'NoneType' object has no attribute 'Display'` | *(fixed)* Should now read "python-xlib is not installed" | For a `uv tool` installation, run `uv tool install amplifier --with python-xlib`; from a source checkout, run `uv pip install python-xlib` in its environment |
 | Tool works, targeting is noticeably poor | Native promotion silently degraded to a plain function tool | Check the trace (below) for a `markers=` line; check module commits |
 | `Tool computer failed: EOF when reading a line` | *(fixed)* Approval prompt with no TTY | Run interactively, or set `unattended_writes_ok: true` |
 | PowerShell banner text where JSON was expected | `bridge.ps1` missing from the deployed payload | Should not occur — it is in `PAYLOAD_MODULES`. File an issue |
@@ -695,7 +695,7 @@ No `markers=` line → screenshots are not reaching the model.
 These are complete, copy-pasteable **behavior files** — every module needs a `source:` key
 naming where to fetch it from, which a bare `tools:`/`hooks:` fragment (no filename, no
 path) cannot show. Save either one as e.g. `my-computer-use.yaml` and register it with
-`amplifier bundle add file:///path/to/my-computer-use.yaml` (see §0 above), or copy the
+`amplifier bundle add file:///path/to/my-computer-use.yaml --app` (see §0 above), or copy the
 `tools:`/`hooks:` blocks into your own existing behavior file.
 
 Local desktop, look-only — the safest first run (`my-computer-use.yaml`):

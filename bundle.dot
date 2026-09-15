@@ -1,56 +1,55 @@
-// Amplifier bundle that lets an AI assistant see and control a computer desktop — take screenshots, move the mouse, click, and type.
 digraph computer_use {
     rankdir=LR
     fontname="Helvetica"
     fontsize=12
-    label="Computer Use — Let the Assistant Drive a Desktop\nScreenshots, mouse, and keyboard control packaged as one add-on (v0.1.0)"
+    label="computer-use v0.1.0 — bundle repo"
     labelloc=t
     labeljust=c
     nodesep=0.6
     ranksep=0.7
     bgcolor="white"
-    source_hash="d26a2896c45ed480152c8294c142ad3de9b7712ef9991e9bff5635cea84317e0"
+    source_hash="7e0514d5f045244342223c1d3ad3ce537a09e4d9d5d4315a2d645f51cbdcc045"
 
     node [fontname="Helvetica", fontsize=11, style="filled,rounded"]
     edge [fontname="Helvetica", fontsize=9]
 
-    root_computer_use [label="Computer Use Add-On (the whole package)\nv0.1.0\n0 tools · 0 agents\n~394 tok aggregate", shape=box, fillcolor="#80cbc4", style="filled,rounded,bold", penwidth=2]
+    root_computer_use [label="computer-use v0.1.0\n0 tools · 0 agents\n~612 tok aggregate", shape=box, fillcolor="#80cbc4", style="filled,rounded,bold", penwidth=2]
 
     subgraph cluster_behaviors {
-        label="What This Add-On Turns On"
+        label="Behaviors"
         style="filled"
         fillcolor="#f9f9f9"
         color="#999999"
 
-        beh_computer_use_behavior [label="Desktop Control Capability\nSwitches on screen viewing + input\n2 tools · 1 ctx\n~1134 tok", shape=box, fillcolor="#e0f2f1", style="filled,rounded"]
+        beh_computer_use_behavior [label="computer-use-behavior\n2 tools · 1 ctx\n~1217 tok", shape=box, fillcolor="#e0f2f1", style="filled,rounded"]
     }
 
     subgraph cluster_agents {
-        label="Specialist Helper"
+        label="Agents"
         style="filled"
         fillcolor="#f9f9f9"
         color="#999999"
 
-        agt_computer_operator [label="Desktop Operator\nHelper that actually works the screen\n~449 tok desc", shape=box, fillcolor="#c8e6c9", style="filled,rounded"]
+        agt_computer_operator [label="computer-operator\n~101 tok desc", shape=box, fillcolor="#c8e6c9", style="filled,rounded"]
     }
 
     subgraph cluster_modules {
-        label="Working Parts (the machinery)"
+        label="Modules"
         style="filled"
         fillcolor="#f9f9f9"
         color="#999999"
 
-        mod_hook_computer_use [label="Screenshot Delivery\nGets pictures back to the assistant", shape=box, fillcolor="#bbdefb", style="filled,rounded"]
-        mod_tool_computer_use [label="Mouse, Keyboard & Screen Capture\nThe actual desktop controls", shape=box, fillcolor="#bbdefb", style="filled,rounded"]
+        mod_hook_computer_use [label="hook-computer-use", shape=box, fillcolor="#bbdefb", style="filled,rounded"]
+        mod_tool_computer_use [label="tool-computer-use\n1 tool · ~323 tok", shape=box, fillcolor="#bbdefb", style="filled,rounded"]
     }
 
     subgraph cluster_context {
-        label="Written Guidance"
+        label="Context Files"
         style="filled"
         fillcolor="#f9f9f9"
         color="#999999"
 
-        ctx_computer_use_awareness_md [label="When to Reach for the Desktop\ncomputer-use-awareness.md\n~192 tok", shape=box, fillcolor="#e1bee7", style="filled,rounded"]
+        ctx_computer_use_awareness_md [label="computer-use-awareness.md\n~344 tok", shape=box, fillcolor="#e1bee7", style="filled,rounded"]
     }
 
     subgraph cluster_legend {
@@ -60,25 +59,25 @@ digraph computer_use {
         color="#cccccc"
         fontsize=9
 
-        leg_root [label="the whole package", shape=box, fillcolor="#80cbc4", style="filled,rounded,bold", fontsize=9]
-        leg_behavior [label="capability switched on", shape=box, fillcolor="#e0f2f1", style="filled,rounded", fontsize=9]
-        leg_agent [label="specialist helper", shape=box, fillcolor="#c8e6c9", style="filled,rounded", fontsize=9]
-        leg_module [label="working part", shape=box, fillcolor="#bbdefb", style="filled,rounded", fontsize=9]
-        leg_provider [label="outside service", shape=box, fillcolor="#e0e0e0", style="filled,rounded", fontsize=9]
-        leg_context [label="written guidance", shape=box, fillcolor="#e1bee7", style="filled,rounded", fontsize=9]
-        leg_standalone [label="works on its own", shape=box, fillcolor="#80cbc4", style="filled,rounded", fontsize=9]
-        leg_experiment [label="experimental", shape=box, fillcolor="#e1bee7", style="filled,rounded", fontsize=9]
-        leg_ext_cost [label="borrowed, adds cost", shape=box, fillcolor="#80cbc4", style="dashed", color="red", penwidth=2, fontsize=9]
-        leg_ext_muted [label="borrowed, free", shape=box, fillcolor="#f5f5f5", style="dashed", fontsize=9]
+        leg_root [label="root bundle", shape=box, fillcolor="#80cbc4", style="filled,rounded,bold", fontsize=9]
+        leg_behavior [label="behavior", shape=box, fillcolor="#e0f2f1", style="filled,rounded", fontsize=9]
+        leg_agent [label="agent", shape=box, fillcolor="#c8e6c9", style="filled,rounded", fontsize=9]
+        leg_module [label="module", shape=box, fillcolor="#bbdefb", style="filled,rounded", fontsize=9]
+        leg_provider [label="provider", shape=box, fillcolor="#e0e0e0", style="filled,rounded", fontsize=9]
+        leg_context [label="context", shape=box, fillcolor="#e1bee7", style="filled,rounded", fontsize=9]
+        leg_standalone [label="standalone", shape=box, fillcolor="#80cbc4", style="filled,rounded", fontsize=9]
+        leg_experiment [label="experiment", shape=box, fillcolor="#e1bee7", style="filled,rounded", fontsize=9]
+        leg_ext_cost [label="ext+cost", shape=box, fillcolor="#80cbc4", style="dashed", color="red", penwidth=2, fontsize=9]
+        leg_ext_muted [label="ext+no-cost", shape=box, fillcolor="#f5f5f5", style="dashed", fontsize=9]
     }
 
-    disclaimer [label="\"tok\" = rough size of the reading material given to the assistant (~4 characters each)\nSolid border = lives in this repo (size counted)\nDashed + red = borrowed from elsewhere, adds hidden size (not counted)\nDashed + grey = borrowed from elsewhere, no added size\nNot included: helper sessions, anything decided while running", shape=note, fillcolor="#eceff1", style="filled", fontsize=9]
+    disclaimer [label="Token estimates: ~4 chars/token\nSolid border = local (counted)\nDashed + red = external, hidden cost (not counted)\nDashed + muted = external, no cost\nExcludes: sub-session costs, runtime-dynamic", shape=note, fillcolor="#eceff1", style="filled", fontsize=9]
 
 
-    root_computer_use -> beh_computer_use_behavior [label="turns on"]
-    beh_computer_use_behavior -> agt_computer_operator [label="provides"]
-    beh_computer_use_behavior -> mod_tool_computer_use [label="relies on", penwidth=0.8]
-    beh_computer_use_behavior -> mod_hook_computer_use [label="relies on", penwidth=0.8]
+    root_computer_use -> beh_computer_use_behavior [label="composes"]
+    beh_computer_use_behavior -> agt_computer_operator [label="owns"]
+    beh_computer_use_behavior -> mod_tool_computer_use [label="uses", penwidth=0.8]
+    beh_computer_use_behavior -> mod_hook_computer_use [label="uses", penwidth=0.8]
     beh_computer_use_behavior -> ctx_computer_use_awareness_md [style=dotted, color=purple]
     root_computer_use -> ctx_computer_use_awareness_md [style=dotted, color=purple]
 }
