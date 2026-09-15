@@ -2,19 +2,22 @@
 
 In-process, like `LinuxX11Backend`: every action below talks straight to WindowServer
 through pyobjc's `Quartz` bindings around CoreGraphics's Display Services and Event
-Services APIs. There is no subprocess anywhere on the hot path for the core action set
-(capture, geometry, monitors, cursor, move/click/drag/scroll/key/type) - the opposite
-constraint from `WindowsBackend`, which must cross the WSL2/Win32 boundary through
+Services APIs. Capture normally uses Core Graphics in process; a deliberately narrow
+single-active-display fallback may invoke Apple's `screencapture` utility after a native
+capture returns `None` and fresh lock, topology, and permission checks succeed. The
+remaining core action set (geometry, monitors, cursor, move/click/drag/scroll/key/type)
+does not spawn a subprocess - the opposite constraint from `WindowsBackend`, which must cross the WSL2/Win32 boundary through
 `powershell.exe` for every single action. macOS needs neither of those crossings: the
 console session this process runs in *is* the GUI session (confirmed: this backend was
 built and verified over SSH into the same user account that owns the desktop), so a
 plain in-process Core Graphics connection reaches the real screen directly, the same
 way `LinuxX11Backend`'s Xlib connection reaches the real X server directly.
 
-Two capabilities shell out anyway, for the same reason `LinuxX11Backend` shells out to
-`xclip` for clipboard: a well-solved, battle-tested surface already exists, and
+Two normal capabilities shell out anyway, for the same reason `LinuxX11Backend` shells
+out to `xclip` for clipboard: a well-solved, battle-tested surface already exists, and
 reimplementing it in-process would trade a working dependency for fragile code with no
-capability upside.
+capability upside. The narrow capture recovery described above is a separate exceptional
+case, not a general subprocess capture path.
 
 * Clipboard -> `pbcopy`/`pbpaste`. Apple's own, always present, gets NSPasteboard's
   UTI/type negotiation right for free.
@@ -64,10 +67,14 @@ from __future__ import annotations
 import ctypes
 import ctypes.util
 import logging
+import os
 import plistlib
 import shutil
 import subprocess
 import sys
+import tempfile
+import time
+from pathlib import Path
 from typing import Any
 
 from .backend import (
@@ -870,6 +877,184 @@ class MacOSBackend:
             "to sleep or been disconnected."
         )
 
+    @staticmethod
+    def _single_display_fallback_error(reason: str) -> BackendError:
+        """Return a fixed, non-sensitive error for the optional utility fallback."""
+        return BackendError(f"single-display screencapture fallback {reason}")
+
+    def _validate_single_display_fallback_target(self, expected: MonitorInfo) -> None:
+        """Fail closed unless the current sole main display is exactly `expected`.
+
+        These independent reads cannot make display topology atomic. They only ensure
+        the narrow fallback does not knowingly accept pixels after a changed, missing,
+        ambiguous, or remapped target.
+        """
+        try:
+            expected_id = int(expected.id)
+            if self._active_display_ids() != [expected_id]:
+                raise ValueError("active display changed")
+            if int(Quartz.CGMainDisplayID()) != expected_id:
+                raise ValueError("main display changed")
+            monitors = self._monitor_infos()
+            if len(monitors) != 1:
+                raise ValueError("monitor set is not singular")
+            current = monitors[0]
+            if (
+                int(current.id),
+                current.x,
+                current.y,
+                current.width,
+                current.height,
+            ) != (
+                expected_id,
+                expected.x,
+                expected.y,
+                expected.width,
+                expected.height,
+            ):
+                raise ValueError("monitor geometry changed")
+        except Exception:  # noqa: BLE001 - fail closed without native/raw details
+            raise self._single_display_fallback_error(
+                "refused: target display changed or could not be validated"
+            ) from None
+
+    def _screencapture_single_display(
+        self, expected: MonitorInfo, deadline: float
+    ) -> Any:
+        """Capture the current sole main display via a private PNG, then decode in memory.
+
+        This is intentionally not a general alternate capture implementation. It is
+        reached only after a native `CGDisplayCreateImage` call returned `None` for an
+        initially singular target. `-m` selects the freshly verified main display; no
+        secondary-display ordinal mapping or multi-display composition is attempted.
+        """
+        if _cg_preflight_screen_capture_access() is not True:
+            raise self._single_display_fallback_error(
+                "refused: fresh screen-capture preflight was not positive"
+            )
+
+        temp_dir: str | None = None
+        fd: int | None = None
+        image_path: str | None = None
+        try:
+            try:
+                temp_dir = tempfile.mkdtemp(prefix="amplifier-cu-capture-")
+                os.chmod(temp_dir, 0o700)
+                fd, image_path = tempfile.mkstemp(suffix=".png", dir=temp_dir)
+                os.fchmod(fd, 0o600)
+                os.close(fd)
+                fd = None
+            except OSError:
+                raise self._single_display_fallback_error(
+                    "could not create private temporary storage"
+                ) from None
+
+            self._validate_single_display_fallback_target(expected)
+            state, _detail = _macos_session_state()
+            if state != "unlocked":
+                raise self._single_display_fallback_error(
+                    "refused: session is not unlocked"
+                )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise self._single_display_fallback_error("exceeded capture budget")
+
+            try:
+                proc = subprocess.run(
+                    [
+                        "/usr/sbin/screencapture",
+                        "-x",
+                        "-m",
+                        "-t",
+                        "png",
+                        image_path,
+                    ],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=remaining,
+                    check=False,
+                    shell=False,
+                )
+            except subprocess.TimeoutExpired:
+                raise self._single_display_fallback_error("timed out") from None
+            except subprocess.SubprocessError:
+                raise self._single_display_fallback_error("failed") from None
+            except OSError:
+                raise self._single_display_fallback_error(
+                    "could not launch screencapture"
+                ) from None
+            if proc.returncode != 0:
+                raise self._single_display_fallback_error("failed")
+            if deadline - time.monotonic() <= 0:
+                raise self._single_display_fallback_error("exceeded capture budget")
+
+            state, _detail = _macos_session_state()
+            if state != "unlocked":
+                raise self._single_display_fallback_error(
+                    "refused: session is not unlocked"
+                )
+            self._validate_single_display_fallback_target(expected)
+            if image_path is None or not os.path.isfile(image_path):
+                raise self._single_display_fallback_error("produced no PNG file")
+            try:
+                raw = Path(image_path).read_bytes()
+            except OSError:
+                raise self._single_display_fallback_error(
+                    "could not read PNG data"
+                ) from None
+            if not raw:
+                raise self._single_display_fallback_error("produced no PNG data")
+            if not raw.startswith(b"\x89PNG\r\n\x1a\n"):
+                raise self._single_display_fallback_error("produced invalid PNG data")
+
+            try:
+                from CoreFoundation import (
+                    CFDataCreate,  # type: ignore[import-not-found]
+                )
+
+                data = CFDataCreate(None, raw, len(raw))
+                source = Quartz.CGImageSourceCreateWithData(data, None)
+                if source is None:
+                    raise self._single_display_fallback_error(
+                        "could not decode PNG data"
+                    )
+                image = Quartz.CGImageSourceCreateImageAtIndex(source, 0, None)
+                if image is None:
+                    raise self._single_display_fallback_error(
+                        "could not decode PNG image"
+                    )
+                actual_size = (
+                    int(Quartz.CGImageGetWidth(image)),
+                    int(Quartz.CGImageGetHeight(image)),
+                )
+            except BackendError:
+                raise
+            except Exception:  # noqa: BLE001 - decoder details may contain private paths
+                raise self._single_display_fallback_error(
+                    "could not decode PNG data"
+                ) from None
+            if actual_size != (expected.width, expected.height):
+                raise self._single_display_fallback_error(
+                    "produced unexpected image dimensions"
+                )
+            if deadline - time.monotonic() <= 0:
+                raise self._single_display_fallback_error("exceeded capture budget")
+            return image
+        finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            if temp_dir is not None:
+                try:
+                    shutil.rmtree(temp_dir)
+                except OSError:
+                    raise self._single_display_fallback_error(
+                        "cleanup failed: private capture data may remain"
+                    ) from None
+
     def capture(self, region: tuple[int, int, int, int] | None = None) -> bytes:
         """Return PNG bytes at native (physical-pixel) resolution.
 
@@ -893,7 +1078,17 @@ class MacOSBackend:
         screen produces a real, plausible-looking `CGDisplayCreateImage` result, not
         `None` and not an exception - see `_macos_session_state()`'s module-level
         docstring for the real incident this refusal exists to prevent.
+
+        If that native per-display call returns `None`, a conservative alternative is
+        available only when the initial target was exactly one active display and it is
+        still the sole main display with unchanged physical geometry. It requires a
+        fresh positive permission preflight and an unlocked session before and after
+        one bounded `screencapture -m` child. Its temporary PNG is decoded into memory
+        before cleanup, then follows this method's existing crop/encode path. This
+        does not apply to multi-display capture, cannot make topology or permission
+        checks atomic, and does not promise a hard capture wall time.
         """
+        fallback_deadline = time.monotonic() + 20.0
         state, detail = _macos_session_state()
         if state != "unlocked":
             raise BackendError(
@@ -928,7 +1123,10 @@ class MacOSBackend:
 
         full_image = Quartz.CGDisplayCreateImage(display_id)
         if full_image is None:
-            raise BackendError(self._capture_none_error(display_id))
+            if len(ids) == 1 and display_id == ids[0] and int(m.id) == ids[0]:
+                full_image = self._screencapture_single_display(m, fallback_deadline)
+            else:
+                raise BackendError(self._capture_none_error(display_id))
         if (local_x, local_y, w, h) == (
             0,
             0,

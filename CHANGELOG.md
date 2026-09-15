@@ -28,6 +28,11 @@ line declared in `modules/tool-computer-use/pyproject.toml` and
 
 ### Fixed
 
+- Added a narrow, offline-logic-tested-only macOS fallback after native per-display capture
+  returns `None`: one bounded `screencapture -m` attempt for an unchanged single active main
+  display, with fresh preflight, lock/topology checks, private temporary storage, and
+  in-memory PNG decoding. Real-macOS verification is still required. Adapted from the
+  capture-alternative lead reported by [@colombod in PR #11](https://github.com/microsoft/amplifier-bundle-computer-use/pull/11).
 - Two silent failures blocking end-to-end remote desktop control.
 - Missing `python-xlib` now reported as a missing dependency rather than surfacing as
   an X server connection failure.

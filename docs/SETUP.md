@@ -623,6 +623,32 @@ problems with different fixes:
 
 ---
 
+### Narrow macOS single-display capture fallback
+
+If native `CGDisplayCreateImage` returns `None`, capture may make one bounded
+`/usr/sbin/screencapture -m` attempt **only** when exactly one active display remains the
+main display with unchanged physical geometry. Before launching it, the backend requires a
+fresh positive Screen Recording preflight and an unlocked session; it rechecks the unlocked
+state and display identity after the child, decodes the private temporary PNG into memory,
+and rejects unexpected dimensions. The temporary directory and file are private; cleanup
+is attempted on every path. A cleanup failure is reported explicitly because private
+capture data may remain.
+
+This is a conservative fallback, not a permission prompt or reset. A positive preflight does
+not establish that the utility has the same TCC attribution, and the checks cannot make
+topology or permission use atomic. The 20-second fallback budget includes prior capture and
+setup work; the child receives only time remaining. It leaves a usual 10-second margin below
+the default 30-second wire timeout for encoding, but does not guarantee a hard wall time.
+Multi-display/virtual-desktop capture and region capture while multiple displays are active
+remain outside this fallback's scope. Existing diagnostics are unchanged and this does not
+claim to diagnose or fix a physical display condition.
+
+Offline logic tests cover this adaptation; it has not been verified on real macOS hardware.
+The capture-alternative lead was reported by [@colombod in PR #11](https://github.com/microsoft/amplifier-bundle-computer-use/pull/11);
+this narrower adaptation is not a claim of independent hardware verification.
+
+---
+
 ## 9. Known issues
 
 ### macOS `type_text` silently no-ops while returning success — OPEN

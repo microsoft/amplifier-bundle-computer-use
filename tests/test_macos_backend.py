@@ -1011,3 +1011,566 @@ def test_lock_check_runs_before_accessibility_check(monkeypatch):
 
     with pytest.raises(BackendError, match="LOCKED"):
         backend.click(10, 10)
+
+
+# -- narrow single-active-display screencapture fallback -----------------------
+
+
+@pytest.fixture(autouse=True)
+def _private_fallback_test_storage(monkeypatch, tmp_path):
+    import tempfile
+
+    real_mkdtemp = tempfile.mkdtemp
+
+    def private_dir(**kwargs):
+        return real_mkdtemp(**{**kwargs, "dir": str(tmp_path)})
+
+    monkeypatch.setattr(tempfile, "mkdtemp", private_dir)
+    yield
+    assert not list(tmp_path.glob("amplifier-cu-capture-*")), "capture storage leaked"
+
+
+class _FallbackImage:
+    def __init__(self, width, height, raw=b"") -> None:
+        self.width = width
+        self.height = height
+        self.raw = raw
+
+
+class _SingleFallbackQuartz(_FakeQuartz):
+    """A 2x Retina display whose native per-display capture returns ``None``."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            [
+                {
+                    "id": 7,
+                    "bounds": (0, 0, 2, 1),
+                    "pixel_w": 4,
+                    "pixel_h": 2,
+                    "main": True,
+                }
+            ]
+        )
+        self.decoded_image = _FallbackImage(4, 2)
+
+    def CGDisplayCreateImage(self, _display_id):
+        return None
+
+    def CGImageSourceCreateWithData(self, data, _options):
+        return data
+
+    def CGImageSourceCreateImageAtIndex(self, source, _index, _options):
+        self.decoded_image.raw = source
+        return self.decoded_image
+
+    def CGImageGetWidth(self, image):
+        return image.width
+
+    def CGImageGetHeight(self, image):
+        return image.height
+
+    def CGRectMake(self, x, y, width, height):
+        return x, y, width, height
+
+    def CGImageCreateWithImageInRect(self, image, rect):
+        import io
+
+        from PIL import Image
+
+        x, y, width, height = rect
+        with Image.open(io.BytesIO(image.raw)) as decoded:
+            cropped = decoded.crop((x, y, x + width, y + height))
+            data = io.BytesIO()
+            cropped.save(data, format="PNG")
+        return _FallbackImage(width, height, data.getvalue())
+
+
+def _valid_png(width=4, height=2):
+    """Use Pillow only to create test data; ImageIO is faked below."""
+    import io
+
+    from PIL import Image
+
+    output = io.BytesIO()
+    image = Image.new("RGBA", (width, height))
+    image.putdata(
+        [
+            (x * 20, y * 40, (x + y) * 10, 255)
+            for y in range(height)
+            for x in range(width)
+        ]
+    )
+    image.save(output, format="PNG")
+    return output.getvalue()
+
+
+def _fallback_backend(monkeypatch):
+    fake = _SingleFallbackQuartz()
+    monkeypatch.setattr(macos, "Quartz", fake)
+    monkeypatch.setattr(
+        macos, "_macos_session_state", lambda: ("unlocked", "test session")
+    )
+    monkeypatch.setattr(macos, "_cg_preflight_screen_capture_access", lambda: True)
+    monkeypatch.setitem(
+        sys.modules,
+        "CoreFoundation",
+        types.SimpleNamespace(CFDataCreate=lambda _alloc, raw, length: raw[:length]),
+    )
+    return MacOSBackend({}), fake
+
+
+def _png_process(data, seen, after_write=None):
+    def fake_run(argv, **kwargs):
+        import os
+        import stat
+
+        image_path = Path(argv[-1])
+        seen["argv"] = list(argv)
+        seen["kwargs"] = kwargs
+        seen["directory_mode"] = stat.S_IMODE(os.stat(image_path.parent).st_mode)
+        seen["file_mode"] = stat.S_IMODE(os.stat(image_path).st_mode)
+        if data is None:
+            image_path.unlink()
+        else:
+            image_path.write_bytes(data)
+        if after_write is not None:
+            after_write()
+        return types.SimpleNamespace(returncode=0)
+
+    return fake_run
+
+
+@pytest.mark.parametrize(
+    ("region", "expected_size"),
+    [
+        (None, (4, 2)),
+        ((0, 0, 2, 2), (2, 2)),
+        ((2, 0, 4, 2), (2, 2)),
+    ],
+)
+def test_capture_single_display_fallback_preserves_retina_capture_and_crop(
+    monkeypatch, region, expected_size
+):
+    backend, fake = _fallback_backend(monkeypatch)
+    seen = {}
+    raw = _valid_png()
+    monkeypatch.setattr(macos.subprocess, "run", _png_process(raw, seen))
+
+    def encode(image):
+        import io
+
+        from PIL import Image
+
+        assert not Path(seen["argv"][-1]).exists(), "utility file must be removed"
+        with Image.open(io.BytesIO(raw)) as original:
+            expected = original.crop(region) if region is not None else original
+            with Image.open(io.BytesIO(image.raw)) as decoded:
+                assert decoded.size == expected_size
+                assert decoded.tobytes() == expected.tobytes()
+        return f"encoded:{image.width}x{image.height}".encode()
+
+    monkeypatch.setattr(MacOSBackend, "_encode_png", staticmethod(encode))
+
+    assert backend.capture(region) == (
+        f"encoded:{expected_size[0]}x{expected_size[1]}".encode()
+    )
+    assert len(seen["argv"]) == 6
+    assert seen["argv"][:-1] == ["/usr/sbin/screencapture", "-x", "-m", "-t", "png"]
+    assert seen["kwargs"]["stdin"] is macos.subprocess.DEVNULL
+    assert seen["kwargs"]["stdout"] is macos.subprocess.DEVNULL
+    assert seen["kwargs"]["stderr"] is macos.subprocess.DEVNULL
+    assert "capture_output" not in seen["kwargs"]
+    assert seen["kwargs"]["shell"] is False
+    assert seen["directory_mode"] == 0o700
+    assert seen["file_mode"] == 0o600
+    assert (fake.decoded_image.width, fake.decoded_image.height) == (4, 2)
+
+
+def test_capture_native_success_never_consults_single_display_fallback(monkeypatch):
+    backend, fake = _fallback_backend(monkeypatch)
+    native = _FallbackImage(4, 2)
+    fake.CGDisplayCreateImage = lambda _display_id: native
+    monkeypatch.setattr(
+        macos,
+        "_cg_preflight_screen_capture_access",
+        lambda: pytest.fail("fallback preflight called after native success"),
+    )
+    monkeypatch.setattr(
+        MacOSBackend,
+        "_screencapture_single_display",
+        lambda *_args: pytest.fail("fallback called after native success"),
+    )
+    monkeypatch.setattr(
+        MacOSBackend, "_encode_png", staticmethod(lambda _image: b"native")
+    )
+
+    assert backend.capture() == b"native"
+
+
+def test_capture_multi_display_whole_path_is_unchanged(monkeypatch):
+    fake = _FakeQuartz(
+        [
+            {"id": 7, "bounds": (0, 0, 2, 1), "pixel_w": 2, "pixel_h": 1, "main": True},
+            {
+                "id": 9,
+                "bounds": (2, 0, 2, 1),
+                "pixel_w": 2,
+                "pixel_h": 1,
+                "main": False,
+            },
+        ]
+    )
+    fake.CGWindowListCreateImage = lambda *_args: "virtual"
+    fake.CGRectInfinite = "infinite"
+    fake.kCGWindowListOptionOnScreenOnly = 1
+    fake.kCGNullWindowID = 0
+    fake.kCGWindowImageDefault = 0
+    monkeypatch.setattr(macos, "Quartz", fake)
+    monkeypatch.setattr(macos, "_macos_session_state", lambda: ("unlocked", "test"))
+    monkeypatch.setattr(
+        MacOSBackend,
+        "_screencapture_single_display",
+        lambda *_args: pytest.fail("multi-display whole capture must not use fallback"),
+    )
+    monkeypatch.setattr(
+        MacOSBackend, "_encode_png", staticmethod(lambda image: image.encode())
+    )
+
+    assert MacOSBackend({}).capture() == b"virtual"
+
+
+def test_capture_multi_display_region_native_none_keeps_existing_error(monkeypatch):
+    backend, _fake = _fallback_backend(monkeypatch)
+    _fake._displays[9] = {
+        "id": 9,
+        "bounds": (2, 0, 2, 1),
+        "pixel_w": 2,
+        "pixel_h": 1,
+        "main": False,
+    }
+    monkeypatch.setattr(
+        MacOSBackend,
+        "_screencapture_single_display",
+        lambda *_args: pytest.fail("multi-display region must not use fallback"),
+    )
+    monkeypatch.setattr(
+        MacOSBackend, "_capture_none_error", lambda *_args: "native none"
+    )
+
+    with pytest.raises(BackendError, match="native none"):
+        backend.capture((0, 0, 1, 1))
+
+
+@pytest.mark.parametrize("state", ["locked", "no_gui_session", "unknown"])
+def test_capture_initial_non_unlocked_state_never_starts_fallback(monkeypatch, state):
+    backend, _fake = _fallback_backend(monkeypatch)
+    monkeypatch.setattr(macos, "_macos_session_state", lambda: (state, "raw detail"))
+    monkeypatch.setattr(
+        macos.subprocess,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail("child process started"),
+    )
+
+    with pytest.raises(BackendError):
+        backend.capture()
+
+
+@pytest.mark.parametrize("preflight", [False, None])
+def test_capture_fallback_refuses_nonpositive_preflight_without_child(
+    monkeypatch, preflight
+):
+    backend, _fake = _fallback_backend(monkeypatch)
+    monkeypatch.setattr(macos, "_cg_preflight_screen_capture_access", lambda: preflight)
+    monkeypatch.setattr(
+        macos.subprocess,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail("child process started"),
+    )
+
+    with pytest.raises(BackendError, match="preflight was not positive"):
+        backend.capture()
+
+
+def test_capture_fallback_refuses_locked_recheck_without_child(monkeypatch):
+    backend, _fake = _fallback_backend(monkeypatch)
+    states = iter([("unlocked", "initial"), ("locked", "private")])
+    monkeypatch.setattr(macos, "_macos_session_state", lambda: next(states))
+    monkeypatch.setattr(
+        macos.subprocess,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail("child process started"),
+    )
+
+    with pytest.raises(BackendError, match="session is not unlocked") as error:
+        backend.capture()
+    assert "private" not in str(error.value)
+
+
+def test_capture_fallback_refuses_topology_change_before_child(monkeypatch):
+    backend, fake = _fallback_backend(monkeypatch)
+    active_lists = iter([[7], [7], [9]])
+    monkeypatch.setattr(backend, "_active_display_ids", lambda: next(active_lists))
+    monkeypatch.setattr(
+        macos.subprocess,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail("child process started"),
+    )
+
+    with pytest.raises(BackendError, match="target display changed"):
+        backend.capture()
+    assert 7 in fake._displays
+
+
+def test_capture_fallback_refuses_main_display_change_before_child(monkeypatch):
+    backend, fake = _fallback_backend(monkeypatch)
+    main_ids = iter([7, 8])
+    fake.CGMainDisplayID = lambda: next(main_ids)
+    monkeypatch.setattr(
+        macos.subprocess,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail("child process started"),
+    )
+
+    with pytest.raises(BackendError, match="target display changed"):
+        backend.capture()
+
+
+def test_capture_fallback_refuses_geometry_change_before_child(monkeypatch):
+    backend, fake = _fallback_backend(monkeypatch)
+
+    def native_none(_display_id):
+        fake._displays[7]["pixel_w"] = 5
+        return None
+
+    fake.CGDisplayCreateImage = native_none
+    monkeypatch.setattr(
+        macos.subprocess,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail("child process started"),
+    )
+
+    with pytest.raises(BackendError, match="target display changed"):
+        backend.capture()
+
+
+@pytest.mark.parametrize("change", ["topology", "main", "geometry"])
+def test_capture_fallback_discards_child_output_after_target_change(
+    monkeypatch, change
+):
+    backend, fake = _fallback_backend(monkeypatch)
+    seen = {}
+
+    def change_target():
+        if change == "topology":
+            fake._displays[9] = {
+                "id": 9,
+                "bounds": (2, 0, 2, 1),
+                "pixel_w": 2,
+                "pixel_h": 1,
+                "main": False,
+            }
+        elif change == "main":
+            fake.CGMainDisplayID = lambda: 9
+        else:
+            fake._displays[7]["pixel_h"] = 3
+
+    monkeypatch.setattr(
+        macos.subprocess, "run", _png_process(_valid_png(), seen, change_target)
+    )
+
+    with pytest.raises(BackendError, match="target display changed"):
+        backend.capture()
+    assert "argv" in seen
+
+
+def test_capture_fallback_discards_child_output_after_session_locks(monkeypatch):
+    backend, _fake = _fallback_backend(monkeypatch)
+    states = iter(
+        [
+            ("unlocked", "initial"),
+            ("unlocked", "before child"),
+            ("locked", "after child"),
+        ]
+    )
+    monkeypatch.setattr(macos, "_macos_session_state", lambda: next(states))
+    monkeypatch.setattr(macos.subprocess, "run", _png_process(_valid_png(), {}))
+
+    with pytest.raises(BackendError, match="session is not unlocked"):
+        backend.capture()
+
+
+@pytest.mark.parametrize(
+    ("outcome", "message"),
+    [
+        ("timeout", "timed out"),
+        ("nonzero", "failed"),
+        ("missing", "produced no PNG file"),
+        ("empty", "produced no PNG data"),
+        ("malformed", "produced invalid PNG data"),
+        ("read", "could not read PNG data"),
+    ],
+)
+def test_capture_fallback_child_failures_are_fixed_and_private(
+    monkeypatch, outcome, message
+):
+    backend, _fake = _fallback_backend(monkeypatch)
+    poison = "do-not-leak-private-capture-path"
+    if outcome == "timeout":
+        monkeypatch.setattr(
+            macos.subprocess,
+            "run",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                macos.subprocess.TimeoutExpired(["ignored"], 1, stderr=poison)
+            ),
+        )
+    elif outcome == "nonzero":
+        monkeypatch.setattr(
+            macos.subprocess,
+            "run",
+            lambda *_args, **_kwargs: types.SimpleNamespace(returncode=1),
+        )
+    else:
+        data = {
+            "missing": None,
+            "empty": b"",
+            "malformed": poison.encode(),
+            "read": _valid_png(),
+        }[outcome]
+        monkeypatch.setattr(macos.subprocess, "run", _png_process(data, {}))
+        if outcome == "read":
+            monkeypatch.setattr(
+                macos.Path,
+                "read_bytes",
+                lambda _path: (_ for _ in ()).throw(OSError(poison)),
+            )
+
+    with pytest.raises(BackendError, match=message) as error:
+        backend.capture()
+    assert poison not in str(error.value)
+
+
+@pytest.mark.parametrize(
+    ("source", "image", "message"),
+    [
+        (None, _FallbackImage(4, 2), "could not decode PNG data"),
+        (b"source", None, "could not decode PNG image"),
+        (b"source", _FallbackImage(3, 2), "unexpected image dimensions"),
+    ],
+)
+def test_capture_fallback_rejects_invalid_decoded_image(
+    monkeypatch, source, image, message
+):
+    backend, fake = _fallback_backend(monkeypatch)
+    fake.CGImageSourceCreateWithData = lambda _data, _options: source
+    fake.CGImageSourceCreateImageAtIndex = lambda _source, _index, _options: image
+    monkeypatch.setattr(macos.subprocess, "run", _png_process(_valid_png(), {}))
+
+    with pytest.raises(BackendError, match=message):
+        backend.capture()
+
+
+def test_capture_fallback_temp_creation_error_is_fixed_and_private(monkeypatch):
+    backend, _fake = _fallback_backend(monkeypatch)
+    poison = "do-not-leak-temp-path"
+    monkeypatch.setattr(
+        macos.tempfile,
+        "mkdtemp",
+        lambda **_kwargs: (_ for _ in ()).throw(OSError(poison)),
+    )
+
+    with pytest.raises(
+        BackendError, match="could not create private temporary storage"
+    ) as error:
+        backend.capture()
+    assert poison not in str(error.value)
+
+
+@pytest.mark.parametrize("returncode", [0, 1])
+def test_capture_fallback_cleanup_failure_never_reports_success(
+    monkeypatch, returncode
+):
+    import shutil
+
+    backend, _fake = _fallback_backend(monkeypatch)
+    real_rmtree = shutil.rmtree
+    seen = {}
+    write_png = _png_process(_valid_png(), seen)
+
+    def run(*args, **kwargs):
+        write_png(*args, **kwargs)
+        return types.SimpleNamespace(returncode=returncode)
+
+    def fail_cleanup(_path):
+        raise OSError("PRIVATE_CAPTURE_PATH")
+
+    monkeypatch.setattr(macos.subprocess, "run", run)
+    monkeypatch.setattr(macos.shutil, "rmtree", fail_cleanup)
+    try:
+        with pytest.raises(
+            BackendError, match="private capture data may remain"
+        ) as exc:
+            backend.capture()
+        assert "PRIVATE_CAPTURE_PATH" not in str(exc.value)
+    finally:
+        if seen:
+            real_rmtree(Path(seen["argv"][-1]).parent)
+
+
+def test_capture_fallback_uses_remaining_deadline_budget(monkeypatch):
+    backend, fake = _fallback_backend(monkeypatch)
+    clock = types.SimpleNamespace(value=0.0)
+    monkeypatch.setattr(macos.time, "monotonic", lambda: clock.value)
+
+    def native_none(_display_id):
+        clock.value = 10.0
+        return None
+
+    def preflight():
+        clock.value = 12.0
+        return True
+
+    seen = {}
+    fake.CGDisplayCreateImage = native_none
+    monkeypatch.setattr(macos, "_cg_preflight_screen_capture_access", preflight)
+    monkeypatch.setattr(macos.subprocess, "run", _png_process(_valid_png(), seen))
+    monkeypatch.setattr(MacOSBackend, "_encode_png", staticmethod(lambda _image: b"ok"))
+
+    assert backend.capture() == b"ok"
+    assert seen["kwargs"]["timeout"] == pytest.approx(8.0)
+
+
+def test_capture_fallback_expired_budget_skips_child(monkeypatch):
+    backend, fake = _fallback_backend(monkeypatch)
+    clock = types.SimpleNamespace(value=0.0)
+    monkeypatch.setattr(macos.time, "monotonic", lambda: clock.value)
+
+    def native_none(_display_id):
+        clock.value = 20.0
+        return None
+
+    fake.CGDisplayCreateImage = native_none
+    monkeypatch.setattr(
+        macos.subprocess,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail("expired budget launched child"),
+    )
+
+    with pytest.raises(BackendError, match="exceeded capture budget"):
+        backend.capture()
+
+
+def test_capture_fallback_discards_late_child_output(monkeypatch):
+    backend, _fake = _fallback_backend(monkeypatch)
+    clock = types.SimpleNamespace(value=0.0)
+    monkeypatch.setattr(macos.time, "monotonic", lambda: clock.value)
+    seen = {}
+
+    def late():
+        clock.value = 20.1
+
+    monkeypatch.setattr(macos.subprocess, "run", _png_process(_valid_png(), seen, late))
+
+    with pytest.raises(BackendError, match="exceeded capture budget"):
+        backend.capture()
+    assert "argv" in seen
