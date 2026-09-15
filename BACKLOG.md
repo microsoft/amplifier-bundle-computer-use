@@ -358,7 +358,17 @@ yet closed:
   black-box GUIs. The tell: if you are about to read pixels to find a button
   that has a DOM node, the wrong tool is in hand.
 
-## ~~macOS `type_text` silently no-ops~~ — RETRACTED 2026-08-03
+## ~~macOS `type_text` silently no-ops~~ — RETRACTED 2026-08-03, **RETRACTION WAS WRONG**
+
+> **Correction, 2026-09-15.** The retraction below is incorrect and is kept only as
+> record. `type_text` really was broken, for a reason nobody had guessed: it posted a
+> keycode-**0** `CGEventKeyboardSetUnicodeString` event, which macOS accepts and
+> discards. Fixed the next day in `ccf0913`. The re-test quoted below "proved" it worked
+> by observing `changed=True` on a screenshot diff — but Spotlight's own UI changes when
+> it opens, so the diff was true whether or not a single character landed. **Comparing
+> that something changed is not comparing what it changed to**; the fix commit was the
+> first check that read the field's actual content. So this section did not end the
+> confusion, it added a fourth wrong diagnosis to the three it complains about.
 
 **This was the locked-screen defect, not a separate bug.** Re-tested on the same
 host with the same code once the screen was unlocked:

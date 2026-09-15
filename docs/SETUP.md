@@ -75,7 +75,7 @@ Stated plainly so you can pick a path you can actually finish.
 | OpenAI provider driving a real desktop | **Proven live.** `gpt-5.5` verified end-to-end through this bundle against a real remote desktop, 2026-08-03 (`providers.py` `OPENAI.models`) |
 | Windows target (WSL2 interop, local) | **Proven.** Capture and input both verified end to end — see `BACKLOG.md` |
 | macOS target — capture, `key`, `focus_window` | **Proven** on real hardware |
-| macOS target — `type_text` | **BROKEN. Known open defect.** Returns success, enters nothing. See [Known issues](#9-known-issues) |
+| macOS target — `type_text` | **Proven** on real hardware. Was broken (keycode-0 events); fixed in `ccf0913`, re-verified 2026-09-15 on macOS 26.6.2 |
 | Linux/X11 target (local) | Backend implemented; presence guard measured (`GUARD_MEASURED["linux-x11"] = True`) |
 | Remote target over SSH | Full action set is implemented and dispatched, including `left_mouse_down`/`up`, `left_click_drag`, `scroll`, `hold_key`, and all four `desktop` window/clipboard actions — see [Remote action coverage](#remote-action-coverage) |
 | Gemini | A dialect record exists in `providers.py` (`gemini-2.5-computer-use` → `computer_use`), built from captured traffic. **No live end-to-end run through this bundle is claimed.** |
@@ -651,26 +651,46 @@ this narrower adaptation is not a claim of independent hardware verification.
 
 ## 9. Known issues
 
-### macOS `type_text` silently no-ops while returning success — OPEN
+### macOS `type_text` silently no-ops while returning success — FIXED
 
-**Status: open defect.** Logged in `BACKLOG.md` (found 2026-08-03).
+**Status: fixed** in `ccf0913` (2026-08-04). This section described it as open for six
+weeks after the fix landed, because that commit changed `macos.py` and its tests and
+never touched this file or the README. The stale label is itself part of the record — an
+agent reading it will tell a user the feature is broken.
 
-On an unlocked Mac, with the screen state confirmed by the presence guard:
+**What the defect actually was.** `type_text` posted a keycode-**0** event carrying the
+string via `CGEventKeyboardSetUnicodeString` — Apple's documented "arbitrary Unicode, no
+layout table" technique. `CGEventPost` accepts that event, signals nothing, and macOS
+delivers nothing. It was confirmed at both `kCGHIDEventTap` and `kCGSessionEventTap`, in
+process and over the remote-agent wire.
 
-- `key` (e.g. `cmd+space`) works. Spotlight opened, verified by screenshot.
-- `type` returned `success: true` and **entered nothing**.
+**The hypothesis this section used to carry — "the type path posts events to a specific
+app rather than the system-wide event tap" — was wrong.** Both paths used the same tap;
+only the keycode differed. It is left named here rather than deleted, because it is the
+kind of plausible, evidence-shaped guess that cost this defect two wrong retractions.
 
-This is **not** the lock defect — the screen was unlocked and capture returned real desktop
-content, so the lock guard correctly did not fire. `key` works and `type_text` does not,
-which localizes it to the type path. The current hypothesis, unconfirmed: the type path
-posts events to a specific app rather than the system-wide event tap.
+**The fix.** Every character resolves to a real, non-zero keycode (plus Shift where
+needed) through the same US-ANSI table `key()` already depends on, and `CGEventSetFlags`
+is called unconditionally — skipping it for the no-modifier case left plain lowercase and
+digits undelivered while shifted characters landed. A character with no keycode on that
+layout raises `BackendError` naming every unsupported character, typing nothing at all,
+rather than silently falling back to the technique measured to deliver nothing.
 
-It is the same shape as every other defect this bundle keeps surfacing — **a write that
-fails while reporting success** — and by the project's own no-fallbacks rule it must fail
-loud rather than report success. It does not yet.
+**Re-verified 2026-09-15** on macOS 26.6.2 (25G83), driven remotely over SSH, using this
+project's own Spotlight method — reading the pixels back, not just checking that no
+exception was raised:
 
-**Impact:** `key`-only flows on macOS are unaffected. Any flow that depends on `type` on
-macOS is blocked. Windows and Linux `type` are unaffected.
+```
+key("cmd+space")                     -> Spotlight opened
+type_text("amplifier typing test")
+capture                              -> Spotlight field reads: amplifier typing test
+                                        (and returned live results for that query)
+key("escape")                        -> dismissed
+```
+
+**Impact:** none outstanding. `type` on macOS works. See also `BACKLOG.md`'s
+"RETRACTED 2026-08-03" entry, which is *also* wrong — it retracted a real defect as a
+locked-screen artifact, on a re-test that never compared pixel content.
 
 ### Other stated gaps
 

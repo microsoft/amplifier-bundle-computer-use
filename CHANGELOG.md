@@ -28,6 +28,27 @@ line declared in `modules/tool-computer-use/pyproject.toml` and
 
 ### Fixed
 
+- Documentation that still described macOS `type_text` as an open defect six weeks after
+  it was fixed in `ccf0913`. The README's known-issues list, `docs/SETUP.md`'s capability
+  table and its §9 all carried the pre-fix text, including a hypothesis about the event
+  tap that the fix had already disproved. `BACKLOG.md`'s "RETRACTED" entry is annotated
+  too: that retraction was also wrong, for a reason worth keeping (its re-test asserted
+  the screen *changed*, not what it changed to). Re-verified on real hardware
+  (macOS 26.6.2, remote over SSH): Spotlight received the typed string verbatim.
+- Generalised that fallback from "the sole display" to "one display at a time", which is
+  what the default configuration actually needs: `target_monitor` defaults to `"primary"`,
+  so per-monitor capture routes through the per-display path, not the whole-virtual-desktop
+  branch - and on macOS 26 a second attached display therefore broke *every* ordinary
+  screenshot with an error blaming a display that was awake and capturable. Same guards,
+  `-D <1-based ordinal>` instead of `-m`, plus an active-display-list reorder check that the
+  sole-display form did not need. `-D`'s mapping to `CGGetActiveDisplayList` order is
+  verified by image CONTENT on macOS 26.6.2, not by size.
+- Whole-virtual-desktop capture on multi-display Macs running macOS 26, which hit a flat
+  30.0s `CGWindowListCreateImage` cost - also the remote transport's per-op timeout, so it
+  dropped the connection instead of returning an image. Composites per-display captures into
+  the identical canvas (point-space bounding box at the largest backing scale). Verified on a
+  mixed-DPI rig (2x built-in beside a 1x ultrawide): same 13696x2880 output, 30.04s -> 0.47s.
+  Falls back to the original call if the composite cannot be built.
 - Added a narrow, offline-logic-tested-only macOS fallback after native per-display capture
   returns `None`: one bounded `screencapture -m` attempt for an unchanged single active main
   display, with fresh preflight, lock/topology checks, private temporary storage, and
