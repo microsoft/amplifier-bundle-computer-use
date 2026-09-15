@@ -20,7 +20,7 @@ sys.path.insert(0, str(ROOT / "modules" / "tool-computer-use"))
 
 import pytest
 from amplifier_module_tool_computer_use import macos
-from amplifier_module_tool_computer_use.backend import BackendError
+from amplifier_module_tool_computer_use.backend import BackendError, MonitorInfo
 from amplifier_module_tool_computer_use.macos import (
     _CG_FLAG_ALTERNATE,
     _CG_FLAG_COMMAND,
@@ -1240,7 +1240,20 @@ def test_capture_multi_display_whole_path_is_unchanged(monkeypatch):
     assert MacOSBackend({}).capture() == b"virtual"
 
 
-def test_capture_multi_display_region_native_none_keeps_existing_error(monkeypatch):
+def test_capture_multi_display_region_uses_per_display_fallback(monkeypatch):
+    """CHANGED from `..._keeps_existing_error` when the compositor landed.
+
+    That test encoded this PR's original single-display-only scope. Measured on real
+    hardware (macOS 26.6.2), that scope left the COMMON case broken: `target_monitor`
+    defaults to "primary", which routes through this per-monitor/region path, not the
+    whole-virtual-desktop branch - so attaching a second display turned every
+    screenshot into "CGDisplayCreateImage(1) returned no image ... the display itself
+    is the likely cause", on a display that was awake and capturable.
+
+    The strict sole-display helper is still never used here - a secondary display is
+    not main and `-m` would capture the wrong screen. The per-display form is, with
+    the same guards and an explicit `-D` ordinal.
+    """
     backend, _fake = _fallback_backend(monkeypatch)
     _fake._displays[9] = {
         "id": 9,
@@ -1252,7 +1265,51 @@ def test_capture_multi_display_region_native_none_keeps_existing_error(monkeypat
     monkeypatch.setattr(
         MacOSBackend,
         "_screencapture_single_display",
-        lambda *_args: pytest.fail("multi-display region must not use fallback"),
+        lambda *_args: pytest.fail("multi-display must not use the sole-display form"),
+    )
+    seen: dict = {}
+
+    def _per_display(_self, expected, _deadline, ordinal, ids):
+        seen["id"] = int(expected.id)
+        seen["ordinal"] = ordinal
+        seen["ids"] = list(ids)
+        return _FallbackImage(2, 1)
+
+    monkeypatch.setattr(MacOSBackend, "_screencapture_display", _per_display)
+    monkeypatch.setattr(
+        MacOSBackend,
+        "_encode_png",
+        staticmethod(lambda image: f"encoded:{image.width}x{image.height}".encode()),
+    )
+
+    assert backend.capture((0, 0, 2, 1)) == b"encoded:2x1"
+    # 1-BASED ordinal into the active display list, not a CGDirectDisplayID.
+    assert (seen["id"], seen["ordinal"]) == (7, 1)
+    assert seen["ids"] == [7, 9]
+
+
+def test_capture_region_still_errors_when_target_is_not_an_active_display(monkeypatch):
+    """The honest-error path this replaced still exists, for the case that really
+    cannot be validated: the covering monitor is not in the active display list."""
+    backend, _fake = _fallback_backend(monkeypatch)
+    _fake._displays[9] = {
+        "id": 9,
+        "bounds": (2, 0, 2, 1),
+        "pixel_w": 2,
+        "pixel_h": 1,
+        "main": False,
+    }
+    monkeypatch.setattr(
+        MacOSBackend,
+        "_covering_monitor_for_pixel",
+        lambda _self, _x, _y: MonitorInfo(
+            id="99", x=0, y=0, width=2, height=1, primary=False, name=""
+        ),
+    )
+    monkeypatch.setattr(
+        MacOSBackend,
+        "_screencapture_display",
+        lambda *_a, **_k: pytest.fail("must not capture an unvalidated display"),
     )
     monkeypatch.setattr(
         MacOSBackend, "_capture_none_error", lambda *_args: "native none"

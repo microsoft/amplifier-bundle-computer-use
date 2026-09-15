@@ -882,23 +882,46 @@ class MacOSBackend:
         """Return a fixed, non-sensitive error for the optional utility fallback."""
         return BackendError(f"single-display screencapture fallback {reason}")
 
-    def _validate_single_display_fallback_target(self, expected: MonitorInfo) -> None:
-        """Fail closed unless the current sole main display is exactly `expected`.
+    def _validate_single_display_fallback_target(
+        self, expected: MonitorInfo, *, sole: bool = True, ids: list[int] | None = None
+    ) -> None:
+        """Fail closed unless the display being captured is still exactly `expected`.
 
         These independent reads cannot make display topology atomic. They only ensure
         the narrow fallback does not knowingly accept pixels after a changed, missing,
         ambiguous, or remapped target.
+
+        `sole=True` (the default, and the single-display fallback's own contract) is
+        the strictest form: exactly one active display, which is main, with unchanged
+        geometry. `sole=False` is the per-display form the virtual-desktop compositor
+        needs - the SAME guarantees scoped to one display of several: that display is
+        still present, the active display LIST is unchanged in both membership and
+        ORDER (which is what `-D`'s ordinal indexes, so a reorder mid-capture would
+        silently retarget), and that display's own geometry is unchanged. It does not
+        require the display to be main, because a secondary display never is.
         """
         try:
             expected_id = int(expected.id)
-            if self._active_display_ids() != [expected_id]:
-                raise ValueError("active display changed")
-            if int(Quartz.CGMainDisplayID()) != expected_id:
-                raise ValueError("main display changed")
+            active = self._active_display_ids()
+            if sole:
+                if active != [expected_id]:
+                    raise ValueError("active display changed")
+                if int(Quartz.CGMainDisplayID()) != expected_id:
+                    raise ValueError("main display changed")
+            else:
+                if ids is not None and active != list(ids):
+                    raise ValueError("active display list changed or reordered")
+                if expected_id not in active:
+                    raise ValueError("target display is no longer active")
             monitors = self._monitor_infos()
-            if len(monitors) != 1:
+            if sole and len(monitors) != 1:
                 raise ValueError("monitor set is not singular")
-            current = monitors[0]
+            current = next(
+                (mi for mi in monitors if int(mi.id) == expected_id),
+                None,
+            )
+            if current is None:
+                raise ValueError("target display is no longer enumerated")
             if (
                 int(current.id),
                 current.x,
@@ -923,10 +946,46 @@ class MacOSBackend:
     ) -> Any:
         """Capture the current sole main display via a private PNG, then decode in memory.
 
-        This is intentionally not a general alternate capture implementation. It is
-        reached only after a native `CGDisplayCreateImage` call returned `None` for an
-        initially singular target. `-m` selects the freshly verified main display; no
-        secondary-display ordinal mapping or multi-display composition is attempted.
+        Reached only after a native `CGDisplayCreateImage` call returned `None` for an
+        initially singular target. `-m` selects the freshly verified main display.
+        Unchanged in behaviour: this is the strict, sole-display contract, and it is
+        what the single-display fallback path still calls.
+        """
+        return self._screencapture_guarded(expected, deadline, sole=True)
+
+    def _screencapture_display(
+        self, expected: MonitorInfo, deadline: float, ordinal: int, ids: list[int]
+    ) -> Any:
+        """Per-display form of the same guarded capture, for the compositor.
+
+        `ordinal` is `screencapture`'s 1-BASED `-D` index, not a `CGDirectDisplayID`.
+        That mapping is `CGGetActiveDisplayList` ORDER, verified by content (not by
+        size) on macOS 26.6.2 against a mixed-DPI pair - see the compositor's docstring
+        for the measurement. The validator is given the full `ids` list so a reorder
+        between resolving the ordinal and reading the pixels is caught rather than
+        silently retargeting the capture.
+        """
+        return self._screencapture_guarded(
+            expected, deadline, sole=False, ordinal=ordinal, ids=ids
+        )
+
+    def _screencapture_guarded(
+        self,
+        expected: MonitorInfo,
+        deadline: float,
+        *,
+        sole: bool,
+        ordinal: int | None = None,
+        ids: list[int] | None = None,
+    ) -> Any:
+        """Shared implementation: one bounded `screencapture` child, fully guarded.
+
+        Every guard is identical in both forms - fresh permission preflight, unlocked
+        session before AND after the child, target re-validation before AND after,
+        remaining-budget timeout, private 0700/0600 storage, DEVNULL stdio, in-memory
+        decode before cleanup, and cleanup failure reported rather than swallowed.
+        Only the display selector differs: `-m` for the sole-display contract,
+        `-D <ordinal>` for one display of several.
         """
         if _cg_preflight_screen_capture_access() is not True:
             raise self._single_display_fallback_error(
@@ -949,7 +1008,7 @@ class MacOSBackend:
                     "could not create private temporary storage"
                 ) from None
 
-            self._validate_single_display_fallback_target(expected)
+            self._validate_single_display_fallback_target(expected, sole=sole, ids=ids)
             state, _detail = _macos_session_state()
             if state != "unlocked":
                 raise self._single_display_fallback_error(
@@ -964,7 +1023,7 @@ class MacOSBackend:
                     [
                         "/usr/sbin/screencapture",
                         "-x",
-                        "-m",
+                        *(["-m"] if sole else ["-D", str(ordinal)]),
                         "-t",
                         "png",
                         image_path,
@@ -994,7 +1053,7 @@ class MacOSBackend:
                 raise self._single_display_fallback_error(
                     "refused: session is not unlocked"
                 )
-            self._validate_single_display_fallback_target(expected)
+            self._validate_single_display_fallback_target(expected, sole=sole, ids=ids)
             if image_path is None or not os.path.isfile(image_path):
                 raise self._single_display_fallback_error("produced no PNG file")
             try:
@@ -1055,6 +1114,93 @@ class MacOSBackend:
                         "cleanup failed: private capture data may remain"
                     ) from None
 
+    def _screencapture_virtual_desktop(self, ids: list[int], deadline: float) -> Any:
+        """Composite one guarded per-display capture into the virtual desktop image.
+
+        A drop-in for `CGWindowListCreateImage(CGRectInfinite, ...)`, which on macOS 26
+        still returns correct pixels but takes a flat 30.0s per call - measured
+        30.07/30.01/30.00s single-display and 30.04s with two displays attached. That
+        is also `SshTransport.send()`'s per-op timeout, so over the remote transport
+        this path does not return a slow image, it drops the connection.
+
+        It reproduces that call's geometry rather than inventing its own: the
+        point-space bounding box of every active display, scaled by the LARGEST backing
+        scale among them. That is what makes it substitutable on a mixed-DPI setup,
+        where no single physical-pixel unit is correct for two displays at once.
+
+        Measured on macOS 26.6.2 with a 2x built-in (1728x1117 points at origin 0,0)
+        beside a 1x 5120x1440 ultrawide at points x=1728: both paths return 13696x2880,
+        this one in 0.47s against 30.04s, a 65x speedup. Pixel difference 2.53% mean /
+        32 of 255 peak, concentrated entirely in the upscaled 1x half (3.31%) while the
+        natively captured 2x half is 0.21%; a control capture 30s apart drifted 0.00%,
+        so that residual is interpolation on the upscale, not content change.
+
+        `-D`'s ordinal mapping is `CGGetActiveDisplayList` ORDER, verified by CONTENT
+        on that machine rather than by size - each ordinal's capture was correlated
+        against a per-display `CGWindowListCreateImage` reference:
+
+            -D 1 vs reference(id 1)   7.83      -D 2 vs reference(id 3)   1.85
+            -D 1 vs reference(id 3)  76.03      -D 2 vs reference(id 1)  74.82
+
+        Returns `None` (never raises) if any display cannot be captured, so the caller
+        falls back to the original call rather than shipping a partial canvas.
+        """
+        try:
+            scales = {d: self._display_scale(d) for d in ids}
+            bounds = {d: Quartz.CGDisplayBounds(d) for d in ids}
+            monitors = {int(mi.id): mi for mi in self._monitor_infos()}
+            if not scales or not bounds or not all(d in monitors for d in ids):
+                return None
+
+            max_scale = max(scales.values())
+            min_x = min(b.origin.x for b in bounds.values())
+            min_y = min(b.origin.y for b in bounds.values())
+            max_x = max(b.origin.x + b.size.width for b in bounds.values())
+            max_y = max(b.origin.y + b.size.height for b in bounds.values())
+            canvas_w = int(round((max_x - min_x) * max_scale))
+            canvas_h = int(round((max_y - min_y) * max_scale))
+            if canvas_w <= 0 or canvas_h <= 0:
+                return None
+
+            context = Quartz.CGBitmapContextCreate(
+                None,
+                canvas_w,
+                canvas_h,
+                8,
+                0,
+                Quartz.CGColorSpaceCreateDeviceRGB(),
+                Quartz.kCGImageAlphaPremultipliedFirst
+                | Quartz.kCGBitmapByteOrder32Little,
+            )
+            if context is None:
+                return None
+
+            for ordinal, display_id in enumerate(ids, start=1):
+                image = self._screencapture_display(
+                    monitors[display_id], deadline, ordinal, ids
+                )
+                if image is None:
+                    return None
+                b = bounds[display_id]
+                # CGDisplayBounds is top-left origin growing DOWN; a bitmap context
+                # is bottom-left origin growing UP - so a top-aligned SHORTER display
+                # does not sit at y=0 here, it sits above the gap beneath it.
+                rect = Quartz.CGRectMake(
+                    (b.origin.x - min_x) * max_scale,
+                    (max_y - (b.origin.y + b.size.height)) * max_scale,
+                    b.size.width * max_scale,
+                    b.size.height * max_scale,
+                )
+                Quartz.CGContextDrawImage(context, rect, image)
+
+            return Quartz.CGBitmapContextCreateImage(context)
+        except BackendError:
+            # A guard refused (topology moved, budget spent, session locked) - fall
+            # back whole rather than composite a stale or partial canvas.
+            return None
+        except Exception:  # noqa: BLE001 - never surface native detail; fall back
+            return None
+
     def capture(self, region: tuple[int, int, int, int] | None = None) -> bytes:
         """Return PNG bytes at native (physical-pixel) resolution.
 
@@ -1099,12 +1245,14 @@ class MacOSBackend:
             raise BackendError("no active displays; cannot capture the screen")
 
         if region is None and len(ids) > 1:
-            cg_image = Quartz.CGWindowListCreateImage(
-                Quartz.CGRectInfinite,
-                Quartz.kCGWindowListOptionOnScreenOnly,
-                Quartz.kCGNullWindowID,
-                Quartz.kCGWindowImageDefault,
-            )
+            cg_image = self._screencapture_virtual_desktop(ids, fallback_deadline)
+            if cg_image is None:
+                cg_image = Quartz.CGWindowListCreateImage(
+                    Quartz.CGRectInfinite,
+                    Quartz.kCGWindowListOptionOnScreenOnly,
+                    Quartz.kCGNullWindowID,
+                    Quartz.kCGWindowImageDefault,
+                )
             if cg_image is None:
                 raise BackendError("CGWindowListCreateImage returned no image")
             return self._encode_png(cg_image)
@@ -1125,6 +1273,18 @@ class MacOSBackend:
         if full_image is None:
             if len(ids) == 1 and display_id == ids[0] and int(m.id) == ids[0]:
                 full_image = self._screencapture_single_display(m, fallback_deadline)
+            elif display_id is not None and int(m.id) in ids:
+                # Per-display form of the same guarded fallback. Without this, a Mac
+                # with a second display attached cannot take ANY per-monitor capture
+                # on macOS 26 - and per-monitor IS the default (`target_monitor`
+                # defaults to "primary", which routes here, not through the
+                # whole-virtual-desktop branch above). Measured: attaching one more
+                # display turned every screenshot into
+                # "CGDisplayCreateImage(1) returned no image ... the display itself is
+                # the likely cause", on a display that was awake and capturable.
+                full_image = self._screencapture_display(
+                    m, fallback_deadline, ids.index(int(m.id)) + 1, ids
+                )
             else:
                 raise BackendError(self._capture_none_error(display_id))
         if (local_x, local_y, w, h) == (
