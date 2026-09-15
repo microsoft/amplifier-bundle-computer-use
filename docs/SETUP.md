@@ -20,39 +20,38 @@ this bundle exists.
 
 ## Install (do this first)
 
-Registering this bundle is ordinary Amplifier bundle management — the unusual part
-starts *after* registration, in the four rows above. Concretely, this repo is a normal
-bundle (`bundle.md` at the repo root, name `computer-use`), so the standard
-`amplifier bundle` commands apply:
+Registering this behavior is ordinary Amplifier bundle management — the unusual part
+starts *after* registration, in the four rows above. The command below targets the
+behavior manifest, so its registered name is `computer-use-behavior`:
 
-1. **Register it** — fetches the bundle and reads its own name from `bundle.md`, so the
-   name below is not something you invent:
+1. **Register it**:
 
    ```bash
    amplifier bundle add git+https://github.com/microsoft/amplifier-bundle-computer-use@main#subdirectory=behaviors/computer-use.yaml --app
    ```
 
    Verified against this exact repo — the command reports back `Bundle's canonical name:
-   computer-use`. Working from a local clone instead of GitHub? Use a `file://` URI
-   instead: `amplifier bundle add file:///path/to/amplifier-bundle-computer-use --app`.
+   computer-use-behavior`. Working from a local clone instead of GitHub? Use the same
+   behavior manifest through a `file://` URI instead: `amplifier bundle add
+   file:///path/to/amplifier-bundle-computer-use#subdirectory=behaviors/computer-use.yaml --app`.
 
 2. **Use it for a session** — either per-run:
 
    ```bash
-   amplifier run --bundle computer-use "What's on my screen right now?"
+   amplifier run --bundle computer-use-behavior "What's on my screen right now?"
    ```
 
    or set it as your active bundle first, so you don't need `--bundle` every time:
 
    ```bash
-   amplifier bundle use computer-use
+   amplifier bundle use computer-use-behavior
    amplifier run "What's on my screen right now?"
    ```
 
 3. **Confirm it's actually there** before you rely on it:
 
    ```bash
-   amplifier bundle show computer-use
+   amplifier bundle show computer-use-behavior
    ```
 
    Once registered this lists the tools/hooks/agents it contributes
@@ -677,7 +676,7 @@ macOS is blocked. Windows and Linux `type` are unaffected.
 ### Trace
 
 ```bash
-AMPLIFIER_COMPUTER_USE_TRACE=/tmp/cu-trace.log amplifier run --bundle computer-use "..."
+AMPLIFIER_COMPUTER_USE_TRACE=/tmp/cu-trace.log amplifier run --bundle computer-use-behavior "..."
 ```
 
 ```

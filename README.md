@@ -40,18 +40,18 @@ CLI, no browser extension required.
 Registering this bundle is ordinary Amplifier bundle management:
 
 ```bash
-# 1. Register it (the name "computer-use" comes from this repo's own bundle.md)
+# 1. Register the behavior (its name comes from behaviors/computer-use.yaml)
 amplifier bundle add git+https://github.com/microsoft/amplifier-bundle-computer-use@main#subdirectory=behaviors/computer-use.yaml --app
 
 # 2. Use it for a session
-amplifier run --bundle computer-use "What's on my screen right now?"
+amplifier run --bundle computer-use-behavior "What's on my screen right now?"
 
 ```
 
-Confirm it registered correctly with `amplifier bundle show computer-use` — it should
-list `tool-computer-use`, `hook-computer-use`, and `computer-use:computer-operator`.
+Confirm it registered correctly with `amplifier bundle show computer-use-behavior` — it
+should list `tool-computer-use`, `hook-computer-use`, and `computer-use:computer-operator`.
 Working from a local clone instead of GitHub? `amplifier bundle add
-file:///path/to/amplifier-bundle-computer-use --app` instead.
+file:///path/to/amplifier-bundle-computer-use#subdirectory=behaviors/computer-use.yaml --app` instead.
 
 **Registering the bundle is not the same as the tools working.** See
 **[docs/SETUP.md](docs/SETUP.md)** for the four things that decide whether `computer` and
@@ -286,7 +286,7 @@ Full symptom→cause→fix table in [`docs/SETUP.md`](docs/SETUP.md) §10.
 Set a trace path and you get a plain-text record of what the hook actually did:
 
 ```bash
-AMPLIFIER_COMPUTER_USE_TRACE=/tmp/cu-trace.log amplifier run --bundle computer-use "..."
+AMPLIFIER_COMPUTER_USE_TRACE=/tmp/cu-trace.log amplifier run --bundle computer-use-behavior "..."
 ```
 
 ```
