@@ -28,6 +28,13 @@ line declared in `modules/tool-computer-use/pyproject.toml` and
 
 ### Fixed
 
+- Documentation that still described macOS `type_text` as an open defect six weeks after
+  it was fixed in `ccf0913`. The README's known-issues list, `docs/SETUP.md`'s capability
+  table and its §9 all carried the pre-fix text, including a hypothesis about the event
+  tap that the fix had already disproved. `BACKLOG.md`'s "RETRACTED" entry is annotated
+  too: that retraction was also wrong, for a reason worth keeping (its re-test asserted
+  the screen *changed*, not what it changed to). Re-verified on real hardware
+  (macOS 26.6.2, remote over SSH): Spotlight received the typed string verbatim.
 - Generalised that fallback from "the sole display" to "one display at a time", which is
   what the default configuration actually needs: `target_monitor` defaults to `"primary"`,
   so per-monitor capture routes through the per-display path, not the whole-virtual-desktop
