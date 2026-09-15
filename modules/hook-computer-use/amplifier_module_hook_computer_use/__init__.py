@@ -684,6 +684,25 @@ def _select_provider_native_tool_type_on_computer_tool(
         logger.debug("computer-use: note_model raised unexpectedly", exc_info=True)
 
 
+def _request_declares_computer_tool(request: Any) -> bool:
+    """Return whether this request can be affected by the computer-tool dialect.
+
+    A provider instance can serve unrelated background work as well as a computer-use
+    turn. Only a request that actually declares the ``computer`` tool may update the
+    mounted tool's provider/model-specific native type.
+    """
+    tools = getattr(request, "tools", None)
+    if not isinstance(tools, list):
+        return False
+    for tool in tools:
+        name = (
+            tool.get("name") if isinstance(tool, dict) else getattr(tool, "name", None)
+        )
+        if name == "computer":
+            return True
+    return False
+
+
 def _wrap_provider(provider: Any, coordinator: Any, max_inline: int) -> bool:
     native_tool_type = _provider_supports_native_computer_tool(provider)
     if native_tool_type is None:
@@ -731,12 +750,13 @@ def _wrap_provider(provider: Any, coordinator: Any, max_inline: int) -> bool:
     original = provider.complete
 
     async def complete(request: Any, **kwargs: Any):
-        _effective_model = getattr(request, "model", None) or getattr(
-            provider, "default_model", None
-        )
-        _select_provider_native_tool_type_on_computer_tool(
-            coordinator, native_tool_type, _effective_model
-        )
+        if _request_declares_computer_tool(request):
+            _effective_model = getattr(request, "model", None) or getattr(
+                provider, "default_model", None
+            )
+            _select_provider_native_tool_type_on_computer_tool(
+                coordinator, native_tool_type, _effective_model
+            )
         try:
             messages = getattr(request, "messages", None)
             if isinstance(messages, list):

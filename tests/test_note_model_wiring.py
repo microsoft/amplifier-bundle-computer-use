@@ -9,7 +9,8 @@ exact defect `tool_versions.py` exists to prevent (a model/tool_version
 mismatch 400s *every* request) requires exactly this correction to fire.
 
 The hook selects a provider's wire dialect before the orchestrator reads the
-mounted tool's native spec, then reselects it for each wrapped request.
+mounted tool's native spec, then reselects it only for wrapped requests that
+declare the computer tool.
 """
 
 from __future__ import annotations
@@ -133,9 +134,14 @@ class _OpenAIProviderFunctionFallback(_OpenAIProviderNoStream):
 
 
 class _FakeRequest:
-    def __init__(self, model: str | None) -> None:
+    def __init__(self, model: str | None, tools: list | None = None) -> None:
         self.messages: list = []
         self.model = model
+        self.tools = [] if tools is None else tools
+
+
+def _computer_tool() -> dict[str, str]:
+    return {"name": "computer"}
 
 
 class _HookRegistry:
@@ -326,7 +332,14 @@ def test_provider_request_uses_note_model_for_a_legacy_tool_without_selection_ap
 
     _mount_and_dispatch_provider_request(coordinator, "anthropic")
     assert legacy_tool.models == ["claude-opus-5"]
-    assert _run(provider.complete(_FakeRequest("claude-sonnet-4-5-20250929"))) == "ok"
+    assert (
+        _run(
+            provider.complete(
+                _FakeRequest("claude-sonnet-4-5-20250929", [_computer_tool()])
+            )
+        )
+        == "ok"
+    )
     assert legacy_tool.models == ["claude-opus-5", "claude-sonnet-4-5-20250929"]
 
 
@@ -363,7 +376,7 @@ def test_wrapped_complete_forwards_request_model_to_note_model_and_corrects_tool
     assert hook_mod._wrap_provider(provider, coord, max_inline=3) is True
 
     caplog.set_level(logging.INFO, logger="amplifier_module_tool_computer_use")
-    request = _FakeRequest(model="claude-sonnet-4-5-20250929")
+    request = _FakeRequest(model="claude-sonnet-4-5-20250929", tools=[_computer_tool()])
     result = _run(provider.complete(request))
 
     assert result == "ok"
@@ -504,7 +517,7 @@ def test_wrapped_complete_falls_back_to_provider_default_model_when_request_mode
     # Reset to the wrong value as if priming had not run, to isolate what
     # complete() alone corrects.
     computer._tool_version = "computer_20251124"
-    result = _run(provider.complete(_FakeRequest(model=None)))
+    result = _run(provider.complete(_FakeRequest(model=None, tools=[_computer_tool()])))
 
     assert result == "ok"
     assert computer._tool_version == "computer_20250124"
@@ -518,11 +531,31 @@ def test_wrapped_complete_prefers_an_explicit_request_model_override_over_defaul
     provider = _AnthropicProviderNoStream(default_model="claude-opus-5")
     hook_mod._wrap_provider(provider, coord, max_inline=3)
 
-    request = _FakeRequest(model="claude-sonnet-4-5-20250929")
+    request = _FakeRequest(model="claude-sonnet-4-5-20250929", tools=[_computer_tool()])
     result = _run(provider.complete(request))
 
     assert result == "ok"
     assert computer._tool_version == "computer_20250124"
+
+
+def test_wrapped_noncomputer_request_does_not_change_shared_tool_version():
+    """An unrelated background request must not poison the next computer turn.
+
+    The provider object is shared with the root session. A Haiku request with no
+    ``computer`` declaration must leave the Opus-selected native tool type intact.
+    """
+    computer = ComputerTool(_FakeBackend(), {"model": "claude-opus-5"})
+    coord = _FakeCoordinator({"computer": computer})
+    provider = _AnthropicProviderNoStream(default_model="claude-opus-5")
+    hook_mod._wrap_provider(provider, coord, max_inline=3)
+
+    request = _FakeRequest(
+        model="claude-haiku-4-5-20251001", tools=[{"name": "read_file"}]
+    )
+    result = _run(provider.complete(request))
+
+    assert result == "ok"
+    assert computer._tool_version == "computer_20251124"
 
 
 def test_wrap_provider_re_primes_tool_version_on_every_turn_even_when_already_wrapped():
