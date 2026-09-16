@@ -221,7 +221,8 @@ def test_provider_request_selects_bare_openai_spec_for_current_and_future_aliase
 
 def test_complete_valid_function_fallback_is_a_negative_probe_without_traceback(caplog):
     provider = _OpenAIProviderFunctionFallback()
-    coordinator = _FakeCoordinator({}, {"openai": provider})
+    computer = _with_resolved_display(ComputerTool(_FakeBackend(), {}))
+    coordinator = _FakeCoordinator({"computer": computer}, {"openai": provider})
 
     with caplog.at_level(logging.DEBUG, logger=hook_mod.__name__):
         _mount_and_dispatch_provider_request(coordinator, "openai")
@@ -237,6 +238,121 @@ def test_complete_valid_function_fallback_is_a_negative_probe_without_traceback(
     assert all(record.exc_info is None for record in caplog.records)
     assert "Traceback" not in caplog.text
     assert any(record.levelno == logging.WARNING for record in caplog.records)
+
+
+@pytest.mark.parametrize("with_stub", [False, True])
+@pytest.mark.parametrize(
+    "provider_factory", [_OpenAIProviderNoStream, _OpenAIProviderFunctionFallback]
+)
+def test_provider_request_without_computer_skips_integration(
+    with_stub, provider_factory, caplog
+):
+    provider = provider_factory()
+    original_complete = provider.complete
+    tools = {"computer_use_unavailable": object()} if with_stub else {}
+    lookups = []
+
+    class Coordinator(_FakeCoordinator):
+        def get(self, mount_point, name=None):
+            lookups.append((mount_point, name))
+            return super().get(mount_point, name)
+
+    coordinator = Coordinator(tools, {"openai": provider})
+    _run(hook_mod.mount(coordinator))
+    handler = coordinator.hooks.handlers[hook_mod.PROVIDER_REQUEST]
+    lookups.clear()
+    with caplog.at_level(logging.WARNING, logger=hook_mod.__name__):
+        for _ in range(2):
+            result = _run(handler(hook_mod.PROVIDER_REQUEST, {"provider": "openai"}))
+            assert result.action == "continue"
+
+    assert lookups == [("tools", "computer"), ("tools", "computer")]
+    assert provider.complete == original_complete
+    assert not caplog.records
+    for flag in (
+        hook_mod._WRAPPED_FLAG,
+        hook_mod._UNSUPPORTED_WARNING_FLAG,
+        hook_mod._NATIVE_COMPUTER_DIALECT_CACHE_ATTR,
+    ):
+        assert not hasattr(provider, flag)
+
+
+def test_provider_request_rechecks_computer_after_activation_and_removal(caplog):
+    provider = _OpenAIProviderNoStream()
+    coordinator = _FakeCoordinator(
+        {"computer_use_unavailable": object()}, {"openai": provider}
+    )
+    _run(hook_mod.mount(coordinator))
+    handler = coordinator.hooks.handlers[hook_mod.PROVIDER_REQUEST]
+    _run(handler(hook_mod.PROVIDER_REQUEST, {"provider": "openai"}))
+    assert provider.helper_calls == 0
+    assert not getattr(provider, hook_mod._WRAPPED_FLAG, False)
+
+    computer = _with_resolved_display(ComputerTool(_FakeBackend(), {}))
+    coordinator._tools = {"computer": computer}
+    _run(handler(hook_mod.PROVIDER_REQUEST, {"provider": "openai"}))
+    assert provider.helper_calls == 1
+    assert getattr(provider, hook_mod._WRAPPED_FLAG) is True
+    assert computer.native_tool_spec == {"type": "computer"}
+
+    # No cached "present" decision: removal must stop even provider lookup.
+    coordinator._tools.clear()
+    coordinator._providers.clear()
+    with caplog.at_level(logging.WARNING, logger=hook_mod.__name__):
+        result = _run(handler(hook_mod.PROVIDER_REQUEST, {"provider": "openai"}))
+    assert result.action == "continue"
+    assert not caplog.records
+
+
+def test_unsupported_warning_remains_once_after_computer_activation(caplog):
+    provider = _OpenAIProviderFunctionFallback()
+    coordinator = _FakeCoordinator({}, {"openai": provider})
+    _run(hook_mod.mount(coordinator))
+    handler = coordinator.hooks.handlers[hook_mod.PROVIDER_REQUEST]
+    with caplog.at_level(logging.WARNING, logger=hook_mod.__name__):
+        _run(handler(hook_mod.PROVIDER_REQUEST, {"provider": "openai"}))
+        assert not caplog.records
+        assert not hasattr(provider, hook_mod._UNSUPPORTED_WARNING_FLAG)
+        coordinator._tools["computer"] = _with_resolved_display(
+            ComputerTool(_FakeBackend(), {})
+        )
+        for _ in range(2):
+            _run(handler(hook_mod.PROVIDER_REQUEST, {"provider": "openai"}))
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "did not prove native computer passthrough" in warnings[0].getMessage()
+    assert not getattr(provider, hook_mod._WRAPPED_FLAG, False)
+
+
+def test_computer_lookup_failure_warns_and_preserves_provider_checks(caplog):
+    provider = _OpenAIProviderNoStream()
+    computer = _with_resolved_display(ComputerTool(_FakeBackend(), {}))
+
+    class Coordinator(_FakeCoordinator):
+        failing = True
+
+        def get(self, mount_point, name=None):
+            if (mount_point, name) == ("tools", "computer") and self.failing:
+                raise RuntimeError("test lookup failure")
+            return super().get(mount_point, name)
+
+    coordinator = Coordinator({"computer": computer}, {"openai": provider})
+    _run(hook_mod.mount(coordinator))
+    handler = coordinator.hooks.handlers[hook_mod.PROVIDER_REQUEST]
+    with caplog.at_level(logging.WARNING, logger=hook_mod.__name__):
+        result = _run(handler(hook_mod.PROVIDER_REQUEST, {"provider": "openai"}))
+    assert result.action == "continue"
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "computer tool lookup failed" in warnings[0].getMessage()
+    assert warnings[0].exc_info is not None
+    assert provider.helper_calls == 1
+    assert getattr(provider, hook_mod._WRAPPED_FLAG) is True
+
+    coordinator.failing = False
+    _run(handler(hook_mod.PROVIDER_REQUEST, {"provider": "openai"}))
+    assert provider.helper_calls == 1
+    assert computer.native_tool_spec == {"type": "computer"}
 
 
 def test_provider_request_reselects_shared_tool_dialect_and_keeps_anthropic_continuity():

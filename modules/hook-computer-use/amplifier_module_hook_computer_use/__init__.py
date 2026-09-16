@@ -1200,6 +1200,21 @@ async def mount(
     unattended_writes_ok = bool(cfg.get("unattended_writes_ok", False))
 
     async def handler(event: str, data: dict[str, Any]) -> HookResult:
+        # The behavior can be loaded without a usable desktop (only the
+        # computer_use_unavailable stub), or in a child without computer access.
+        # Recheck every turn: runtime activation can mount computer later.
+        try:
+            if coordinator.get("tools", "computer") is None:
+                return HookResult(action="continue")
+        except Exception:
+            # A failed lookup is not proof of absence. Keep the existing provider
+            # compatibility checks active rather than silently bypassing them.
+            logger.warning(
+                "computer-use: computer tool lookup failed; checking provider "
+                "compatibility without confirming tool presence",
+                exc_info=True,
+            )
+
         # Providers are guaranteed mounted by the time the loop asks one to run.
         name = (data or {}).get("provider")
         provider = None
