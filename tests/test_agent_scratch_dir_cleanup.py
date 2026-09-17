@@ -1,44 +1,27 @@
-"""Proves the bootstrap stub's scratch dir is actually removed on exit - the
-leak this guards against (2026-08-03): `w=tempfile.mkdtemp(...)` in
-`ssh_transport._bootstrap_stub` was created and never removed by ANY exit
-path. Confirmed on a real target: 64 leaked dirs / 26MB accumulated over
-three days, oldest untouched since creation.
+"""Real-process lease tests for the exact generated bootstrap stub.
 
-`test_stub_removes_its_own_scratch_dir_on_normal_exit` runs the EXACT stub
-text `_bootstrap_stub()` produces, as a real subprocess - no SSH needed, the
-stub is plain `python3 -c <text>` and SSH is only the transport that carries
-it to a target. It proves the directory the stub creates is gone once the
-process exits via the ordinary path (handshake, then EOF/`bye`). Without the
-fix (no `atexit.register(...)` in the stub) this fails: the directory
-survives the process exit. With the fix, it does not.
-
-Runs entirely headless (no DISPLAY, no Xvfb, no real backend required) - see
-CONTRIBUTING.md's test philosophy. On a machine with no backend available the
-agent still runs `main()`'s no-backend branch, which is enough: `mkdtemp()`
-in the stub runs unconditionally, before backend selection is even attempted,
-so this exercises the exact code path that leaked regardless of what backend
-(if any) this test machine has.
-
-The SIGTERM-specific path (`RemoteAgent.install_signal_handlers()` calling
-`sys.exit(0)`, which must still reach the same `atexit` hook) requires a real
-backend to be running the agent's blocking read loop when the signal
-arrives - reaching for that here would make this test only pass on a machine
-with a real desktop, which CONTRIBUTING.md reserves for the ship gate, not
-`tests/`. That path is instead verified against a live remote target with a
-real SIGTERM - see the PR/issue description for that evidence.
+Every scratch directory is under pytest's ``tmp_path`` and every child gets
+``TMPDIR=tmp_path``. The tests signal or remove only PIDs and paths they own.
 """
 
 from __future__ import annotations
 
 import contextlib
-import glob
+import hashlib
+import io
 import json
 import os
+import shutil
 import subprocess
 import sys
-import tempfile
+import tarfile
 import threading
+import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "modules" / "tool-computer-use"))
@@ -46,133 +29,354 @@ PACKAGE_DIR = (
     ROOT / "modules" / "tool-computer-use" / "amplifier_module_tool_computer_use"
 )
 
-from amplifier_module_tool_computer_use import ssh_transport as ssh_transport_mod
+from amplifier_module_tool_computer_use import agent_scratch_lease as lease
+from amplifier_module_tool_computer_use import ssh_transport
+
+pytestmark = pytest.mark.skipif(
+    lease._secure_flags() is None or lease._flock_module() is None,
+    reason="requires POSIX no-follow operations and flock",
+)
 
 
-def _agent_scratch_dirs() -> set[str]:
-    return set(glob.glob(os.path.join(tempfile.gettempdir(), "amplifier-cu-agent-*")))
+def _child_env(tmp_path: Path) -> dict[str, str]:
+    env = {**os.environ, "TMPDIR": str(tmp_path), "PYTHONDONTWRITEBYTECODE": "1"}
+    env.pop("DISPLAY", None)
+    env.pop("WAYLAND_DISPLAY", None)
+    return env
 
 
-def _read_line_with_timeout(stream, timeout: float) -> bytes | None:
-    """Same bounded-read pattern `SshTransport._read_line_with_timeout` uses -
-    a plain blocking `readline()` on a pipe has no timeout of its own."""
-    result: dict[str, bytes | None] = {"line": None}
+def _readline(stream, timeout: float = 10) -> bytes:
+    result: dict[str, bytes] = {}
 
-    def _read() -> None:
-        result["line"] = stream.readline() or None
+    def read() -> None:
+        result["line"] = stream.readline()
 
-    t = threading.Thread(target=_read, daemon=True)
-    t.start()
-    t.join(timeout)
+    thread = threading.Thread(target=read, daemon=True)
+    thread.start()
+    thread.join(timeout)
+    assert not thread.is_alive(), "child did not become ready before timeout"
     return result["line"]
 
 
-def test_stub_removes_its_own_scratch_dir_on_normal_exit():
-    """THE fix: the exact stub text sent to every real target must clean up
-    the scratch dir it creates once the process it spawns exits normally.
+def _remove_owned_scratch(tmp_path: Path) -> None:
+    for path in tmp_path.glob(f"{lease.AGENT_SCRATCH_DIR_PREFIX}*"):
+        shutil.rmtree(path, ignore_errors=True)
 
-    On a machine with no backend available (this test's headless dev-box/CI
-    environment), `remote_agent.main()`'s no-backend branch writes the
-    handshake and returns within the same handful of Python bytecodes - there
-    is no blocking `agent.run()` read loop holding the process open in
-    between. That means the scratch dir's entire lifetime, in this branch,
-    can be over before a single post-handshake `glob()` in the *parent*
-    process gets scheduled: a snapshot taken right after reading the
-    handshake line reliably loses that race (confirmed: the directory is
-    gone every time by then, even after an extra 50ms grace sleep).
 
-    `mkdtemp()` itself runs early in the stub - well before backend
-    selection, argv setup, or the handshake is even built - so the directory
-    does exist for a real, observable span of wall-clock time; the problem is
-    purely *when* the parent looks. A background thread that polls
-    continuously from the moment the payload is sent (not a single
-    point-in-time check after the read) reliably observes it regardless of
-    how short-lived the no-backend branch's process turns out to be.
-    """
-    payload = ssh_transport_mod._build_payload(PACKAGE_DIR)
-    stub = ssh_transport_mod._bootstrap_stub(deadman_seconds=5.0, read_only=True)
+def _close_owned(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is None and process.stdin is not None:
+        with contextlib.suppress(OSError, ValueError):
+            process.stdin.close()
+    try:
+        process.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        process.terminate()
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
 
-    before = _agent_scratch_dirs()
-    proc = subprocess.Popen(
-        [sys.executable, "-c", stub],
+
+@contextmanager
+def _running_bootstrap(
+    tmp_path: Path,
+    payload: bytes,
+    *,
+    ready_prefix: bytes | None = None,
+    test_preamble: str = "",
+) -> Iterator[tuple[subprocess.Popen[bytes], bytes | None]]:
+    """Yield an owned bootstrap child and clean it on every setup/test failure."""
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            test_preamble + ssh_transport._bootstrap_stub(5.0, True),
+        ],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        env=_child_env(tmp_path),
     )
-
-    seen_dirs: set[str] = set()
-    stop_polling = threading.Event()
-
-    def _poll_for_scratch_dir() -> None:
-        # Tight loop, no sleep: the no-backend branch's post-handshake
-        # window can be sub-millisecond, so any polling interval risks
-        # missing it entirely. Bounded by `stop_polling` from the main
-        # thread (set once the handshake has been read, or in `finally`).
-        while not stop_polling.is_set():
-            found = _agent_scratch_dirs() - before
-            if found:
-                seen_dirs.update(found)
-                return
-
-    poller = threading.Thread(target=_poll_for_scratch_dir, daemon=True)
-    poller.start()
     try:
-        assert proc.stdin is not None and proc.stdout is not None
-        proc.stdin.write(f"{len(payload)}\n".encode())
-        proc.stdin.write(payload)
-        proc.stdin.flush()
-
-        # Handshake line - proves the stub actually ran far enough to create
-        # and populate its scratch dir, not just that a process was spawned.
-        line = _read_line_with_timeout(proc.stdout, timeout=20.0)
-        assert line is not None, (
-            "no handshake from the stub subprocess - stderr: "
-            f"{proc.stderr.read().decode(errors='replace') if proc.stderr else ''}"
-        )
-        handshake = json.loads(line)
-        assert handshake["ok"] is True
-
-        # Ordinary shutdown: ask for a clean stop if the agent is still
-        # reading requests (real backend available), then close stdin (EOF) -
-        # exactly what `SshTransport.close()` does. If the no-backend branch
-        # already exited (headless, no display), these are no-ops on a
-        # closed pipe.
-        with contextlib.suppress(BrokenPipeError, OSError):
-            proc.stdin.write(
-                json.dumps({"id": 1, "op": "bye", "args": {}}).encode() + b"\n"
-            )
-            proc.stdin.flush()
-        with contextlib.suppress(OSError):
-            proc.stdin.close()
-
-        returncode = proc.wait(timeout=10)
-        assert returncode is not None
-
-        # Give the poller a last moment to notice a dir created very late
-        # (has-backend branch, torn down only by the `bye`/EOF above), then
-        # stop it - the process has now fully exited either way.
-        poller.join(timeout=1.0)
-        stop_polling.set()
-        poller.join(timeout=1.0)
-
-        assert len(seen_dirs) == 1, (
-            f"expected exactly one new scratch dir to ever appear, saw {seen_dirs}"
-        )
-        scratch_dir = seen_dirs.pop()
-
-        assert not os.path.exists(scratch_dir), (
-            f"scratch dir {scratch_dir!r} was not cleaned up after normal exit "
-            "(this is the leak - see ssh_transport._bootstrap_stub)"
-        )
+        assert process.stdin is not None
+        process.stdin.write(f"{len(payload)}\n".encode() + payload)
+        process.stdin.flush()
+        ready_line = None
+        if ready_prefix is not None:
+            assert process.stdout is not None
+            ready_line = _readline(process.stdout)
+            assert ready_line.startswith(ready_prefix), ready_line
+        yield process, ready_line
     finally:
-        stop_polling.set()
-        poller.join(timeout=2.0)
-        if proc.poll() is None:
-            proc.kill()
-            proc.wait(timeout=5)
-        # Belt and suspenders: never let a bug in the fix leave test-run
-        # residue behind even if an assertion above already failed.
-        for leftover in _agent_scratch_dirs() - before:
-            import shutil as _shutil
+        _close_owned(process)
+        _remove_owned_scratch(tmp_path)
 
-            _shutil.rmtree(leftover, ignore_errors=True)
+
+def _fake_payload(remote_agent: bytes | None = None) -> bytes:
+    archive = io.BytesIO()
+    fake_agent = remote_agent or (
+        b"import os,sys\n"
+        b"print('READY', os.getpid(), flush=True)\n"
+        b"assert sys.stdin.buffer.readline() == b'continue\\n'\n"
+        b"from amplifier_cu_agent.backend import BackendError\n"
+        b"assert BackendError.__name__ == 'BackendError'\n"
+        b"print('LATER', flush=True)\n"
+        b"assert sys.stdin.buffer.read() == b''\n"
+    )
+    with tarfile.open(fileobj=archive, mode="w:gz") as tf:
+        for name in ssh_transport.PAYLOAD_MODULES:
+            if name == "remote_agent.py":
+                data = fake_agent
+            elif name in {"agent_scratch_lease.py", "backend.py"}:
+                data = (PACKAGE_DIR / name).read_bytes()
+            else:
+                data = b""
+            info = tarfile.TarInfo(f"amplifier_cu_agent/{name}")
+            info.size = len(data)
+            tf.addfile(info, io.BytesIO(data))
+    return archive.getvalue()
+
+
+def _sweep_in_other_process(tmp_path: Path) -> int:
+    script = (
+        "import sys;"
+        f"sys.path.insert(0, {str(ROOT / 'modules' / 'tool-computer-use')!r});"
+        "from amplifier_module_tool_computer_use.agent_scratch_lease import sweep_stale_agent_dirs;"
+        f"print(sweep_stale_agent_dirs(temp_dir={str(tmp_path)!r}))"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        env=_child_env(tmp_path),
+        timeout=10,
+        check=True,
+    )
+    return int(result.stdout.strip())
+
+
+def _old_valid_dir(tmp_path: Path, suffix: str) -> Path:
+    directory = tmp_path / f"{lease.AGENT_SCRATCH_DIR_PREFIX}{suffix}"
+    directory.mkdir(mode=0o700)
+    os.chmod(directory, 0o700)
+    marker = directory / lease.LEASE_FILENAME
+    marker.write_bytes(lease.LEASE_MAGIC)
+    os.chmod(marker, 0o600)
+    os.utime(marker, (time.time() - 48 * 60 * 60,) * 2)
+    return directory
+
+
+def test_bootstrap_lease_precedes_ready_preserves_live_lazy_import_then_eof(
+    tmp_path: Path,
+) -> None:
+    with _running_bootstrap(tmp_path, _fake_payload(), ready_prefix=b"READY ") as (
+        process,
+        ready,
+    ):
+        assert ready is not None and int(ready.decode().split()[1]) == process.pid
+        scratch_dirs = list(tmp_path.glob(f"{lease.AGENT_SCRATCH_DIR_PREFIX}*"))
+        assert len(scratch_dirs) == 1
+        marker = scratch_dirs[0] / lease.LEASE_FILENAME
+        assert marker.read_bytes() == lease.LEASE_MAGIC
+        os.utime(marker, (time.time() - 48 * 60 * 60,) * 2)
+
+        assert _sweep_in_other_process(tmp_path) == 0
+        assert scratch_dirs[0].exists()
+
+        assert process.stdin is not None and process.stdout is not None
+        process.stdin.write(b"continue\n")
+        process.stdin.flush()
+        assert _readline(process.stdout) == b"LATER\n"
+        process.stdin.close()
+        assert process.wait(timeout=5) == 0
+        assert not scratch_dirs[0].exists()
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux", reason="requires a headless Linux backend probe"
+)
+def test_full_real_payload_bootstraps_headless_and_cleans_its_own_scratch(
+    tmp_path: Path,
+) -> None:
+    payload = ssh_transport._build_payload(PACKAGE_DIR)
+    orphaned = tmp_path / f"{lease.AGENT_SCRATCH_DIR_PREFIX}old-unlocked"
+    orphaned.mkdir(mode=0o700)
+    os.chmod(orphaned, 0o700)
+    orphaned_fd = lease.acquire_agent_lease(orphaned)
+    assert orphaned_fd is not None
+    os.close(orphaned_fd)
+    os.utime(orphaned / lease.LEASE_FILENAME, (time.time() - 48 * 60 * 60,) * 2)
+    legacy = tmp_path / "amplifier-cu-agent-legacy"
+    legacy.mkdir(mode=0o700)
+    os.chmod(legacy, 0o700)
+    with _running_bootstrap(tmp_path, payload) as (process, _):
+        assert process.stdout is not None
+        handshake = json.loads(_readline(process.stdout))
+        assert handshake["ok"] is True
+        assert handshake["result"]["backend"] == "none"
+        assert (
+            handshake["result"]["agent_sha256"] == hashlib.sha256(payload).hexdigest()
+        )
+        assert process.wait(timeout=5) == 1
+        assert not orphaned.exists()
+        assert legacy.exists()
+        assert not list(tmp_path.glob(f"{lease.AGENT_SCRATCH_DIR_PREFIX}*"))
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux", reason="requires a headless Linux backend probe"
+)
+def test_startup_continues_when_stale_sweep_unexpectedly_fails(tmp_path: Path) -> None:
+    payload = ssh_transport._build_payload(PACKAGE_DIR)
+    candidate = tmp_path / f"{lease.AGENT_SCRATCH_DIR_PREFIX}blocked"
+    candidate.mkdir(mode=0o700)
+    os.chmod(candidate, 0o700)
+    candidate_fd = lease.acquire_agent_lease(candidate)
+    assert candidate_fd is not None
+    os.close(candidate_fd)
+    os.utime(candidate / lease.LEASE_FILENAME, (time.time() - 48 * 60 * 60,) * 2)
+    test_preamble = (
+        "import shutil\n"
+        "_real_rmtree = shutil.rmtree\n"
+        "def _fail_dir_fd_rmtree(path, *args, **kwargs):\n"
+        "    if kwargs.get('dir_fd') is not None:\n"
+        "        raise TypeError('injected dir_fd rmtree failure')\n"
+        "    return _real_rmtree(path, *args, **kwargs)\n"
+        "_fail_dir_fd_rmtree.avoids_symlink_attacks = True\n"
+        "shutil.rmtree = _fail_dir_fd_rmtree\n"
+    )
+    with _running_bootstrap(tmp_path, payload, test_preamble=test_preamble) as (
+        process,
+        _,
+    ):
+        assert process.stdout is not None
+        handshake = json.loads(_readline(process.stdout))
+        assert handshake["ok"] is True
+        assert handshake["result"]["backend"] == "none"
+        assert (
+            handshake["result"]["agent_sha256"] == hashlib.sha256(payload).hexdigest()
+        )
+        assert process.wait(timeout=5) == 1
+        assert candidate.exists()
+        assert not [
+            path
+            for path in tmp_path.glob(f"{lease.AGENT_SCRATCH_DIR_PREFIX}*")
+            if path != candidate
+        ]
+        assert process.stderr is not None
+        stderr = process.stderr.read()
+        assert b"stale-dir sweep failed; continuing startup" in stderr
+        assert b"injected dir_fd rmtree failure" in stderr
+
+
+def test_bootstrap_setup_failure_cleans_owned_child_and_scratch(tmp_path: Path) -> None:
+    wrong_ready = b"import sys\nprint('WRONG', flush=True)\nsys.stdin.buffer.read()\n"
+    with (
+        pytest.raises(AssertionError),
+        _running_bootstrap(
+            tmp_path, _fake_payload(wrong_ready), ready_prefix=b"READY "
+        ),
+    ):
+        pass
+    assert not list(tmp_path.glob(f"{lease.AGENT_SCRATCH_DIR_PREFIX}*"))
+
+
+def test_sweep_removes_only_test_owned_dead_lease_not_live_sibling(
+    tmp_path: Path,
+) -> None:
+    with _running_bootstrap(tmp_path, _fake_payload(), ready_prefix=b"READY ") as (
+        abandoned,
+        ready,
+    ):
+        assert ready is not None and int(ready.decode().split()[1]) == abandoned.pid
+        live_script = (
+            "import atexit,os,shutil,sys,tempfile;"
+            f"sys.path.insert(0, {str(ROOT / 'modules' / 'tool-computer-use')!r});"
+            "from amplifier_module_tool_computer_use.agent_scratch_lease import AGENT_SCRATCH_DIR_PREFIX,acquire_agent_lease;"
+            "scratch=tempfile.mkdtemp(prefix=AGENT_SCRATCH_DIR_PREFIX);"
+            "os.chmod(scratch,0o700);"
+            "atexit.register(shutil.rmtree,scratch,ignore_errors=True);"
+            "fd=acquire_agent_lease(scratch);assert fd is not None;"
+            "print('READY',os.getpid(),scratch,flush=True);"
+            "sys.stdin.buffer.read();os.close(fd)"
+        )
+        live = subprocess.Popen(
+            [sys.executable, "-c", live_script],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=_child_env(tmp_path),
+        )
+        try:
+            assert live.stdout is not None
+            live_ready = _readline(live.stdout).decode().split()
+            assert live_ready[0] == "READY" and int(live_ready[1]) == live.pid
+            live_path = Path(live_ready[2])
+            paths = list(tmp_path.glob(f"{lease.AGENT_SCRATCH_DIR_PREFIX}*"))
+            assert len(paths) == 2
+            for directory in paths:
+                os.utime(
+                    directory / lease.LEASE_FILENAME, (time.time() - 48 * 60 * 60,) * 2
+                )
+
+            abandoned.kill()
+            assert abandoned.wait(timeout=5) < 0
+            assert _sweep_in_other_process(tmp_path) == 1
+            assert not any(path.exists() for path in paths if path != live_path)
+            assert live_path.exists()
+        finally:
+            _close_owned(live)
+        assert not live_path.exists()
+
+
+def test_two_real_sweepers_remove_one_abandoned_dir_and_preserve_live_lease(
+    tmp_path: Path,
+) -> None:
+    abandoned = _old_valid_dir(tmp_path, "abandoned")
+    live_dir = tmp_path / f"{lease.AGENT_SCRATCH_DIR_PREFIX}live"
+    live_dir.mkdir(mode=0o700)
+    os.chmod(live_dir, 0o700)
+    live_fd = lease.acquire_agent_lease(live_dir)
+    assert live_fd is not None
+    os.utime(live_dir / lease.LEASE_FILENAME, (time.time() - 48 * 60 * 60,) * 2)
+    sweeper_script = (
+        "import sys;"
+        f"sys.path.insert(0, {str(ROOT / 'modules' / 'tool-computer-use')!r});"
+        "from amplifier_module_tool_computer_use.agent_scratch_lease import sweep_stale_agent_dirs;"
+        "print('READY',flush=True);"
+        "sys.stdin.buffer.readline();"
+        f"print(sweep_stale_agent_dirs(temp_dir={str(tmp_path)!r}),flush=True)"
+    )
+    sweepers = [
+        subprocess.Popen(
+            [sys.executable, "-c", sweeper_script],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=_child_env(tmp_path),
+        )
+        for _ in range(2)
+    ]
+    try:
+        for sweeper in sweepers:
+            assert (
+                sweeper.stdout is not None and _readline(sweeper.stdout) == b"READY\n"
+            )
+        for sweeper in sweepers:
+            assert sweeper.stdin is not None
+            sweeper.stdin.write(b"go\n")
+            sweeper.stdin.flush()
+        counts = []
+        for sweeper in sweepers:
+            assert sweeper.stdout is not None
+            counts.append(int(_readline(sweeper.stdout).strip()))
+            assert sweeper.wait(timeout=5) == 0
+        assert sum(counts) == 1
+        assert not abandoned.exists()
+        assert live_dir.exists()
+    finally:
+        for sweeper in sweepers:
+            _close_owned(sweeper)
+        os.close(live_fd)
+        shutil.rmtree(live_dir, ignore_errors=True)

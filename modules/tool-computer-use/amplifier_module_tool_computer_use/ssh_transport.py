@@ -22,6 +22,7 @@ import threading
 from pathlib import Path
 from typing import Any
 
+from .agent_scratch_lease import AGENT_SCRATCH_DIR_PREFIX
 from .wire import Response, validate_handshake
 
 logger = logging.getLogger(__name__)
@@ -47,6 +48,7 @@ PAYLOAD_MODULES = (
     "windows.py",
     "wire.py",
     "ledger.py",
+    "agent_scratch_lease.py",
     "remote_agent.py",
     # The session-start disclosure channel (docs/designs/coexistence.md
     # \u00a77, \u00a710.3) closes the remote-transport gap BACKLOG.md recorded:
@@ -265,13 +267,13 @@ def _bootstrap_stub(deadman_seconds: float, read_only: bool) -> str:
     the agent IN-PROCESS via `runpy` (an `os.exec*` would discard whatever of
     stdin Python has already buffered past the tar bytes).
 
-    Scratch-dir lifecycle (the leak this stub used to have - `w` was created
-    and never removed by any exit path):
+    Scratch-dir lifecycle:
 
-    `atexit.register(shutil.rmtree, w, ...)` is registered the INSTANT `w` is
-    created, before extraction even happens, and fires whenever THIS process
-    reaches a normal Python-level shutdown - which covers every exit path
-    that runs any Python code on the way out:
+    The stub registers `atexit.register(shutil.rmtree, w, ...)` the INSTANT
+    `w` is created, before extraction. After extracting, it acquires a
+    versioned lease which is held while the agent runs. The atexit cleanup
+    handles the current process whenever it reaches a normal Python-level
+    shutdown:
 
     * stdin EOF / the agent's own `bye` op (the ordinary case - `run()`'s
       loop ends, `main()` returns, `SystemExit(main())` propagates to the
@@ -281,18 +283,12 @@ def _bootstrap_stub(deadman_seconds: float, read_only: bool) -> str:
       `sys.exit(0)`, which is a normal (if abrupt) Python exit, not the raw
       OS default action, so it still reaches this same shutdown path.
 
-    It does NOT cover a SIGKILL (to this process or an ancestor `uv run`
-    it can't intercept), an OOM-kill, or the host disappearing outright -
-    none of those ever run another line of Python, so nothing registered
-    with `atexit` can fire. `amplifier_cu_agent.remote_agent
-    .sweep_stale_agent_dirs()` (called from `main()`, so it runs once per
-    NEW connection, on the fresh agent process) exists to bound the damage
-    from exactly that gap: it age-gates rather than identity-gates so a
-    live sibling session's directory (a second, independent connection to
-    the same target - see `_build_ssh_transport` in `registry.py`) is never
-    at risk, but anything old enough to be almost certainly orphaned gets
-    swept up the next time anyone connects. See that function's docstring
-    for the full reasoning.
+    SIGKILL, OOM kills, and host loss cannot run atexit. A later agent's
+    sweep can reclaim only a recognized, valid, unlocked versioned lease
+    after the mandatory 24-hour retention period; a held live lease remains.
+    Old-prefix, legacy/unknown, malformed/incomplete, and unsupported-locking
+    directories are deliberately preserved. This is separate from normal
+    atexit cleanup, not a replacement for it.
     """
     read_only_arg = "true" if read_only else "false"
     # Restrict even older Python 3.11 patch releases without tar filters to
@@ -300,12 +296,13 @@ def _bootstrap_stub(deadman_seconds: float, read_only: bool) -> str:
     allowed_names = tuple(f"{_PACKAGE_NAME}/{name}" for name in PAYLOAD_MODULES)
     return (
         "import sys,os,tarfile,io,runpy,hashlib,tempfile,atexit,shutil;"
+        "sys.exit('remote agent requires Python >= 3.11') if sys.version_info < (3,11) else None;"
         "buf=sys.stdin.buffer;"
         "n=int(buf.readline().strip());"
         "data=buf.read(n);"
         "sys.exit(97) if len(data)!=n else None;"
         "d=hashlib.sha256(data).hexdigest();"
-        "w=tempfile.mkdtemp(prefix='amplifier-cu-agent-');"
+        f"w=tempfile.mkdtemp(prefix={AGENT_SCRATCH_DIR_PREFIX!r});"
         "atexit.register(shutil.rmtree,w,ignore_errors=True);"
         "t=tarfile.open(fileobj=io.BytesIO(data),mode='r:gz');"
         f"allowed={allowed_names!r};"
@@ -317,6 +314,8 @@ def _bootstrap_stub(deadman_seconds: float, read_only: bool) -> str:
         "t.extractall(w,**({'filter':'data'} if hasattr(tarfile,'data_filter') else {}));"
         "t.close();"
         "sys.path.insert(0,w);"
+        "from amplifier_cu_agent.agent_scratch_lease import acquire_agent_lease;"
+        "lease_fd=acquire_agent_lease(w);"
         "os.environ['AMPLIFIER_CU_AGENT_SHA256']=d;"
         f"sys.argv=['remote_agent','--deadman-seconds={deadman_seconds}',"
         f"'--read-only={read_only_arg}'];"

@@ -18,20 +18,31 @@ from amplifier_module_tool_computer_use.ssh_transport import (
 )
 
 
-def _run_stub(tmp_path, extra=None, *, legacy=False, omit=None):
+def _run_stub(tmp_path, extra=None, *, legacy=False, omit=None, preamble=""):
     archive = io.BytesIO()
     with tarfile.open(fileobj=archive, mode="w:gz") as tf:
         for name in PAYLOAD_MODULES:
             if name == omit:
                 continue
-            code = b"print('agent started')\n" if name == "remote_agent.py" else b""
+            if name == "remote_agent.py":
+                code = b"print('agent started')\n"
+            elif name == "agent_scratch_lease.py":
+                code = (
+                    ROOT
+                    / "modules"
+                    / "tool-computer-use"
+                    / "amplifier_module_tool_computer_use"
+                    / name
+                ).read_bytes()
+            else:
+                code = b""
             info = tarfile.TarInfo(f"amplifier_cu_agent/{name}")
             info.size = len(code)
             tf.addfile(info, io.BytesIO(code))
         if extra is not None:
             tf.addfile(extra, io.BytesIO(b"") if extra.isreg() else None)
     payload = archive.getvalue()
-    stub = _bootstrap_stub(5.0, True)
+    stub = preamble + _bootstrap_stub(5.0, True)
     if legacy:
         # Emulate a pre-filter 3.11 tarfile API; still extract using the real
         # archive implementation. The stub must validate names/types first.
@@ -59,7 +70,38 @@ def test_bootstrap_extracts_payload_without_warning(tmp_path, legacy):
     assert result.returncode == 0, result.stderr.decode()
     assert result.stdout == b"agent started\n"
     assert result.stderr == b""
-    assert not list(tmp_path.glob("amplifier-cu-agent-*"))
+    assert not list(tmp_path.glob("amplifier-cu-v2-agent-*"))
+
+
+def test_bootstrap_refuses_old_python_before_reading_payload(tmp_path):
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-W",
+            "error::DeprecationWarning",
+            "-c",
+            "import sys\nsys.version_info = (3, 10, 0)\n" + _bootstrap_stub(5.0, True),
+        ],
+        input=b"not-a-size\n",
+        capture_output=True,
+        env={**os.environ, "TMPDIR": str(tmp_path)},
+        timeout=5,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert b"remote agent requires Python >= 3.11" in result.stderr
+    assert b"ValueError" not in result.stderr
+    assert result.stdout == b""
+    assert not list(tmp_path.glob("amplifier-cu-v2-agent-*"))
+
+
+def test_bootstrap_accepts_simulated_python_311(tmp_path):
+    result = _run_stub(tmp_path, preamble="import sys\nsys.version_info = (3, 11, 0)\n")
+    assert result.returncode == 0, result.stderr.decode()
+    assert result.stdout == b"agent started\n"
+    assert result.stderr == b""
+    assert not list(tmp_path.glob("amplifier-cu-v2-agent-*"))
 
 
 @pytest.mark.parametrize("legacy", [False, True])
@@ -102,4 +144,4 @@ def test_bootstrap_refuses_non_manifest_or_non_regular_files(
     assert b"unsafe agent payload" in result.stderr
     assert b"agent started" not in result.stdout
     assert not (tmp_path / "escaped").exists()
-    assert not list(tmp_path.glob("amplifier-cu-agent-*"))
+    assert not list(tmp_path.glob("amplifier-cu-v2-agent-*"))

@@ -219,9 +219,13 @@ typical bundle.** In brief:
 - Pillow (installed with the tool module).
 
 **No agent installed on the target**, and no admin rights, extra service, or new listening
-port: our files ship down the SSH pipe and are removed at session end — nothing to update
-or uninstall. That is a claim about *our agent*, **not** a claim that the target needs no
-setup. It still needs everything listed above.
+port: our files ship down the SSH pipe and normally remove themselves at session end —
+nothing to update or uninstall. A crash can leave an incomplete scratch directory; a later
+agent only reclaims a valid v2 lease after a 24-hour minimum retention period and only when
+it is unlocked. That protects live long-running agents: age is not treated as idleness.
+Legacy, unknown, incomplete, and unsupported-locking cases are retained conservatively.
+That is a claim about *our agent*, **not** a claim that the target needs no setup. It still
+needs everything listed above.
 
 ## Safety
 

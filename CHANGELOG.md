@@ -28,6 +28,10 @@ line declared in `modules/tool-computer-use/pyproject.toml` and
 
 ### Fixed
 
+- Remote-agent scratch cleanup now uses a locked v2 lease instead of treating directory age
+  as liveness. Normal exits still clean their own directory; only valid, unlocked v2 leases
+  past a 24-hour minimum retention period are later reclaimed, while legacy, unknown, and
+  incomplete crash residue is retained conservatively.
 - Documentation that still described macOS `type_text` as an open defect six weeks after
   it was fixed in `ccf0913`. The README's known-issues list, `docs/SETUP.md`'s capability
   table and its §9 all carried the pre-fix text, including a hypothesis about the event
