@@ -43,21 +43,21 @@ import base64
 import io
 import json
 import logging
-import shutil
 import signal
 import sys as _sys
-import tempfile
 import threading
-import time
 import traceback
 from collections.abc import Callable
-from pathlib import Path
 from typing import Any, ClassVar
 
 # Package-relative imports: this module always runs as part of the
 # `amplifier_module_tool_computer_use` (locally) or a same-shaped extracted
 # package (remotely) - see `ssh_transport.PAYLOAD_MODULES`.
 from . import announce_macos
+from .agent_scratch_lease import (
+    STALE_AGENT_DIR_MIN_AGE_SECONDS,
+    sweep_stale_agent_dirs,
+)
 from .backend import Backend, BackendError
 from .exclusion import ExclusionZone
 from .ledger import DEFAULT_DEADMAN_SECONDS, HeldInputLedger
@@ -144,78 +144,9 @@ def _probe_permissions(backend: Backend) -> dict[str, bool]:
     return permissions
 
 
-#: Glob for the scratch dirs `ssh_transport._bootstrap_stub` creates via
-#: `tempfile.mkdtemp(prefix='amplifier-cu-agent-')`. That call site is the
-#: source of truth for the name shape; this is only the matching pattern.
-_STALE_AGENT_DIR_GLOB = "amplifier-cu-agent-*"
-
-#: Directories older than this are almost certainly orphaned, not live. A
-#: real Phase 1 session is interactive and short (`ledger
-#: .DEFAULT_DEADMAN_SECONDS` is single-digit seconds - nothing legitimate
-#: goes quiet for anywhere near this long), so age alone is a safe enough
-#: signal without ever having to know which directory belongs to "this"
-#: run. Chosen generously - see `sweep_stale_agent_dirs` for why a
-#: conservative threshold matters here specifically.
-STALE_AGENT_DIR_MAX_AGE_SECONDS = 24 * 60 * 60  # 24h
-
-
-def sweep_stale_agent_dirs(
-    *,
-    temp_dir: str | None = None,
-    max_age_seconds: float = STALE_AGENT_DIR_MAX_AGE_SECONDS,
-) -> int:
-    """Best-effort removal of scratch dirs orphaned by a PAST agent process
-    that died too hard for its own cleanup to run.
-
-    `ssh_transport._bootstrap_stub` registers an `atexit` hook for the
-    CURRENT run's own directory the instant it is created, and that covers
-    every exit path that executes any further Python: normal completion
-    (stdin EOF / the `bye` op) and SIGTERM/SIGHUP/SIGINT once
-    `RemoteAgent.install_signal_handlers()` has run (each handler calls
-    `sys.exit(0)`, a normal Python exit, not the raw OS default action). It
-    cannot cover a SIGKILL, an OOM-kill, or the host disappearing outright -
-    none of those run another line of Python, so nothing registered with
-    `atexit` ever fires. This function is what keeps THAT gap from
-    accumulating without bound: called once per new connection (see
-    `main()`, below), so a hard-killed predecessor's directory is at most
-    one connection's worth of staleness before it gets swept.
-
-    Age-gated, not identity-gated: two independent sessions can legitimately
-    be connected to the SAME target at once, each with its own scratch dir
-    (`_build_ssh_transport` in `registry.py` shares a transport only within
-    one controller process - a second, unrelated controller process is a
-    second agent). A sweep that removed every OTHER directory unconditionally
-    could delete a live sibling's directory while it is still serving lazy
-    imports off `sys.path` for a running session - exactly the hazard this
-    design has to avoid, and worse than the leak it would be fixing. Judging
-    by age instead means the current run's own directory (always freshly
-    created) is never a candidate, and a live sibling would have to sit idle
-    for `max_age_seconds` before this would ever touch it.
-
-    Never raises: a failure here (permissions, a directory vanishing mid-
-    scan, an unreadable temp dir) must never prevent the new agent from
-    starting - the constraint this whole feature lives under is "a leaked
-    temp dir is a wart, a crashed agent is an outage." Returns the count
-    actually removed (0 on any error, including "nothing to do").
-    """
-    try:
-        base = Path(temp_dir) if temp_dir is not None else Path(tempfile.gettempdir())
-        now = time.time()
-        removed = 0
-        for path in base.glob(_STALE_AGENT_DIR_GLOB):
-            try:
-                if now - path.stat().st_mtime < max_age_seconds:
-                    continue
-                shutil.rmtree(path, ignore_errors=True)
-                removed += 1
-            except OSError as exc:
-                logger.debug("stale-dir sweep: skipping %s: %s", path, exc)
-        if removed:
-            logger.info("stale-dir sweep: removed %d orphaned agent dir(s)", removed)
-        return removed
-    except Exception as exc:  # noqa: BLE001 - best-effort hygiene, must never block startup
-        logger.debug("stale-dir sweep: skipped entirely: %s", exc)
-        return 0
+# Compatibility import for callers that used the old name. The age is now a
+# minimum retention floor; it is never interpreted as liveness or idleness.
+STALE_AGENT_DIR_MAX_AGE_SECONDS = STALE_AGENT_DIR_MIN_AGE_SECONDS
 
 
 class UnsupportedOpError(BackendError):

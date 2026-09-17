@@ -298,17 +298,34 @@ os.dup2(2, 1)                                          # everything else → std
 
 At connect time the controller:
 
-1. Builds a deterministic `tar.gz` of the agent payload — `backend.py`, `geometry.py`, `imaging.py`, `monitors.py`, `registry.py`, `linux_x11.py`, `macos.py`, `windows.py`, `bridge.ps1`, `agent.py`, plus a manifest. Roughly 100 KB.
-2. Computes its SHA-256.
+1. Builds a manifest-restricted `tar.gz` from `ssh_transport.PAYLOAD_MODULES`, including
+   `remote_agent.py`, `agent_scratch_lease.py`, and the platform and support modules the
+   remote agent imports.
+2. Computes the SHA-256 of the exact payload bytes.
 3. Opens **one** SSH connection whose remote command is a small pure-Python stub, and writes: `[payload bytes][NDJSON requests…]` to its stdin.
 
-The stub reads exactly `N` bytes, verifies the hash, extracts to `~/.cache/amplifier-computer-use/<sha256>/`, and runs the agent **in-process** (`runpy.run_path`) so the buffered remainder of stdin survives as the protocol channel. Verified working in §3.3.
+The stub reads exactly `N` bytes, computes and exports the received-byte hash, validates the
+fixed manifest before extraction, then runs the agent **in-process** (`runpy.run_module`) from
+a private session scratch directory so the buffered remainder of stdin survives as the protocol
+channel. It registers its own cleanup immediately after creating that directory, before
+extraction. The controller verifies the received-byte hash during the handshake; the stub does
+not have an expected hash to compare.
 
 Why this shape:
 
 - **No `scp`, no second connection, no second channel.** Deployment and session are the same stream, so they cannot disagree about which code is running.
-- **Version skew is structurally impossible**, not merely detected. The agent reports the hash of what it actually extracted; the controller compares against what it actually sent. Mismatch → fail loud, disconnect. Since deployment happens every connect and the payload is ~100 KB over a 1–8 ms link, there is no incentive to skip it and therefore no stale-cache path to reason about.
-- **The cache directory is content-addressed**, so multiple controller versions coexist without interfering.
+- **Version skew is structurally impossible**, not merely detected. The agent reports the hash
+  of the received payload bytes; the controller compares it with the exact bytes it sent.
+  Mismatch → fail loud, disconnect. Deployment happens every connection, so there is no
+  persistent agent-code cache or stale-cache path to reason about.
+- **Scratch cleanup is lease-based, not age-based.** After extraction the deployed helper
+  creates an exact v2 marker and holds an advisory lock for the agent process lifetime.
+  Normal shutdown removes the agent's own directory. A later agent may reclaim only a
+  valid, unlocked v2 marker whose marker mtime has passed a 24-hour *minimum retention*
+  floor. An old process can be live, so age is not evidence of idleness. Legacy prefixes,
+  unknown names, malformed or incomplete crash residue, and platforms without the needed
+  POSIX no-follow and locking primitives are conservatively retained. This protects
+  ordinary cooperating sessions, not a malicious same-UID process racing filesystem swaps.
 
 **Dependencies.** The agent needs PIL (for `capture_scaled`) and, on X11 targets, `python-xlib`. Neither is installed on either target; `pip3` is missing on the WSL box. **`uv` is present on both and is the answer.** The stub locates `uv` by absolute path — `~/.local/bin/uv`, `/opt/homebrew/bin/uv`, `/usr/local/bin/uv`, then `shutil.which` — never trusting `PATH`, mirroring `windows.py::_which_powershell`. It then re-execs under `uv run --with pillow --with python-xlib`. If `uv` cannot be found, **fail loud with the list of paths tried** — the same diagnostic shape `_which_powershell` already produces. Do not attempt a pip fallback; on the WSL target there is no pip to fall back to.
 
@@ -388,6 +405,13 @@ Named honestly, because "SSH everywhere" is not true:
 The **controller** does, for the duration of the session. No systemd unit, no launchd plist, no daemon, no autostart. The agent's lifetime is the SSH subprocess's lifetime, which is bounded by the module's mount/cleanup cycle — `mount()` returns a cleanup callable, which the kernel awaits at teardown (`CONTRACTS.md` § Module Lifecycle).
 
 Shutdown order: `release_all` → `bye` → close stdin → wait 2 s → `SIGTERM` the ssh process → wait 2 s → `SIGKILL`.
+
+The bootstrap also registers its scratch-directory cleanup immediately on creation. A raw
+crash before it can acquire a v2 lease leaves an unknown/incomplete directory intentionally
+untouched. On POSIX targets with secure no-follow opens and advisory locks, a future agent
+reclaims only an unlocked, valid v2 lease after the marker has been retained for at least
+24 hours; it never removes legacy or unknown names. Where those primitives are unavailable,
+automatic stale cleanup is disabled rather than risking a live agent's imports.
 
 ### 10.2 The held-input ledger — the most important safety property here
 

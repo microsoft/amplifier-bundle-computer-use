@@ -1,107 +1,315 @@
-"""Unit tests for `remote_agent.sweep_stale_agent_dirs` - the defense-in-depth
-half of the scratch-dir leak fix (the other half, `atexit` registration in
-`ssh_transport._bootstrap_stub`, is proven in
-`test_agent_scratch_dir_cleanup.py`).
-
-`atexit` can only run code in a process that is still alive to run it - a
-SIGKILL, an OOM-kill, or the host disappearing never gets there, so some
-scratch dirs are always going to survive whatever cleanup the dying process
-itself could register. This sweep is what keeps THAT residual leak bounded
-instead of unbounded: it runs once per new connection and removes anything
-old enough to be almost certainly orphaned.
-
-No subprocess, no real target - plain directories under `tmp_path`, with
-`os.utime` used to backdate the ones that should look stale.
-"""
+"""POSIX-only safety tests for v2 remote-agent scratch lease reclamation."""
 
 from __future__ import annotations
 
+import ast
 import os
+import stat
 import sys
 import time
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "modules" / "tool-computer-use"))
 
+from amplifier_module_tool_computer_use import agent_scratch_lease as lease
 from amplifier_module_tool_computer_use.remote_agent import sweep_stale_agent_dirs
 
-
-def _make_dir(base: Path, name: str, *, age_seconds: float) -> Path:
-    d = base / name
-    d.mkdir()
-    (d / "marker.txt").write_text("x", encoding="utf-8")
-    stamp = time.time() - age_seconds
-    os.utime(d, (stamp, stamp))
-    return d
+pytestmark = pytest.mark.skipif(
+    lease._secure_flags() is None or lease._flock_module() is None,
+    reason="requires POSIX no-follow operations and flock",
+)
 
 
-def test_sweep_removes_only_dirs_older_than_the_threshold(tmp_path: Path) -> None:
-    stale = _make_dir(tmp_path, "amplifier-cu-agent-stale", age_seconds=48 * 3600)
-    fresh = _make_dir(tmp_path, "amplifier-cu-agent-fresh", age_seconds=5)
+def _old_valid_dir(base: Path, name: str) -> Path:
+    directory = base / f"{lease.AGENT_SCRATCH_DIR_PREFIX}{name}"
+    directory.mkdir(mode=0o700)
+    os.chmod(directory, 0o700)
+    marker = directory / lease.LEASE_FILENAME
+    marker.write_bytes(lease.LEASE_MAGIC)
+    os.chmod(marker, 0o600)
+    stamp = time.time() - 48 * 60 * 60
+    os.utime(marker, (stamp, stamp))
+    return directory
 
-    removed = sweep_stale_agent_dirs(temp_dir=str(tmp_path), max_age_seconds=3600)
 
-    assert removed == 1
-    assert not stale.exists(), "stale dir must be removed"
-    assert fresh.exists(), "fresh (possibly live, concurrent-session) dir must survive"
+def test_sweep_removes_only_old_unlocked_v2_leases(tmp_path: Path) -> None:
+    stale = _old_valid_dir(tmp_path, "stale")
+    fresh = _old_valid_dir(tmp_path, "fresh")
+    os.utime(fresh / lease.LEASE_FILENAME, None)
+
+    assert sweep_stale_agent_dirs(temp_dir=str(tmp_path)) == 1
+    assert not stale.exists()
+    assert fresh.exists()
 
 
-def test_sweep_never_touches_a_live_concurrent_sessions_directory(
+def test_sweep_preserves_legacy_unknown_and_unleased_directories(
     tmp_path: Path,
 ) -> None:
-    """The core safety property: a second, independent session to the same
-    target must never lose its scratch dir just because this one connected.
-    Simulated here as a dir well under the age threshold."""
-    live_sibling = _make_dir(tmp_path, "amplifier-cu-agent-sibling", age_seconds=60)
+    legacy = tmp_path / "amplifier-cu-agent-legacy"
+    unknown = tmp_path / "unrelated-agent"
+    incomplete = tmp_path / f"{lease.AGENT_SCRATCH_DIR_PREFIX}incomplete"
+    for directory in (legacy, unknown, incomplete):
+        directory.mkdir(mode=0o700)
+        os.chmod(directory, 0o700)
+    (legacy / lease.LEASE_FILENAME).write_bytes(lease.LEASE_MAGIC)
 
-    sweep_stale_agent_dirs(temp_dir=str(tmp_path), max_age_seconds=3600)
-
-    assert live_sibling.exists()
-
-
-def test_sweep_ignores_unrelated_files_and_directories(tmp_path: Path) -> None:
-    unrelated = tmp_path / "some-other-tempfile"
-    unrelated.write_text("not ours", encoding="utf-8")
-    stamp = time.time() - 999999
-    os.utime(unrelated, (stamp, stamp))
-
-    removed = sweep_stale_agent_dirs(temp_dir=str(tmp_path), max_age_seconds=1)
-
-    assert removed == 0
-    assert unrelated.exists()
+    assert sweep_stale_agent_dirs(temp_dir=str(tmp_path)) == 0
+    assert legacy.exists()
+    assert unknown.exists()
+    assert incomplete.exists()
 
 
-def test_sweep_returns_zero_and_never_raises_when_temp_dir_is_missing() -> None:
-    """Cleanup failing must never break a working session - a nonexistent
-    or unreadable temp dir is exactly the kind of environment hiccup this
-    is best-effort against."""
-    removed = sweep_stale_agent_dirs(
-        temp_dir="/this/path/does/not/exist/anywhere", max_age_seconds=1
-    )
-    assert removed == 0
+def test_sweep_preserves_bare_v2_prefix_even_with_valid_old_marker(
+    tmp_path: Path,
+) -> None:
+    bare = tmp_path / lease.AGENT_SCRATCH_DIR_PREFIX
+    bare.mkdir(mode=0o700)
+    os.chmod(bare, 0o700)
+    marker = bare / lease.LEASE_FILENAME
+    marker.write_bytes(lease.LEASE_MAGIC)
+    os.chmod(marker, 0o600)
+    os.utime(marker, (time.time() - 48 * 60 * 60,) * 2)
+
+    assert sweep_stale_agent_dirs(temp_dir=str(tmp_path)) == 0
+    assert bare.exists()
 
 
-def test_sweep_survives_a_directory_it_cannot_remove(
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "trailing",
+        "fifo",
+        "bad-mode",
+        "directory-mode",
+        "hardlink",
+        "marker-symlink",
+    ],
+)
+def test_sweep_preserves_invalid_marker_types_and_modes(
+    tmp_path: Path, kind: str
+) -> None:
+    directory = _old_valid_dir(tmp_path, kind)
+    marker = directory / lease.LEASE_FILENAME
+    if kind == "trailing":
+        marker.write_bytes(lease.LEASE_MAGIC + b"extra")
+    elif kind == "fifo":
+        marker.unlink()
+        os.mkfifo(marker, 0o600)
+    elif kind == "bad-mode":
+        os.chmod(marker, 0o640)
+    elif kind == "directory-mode":
+        os.chmod(directory, 0o750)
+    elif kind == "marker-symlink":
+        outside = tmp_path / "outside-marker"
+        outside.write_bytes(lease.LEASE_MAGIC)
+        marker.unlink()
+        marker.symlink_to(outside)
+    else:
+        linked = tmp_path / "linked-marker"
+        linked.write_bytes(lease.LEASE_MAGIC)
+        os.chmod(linked, 0o600)
+        marker.unlink()
+        os.link(linked, marker)
+        os.utime(marker, (time.time() - 48 * 60 * 60,) * 2)
+
+    assert sweep_stale_agent_dirs(temp_dir=str(tmp_path)) == 0
+    assert directory.exists()
+
+
+def test_sweep_rejects_explicit_symlink_base_and_candidate(tmp_path: Path) -> None:
+    base = tmp_path / "base"
+    base.mkdir(mode=0o700)
+    outside = tmp_path / "outside"
+    outside.mkdir(mode=0o700)
+    (outside / "keep").write_text("keep", encoding="utf-8")
+    candidate = base / f"{lease.AGENT_SCRATCH_DIR_PREFIX}symlink"
+    candidate.symlink_to(outside, target_is_directory=True)
+    prefixed_file = base / f"{lease.AGENT_SCRATCH_DIR_PREFIX}ordinary-file"
+    prefixed_file.write_text("not a directory", encoding="utf-8")
+    base_link = tmp_path / "base-link"
+    base_link.symlink_to(base, target_is_directory=True)
+
+    assert sweep_stale_agent_dirs(temp_dir=str(base_link)) == 0
+    assert sweep_stale_agent_dirs(temp_dir=str(base)) == 0
+    assert candidate.is_symlink()
+    assert prefixed_file.exists()
+    assert (outside / "keep").read_text(encoding="utf-8") == "keep"
+
+
+def test_default_temp_base_is_canonicalized_but_explicit_symlink_is_rejected(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """A single unremovable directory (permissions, a race with something
-    else deleting it) must not abort the sweep or raise - `shutil.rmtree`
-    is called with `ignore_errors=True` for exactly this reason, but this
-    proves the surrounding loop is equally tolerant of a `stat()` failure."""
-    stale = _make_dir(tmp_path, "amplifier-cu-agent-a", age_seconds=48 * 3600)
-    also_stale = _make_dir(tmp_path, "amplifier-cu-agent-b", age_seconds=48 * 3600)
+    real_base = tmp_path / "real-base"
+    real_base.mkdir(mode=0o700)
+    link_base = tmp_path / "linked-base"
+    link_base.symlink_to(real_base, target_is_directory=True)
+    candidate = _old_valid_dir(real_base, "default-canonicalized")
+    monkeypatch.setattr(lease.tempfile, "gettempdir", lambda: str(link_base))
 
-    real_stat = Path.stat
+    assert sweep_stale_agent_dirs() == 1
+    assert not candidate.exists()
 
-    def _flaky_stat(self, *args, **kwargs):
-        if self == stale:
-            raise OSError("simulated stat failure")
-        return real_stat(self, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "stat", _flaky_stat)
+def test_requested_max_age_never_lowers_24_hour_retention(tmp_path: Path) -> None:
+    directory = _old_valid_dir(tmp_path, "below-floor")
+    os.utime(directory / lease.LEASE_FILENAME, (time.time() - 2 * 60 * 60,) * 2)
 
-    removed = sweep_stale_agent_dirs(temp_dir=str(tmp_path), max_age_seconds=3600)
+    assert sweep_stale_agent_dirs(temp_dir=str(tmp_path), max_age_seconds=0) == 0
+    assert directory.exists()
 
-    assert removed == 1
-    assert not also_stale.exists()
+
+def test_locked_48_hour_lease_is_preserved_as_live(tmp_path: Path) -> None:
+    directory = tmp_path / f"{lease.AGENT_SCRATCH_DIR_PREFIX}live"
+    directory.mkdir(mode=0o700)
+    os.chmod(directory, 0o700)
+    fd = lease.acquire_agent_lease(directory)
+    assert fd is not None
+    try:
+        marker = directory / lease.LEASE_FILENAME
+        os.utime(marker, (time.time() - 48 * 60 * 60,) * 2)
+        assert sweep_stale_agent_dirs(temp_dir=str(tmp_path)) == 0
+        assert directory.exists()
+    finally:
+        os.close(fd)
+
+
+def test_acquire_write_failure_keeps_its_locked_fd(tmp_path: Path, monkeypatch) -> None:
+    import fcntl
+
+    directory = tmp_path / f"{lease.AGENT_SCRATCH_DIR_PREFIX}write-failure"
+    directory.mkdir(mode=0o700)
+    os.chmod(directory, 0o700)
+    monkeypatch.setattr(
+        lease.os, "write", lambda *_: (_ for _ in ()).throw(OSError("write failed"))
+    )
+    held_fd = lease.acquire_agent_lease(directory)
+    assert held_fd is not None
+    probe_fd = os.open(directory / lease.LEASE_FILENAME, os.O_RDWR)
+    try:
+        with pytest.raises(OSError):
+            fcntl.flock(probe_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        assert (directory / lease.LEASE_FILENAME).read_bytes() == b""
+    finally:
+        os.close(probe_fd)
+        os.close(held_fd)
+
+
+def test_rmtree_failure_preserves_one_candidate_and_continues(
+    tmp_path: Path, monkeypatch
+) -> None:
+    blocked = _old_valid_dir(tmp_path, "blocked")
+    removable = _old_valid_dir(tmp_path, "removable")
+    real_rmtree = lease.shutil.rmtree
+
+    def flaky_rmtree(name, *, dir_fd):
+        if name == blocked.name:
+            raise OSError("simulated removal failure")
+        return real_rmtree(name, dir_fd=dir_fd)
+
+    monkeypatch.setattr(lease.shutil, "rmtree", flaky_rmtree)
+    monkeypatch.setattr(
+        lease.shutil.rmtree, "avoids_symlink_attacks", True, raising=False
+    )
+
+    assert sweep_stale_agent_dirs(temp_dir=str(tmp_path)) == 1
+    assert blocked.exists()
+    assert not removable.exists()
+
+
+def test_unsupported_locking_preserves_candidate(tmp_path: Path, monkeypatch) -> None:
+    directory = _old_valid_dir(tmp_path, "unsupported")
+    monkeypatch.setattr(lease, "_flock_module", lambda: None)
+    assert sweep_stale_agent_dirs(temp_dir=str(tmp_path)) == 0
+    assert directory.exists()
+    assert lease.acquire_agent_lease(directory) is None
+
+
+def test_unsupported_secure_primitives_preserve_scratch_without_marker(
+    tmp_path: Path, monkeypatch
+) -> None:
+    directory = tmp_path / f"{lease.AGENT_SCRATCH_DIR_PREFIX}unsupported-primitives"
+    directory.mkdir(mode=0o700)
+    os.chmod(directory, 0o700)
+    monkeypatch.setattr(lease, "_secure_flags", lambda: None)
+
+    assert lease.acquire_agent_lease(directory) is None
+    assert directory.exists()
+    assert not (directory / lease.LEASE_FILENAME).exists()
+
+
+def test_owner_mismatch_preserves_candidate(tmp_path: Path, monkeypatch) -> None:
+    directory = _old_valid_dir(tmp_path, "owner-mismatch")
+    monkeypatch.setattr(lease.os, "geteuid", lambda: -1)
+
+    assert sweep_stale_agent_dirs(temp_dir=str(tmp_path)) == 0
+    assert directory.exists()
+
+
+def test_existing_marker_does_not_get_overwritten(tmp_path: Path) -> None:
+    directory = tmp_path / f"{lease.AGENT_SCRATCH_DIR_PREFIX}existing-marker"
+    directory.mkdir(mode=0o700)
+    os.chmod(directory, 0o700)
+    marker = directory / lease.LEASE_FILENAME
+    marker.write_bytes(b"legacy marker")
+    os.chmod(marker, 0o600)
+
+    assert lease.acquire_agent_lease(directory) is None
+    assert marker.read_bytes() == b"legacy marker"
+
+
+def test_flock_failure_after_marker_creation_leaves_invalid_marker(
+    tmp_path: Path, monkeypatch
+) -> None:
+    directory = tmp_path / f"{lease.AGENT_SCRATCH_DIR_PREFIX}flock-failure"
+    directory.mkdir(mode=0o700)
+    os.chmod(directory, 0o700)
+
+    class FailingFlock:
+        LOCK_EX = 1
+        LOCK_NB = 2
+
+        @staticmethod
+        def flock(fd: int, flags: int) -> None:
+            raise OSError("simulated flock failure")
+
+    monkeypatch.setattr(lease, "_flock_module", lambda: FailingFlock)
+    assert lease.acquire_agent_lease(directory) is None
+    assert (directory / lease.LEASE_FILENAME).read_bytes() == b""
+
+
+def test_full_magic_write_then_error_retains_lock_and_prevents_sweep(
+    tmp_path: Path, monkeypatch
+) -> None:
+    real_write = lease.os.write
+    directory = tmp_path / f"{lease.AGENT_SCRATCH_DIR_PREFIX}partial-write"
+    directory.mkdir(mode=0o700)
+    os.chmod(directory, 0o700)
+
+    def write_then_error(fd: int, data: bytes) -> int:
+        real_write(fd, data)
+        raise OSError("simulated post-write error")
+
+    monkeypatch.setattr(lease.os, "write", write_then_error)
+    held_fd = lease.acquire_agent_lease(directory)
+    assert held_fd is not None
+    try:
+        marker = directory / lease.LEASE_FILENAME
+        assert marker.read_bytes() == lease.LEASE_MAGIC
+        os.utime(marker, (time.time() - 48 * 60 * 60,) * 2)
+        assert sweep_stale_agent_dirs(temp_dir=str(tmp_path)) == 0
+        assert directory.exists()
+    finally:
+        os.close(held_fd)
+
+
+def test_helper_has_no_module_level_fcntl_import() -> None:
+    tree = ast.parse(Path(lease.__file__).read_text(encoding="utf-8"))
+    assert not any(
+        isinstance(node, (ast.Import, ast.ImportFrom))
+        and any(alias.name == "fcntl" for alias in node.names)
+        for node in tree.body
+    )
+    assert stat.S_ISREG(os.stat(lease.__file__).st_mode)

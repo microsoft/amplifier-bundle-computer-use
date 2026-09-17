@@ -22,6 +22,7 @@ import threading
 from pathlib import Path
 from typing import Any
 
+from .agent_scratch_lease import AGENT_SCRATCH_DIR_PREFIX
 from .wire import Response, validate_handshake
 
 logger = logging.getLogger(__name__)
@@ -47,6 +48,7 @@ PAYLOAD_MODULES = (
     "windows.py",
     "wire.py",
     "ledger.py",
+    "agent_scratch_lease.py",
     "remote_agent.py",
     # The session-start disclosure channel (docs/designs/coexistence.md
     # \u00a77, \u00a710.3) closes the remote-transport gap BACKLOG.md recorded:
@@ -305,7 +307,7 @@ def _bootstrap_stub(deadman_seconds: float, read_only: bool) -> str:
         "data=buf.read(n);"
         "sys.exit(97) if len(data)!=n else None;"
         "d=hashlib.sha256(data).hexdigest();"
-        "w=tempfile.mkdtemp(prefix='amplifier-cu-agent-');"
+        f"w=tempfile.mkdtemp(prefix={AGENT_SCRATCH_DIR_PREFIX!r});"
         "atexit.register(shutil.rmtree,w,ignore_errors=True);"
         "t=tarfile.open(fileobj=io.BytesIO(data),mode='r:gz');"
         f"allowed={allowed_names!r};"
@@ -317,6 +319,8 @@ def _bootstrap_stub(deadman_seconds: float, read_only: bool) -> str:
         "t.extractall(w,**({'filter':'data'} if hasattr(tarfile,'data_filter') else {}));"
         "t.close();"
         "sys.path.insert(0,w);"
+        "from amplifier_cu_agent.agent_scratch_lease import acquire_agent_lease;"
+        "lease_fd=acquire_agent_lease(w);"
         "os.environ['AMPLIFIER_CU_AGENT_SHA256']=d;"
         f"sys.argv=['remote_agent','--deadman-seconds={deadman_seconds}',"
         f"'--read-only={read_only_arg}'];"
