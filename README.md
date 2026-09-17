@@ -270,11 +270,13 @@ are created `0700` and files `0600`.
 
 ## Known issues
 
-- **macOS `type_text` silently no-ops while returning success — OPEN.** On an unlocked
-  Mac, `key` works and `type` returns `success: true` while entering nothing. Localized to
-  the type path; hypothesis (unconfirmed) is that it posts to a specific app rather than
-  the system-wide event tap. `key`-only flows on macOS are unaffected. Logged in
-  `BACKLOG.md`.
+- ~~**macOS `type_text` silently no-ops while returning success.**~~ **FIXED** in
+  `ccf0913` (2026-08-04) — the cause was a keycode-0 `CGEventKeyboardSetUnicodeString`
+  event, which macOS accepts and then discards; it now posts real, non-zero keycodes, the
+  same mechanism `key` uses. The "posts to a specific app rather than the system-wide
+  event tap" hypothesis this entry used to carry was wrong. Re-verified on real hardware
+  2026-09-15 (macOS 26.6.2, remote over SSH): Spotlight received
+  `amplifier typing test` verbatim.
 - **No whole-session end-to-end run** of the hook, native promotion, screenshot rewriting
   and the write gate all executing together (`BACKLOG.md`).
 - **The Windows on-desktop indicator overlay is not built** (Linux and macOS announce are).

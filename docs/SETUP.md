@@ -74,7 +74,7 @@ Stated plainly so you can pick a path you can actually finish.
 | OpenAI provider driving a real desktop | **Proven live.** `gpt-5.5` verified end-to-end through this bundle against a real remote desktop, 2026-08-03 (`providers.py` `OPENAI.models`) |
 | Windows target (WSL2 interop, local) | **Proven.** Capture and input both verified end to end — see `BACKLOG.md` |
 | macOS target — capture, `key`, `focus_window` | **Proven** on real hardware |
-| macOS target — `type_text` | **BROKEN. Known open defect.** Returns success, enters nothing. See [Known issues](#9-known-issues) |
+| macOS target — `type_text` | **Proven** on real hardware. Was broken (keycode-0 events); fixed in `ccf0913`, re-verified 2026-09-15 on macOS 26.6.2 |
 | Linux/X11 target (local) | Backend implemented; presence guard measured (`GUARD_MEASURED["linux-x11"] = True`) |
 | Remote target over SSH | Full action set is implemented and dispatched, including `left_mouse_down`/`up`, `left_click_drag`, `scroll`, `hold_key`, and all four `desktop` window/clipboard actions — see [Remote action coverage](#remote-action-coverage) |
 | Gemini | A dialect record exists in `providers.py` (`gemini-2.5-computer-use` → `computer_use`), built from captured traffic. **No live end-to-end run through this bundle is claimed.** |
@@ -622,25 +622,95 @@ problems with different fixes:
 
 ---
 
-### Narrow macOS single-display capture fallback
+### macOS capture fallback: per-display, and a multi-display compositor
 
 If native `CGDisplayCreateImage` returns `None`, capture may make one bounded
-`/usr/sbin/screencapture -m` attempt **only** when exactly one active display remains the
-main display with unchanged physical geometry. Before launching it, the backend requires a
-fresh positive Screen Recording preflight and an unlocked session; it rechecks the unlocked
-state and display identity after the child, decodes the private temporary PNG into memory,
-and rejects unexpected dimensions. The temporary directory and file are private; cleanup
-is attempted on every path. A cleanup failure is reported explicitly because private
-capture data may remain.
+`/usr/sbin/screencapture` attempt **per display**. When exactly one display is active it
+uses `-m` and requires that display to remain the sole main display with unchanged physical
+geometry. With several displays active it uses `-D <1-based ordinal>` into the active
+display list, and requires that display to still be present with unchanged geometry and the
+list itself not reordered — the ordinal is an index into that list, so a reorder would
+silently retarget the capture.
+
+Both forms take the same guards: a fresh positive Screen Recording preflight and an unlocked
+session before the child, the unlocked state and display identity rechecked after it, the
+private temporary PNG decoded into memory, and unexpected dimensions rejected. The temporary
+directory and file are private; cleanup is attempted on every path, and a cleanup failure is
+reported explicitly because private capture data may remain.
+
+Whole-virtual-desktop capture with several displays active composites those per-display
+captures into one canvas — the point-space bounding box of every active display at the
+**largest** backing scale among them, which is the geometry
+`CGWindowListCreateImage(CGRectInfinite, ...)` itself produces. Before the composite is
+accepted, every placement input is re-read and compared against the snapshot the canvas was
+built from: the active ID list and its order, each display's backing scale, and each
+display's full bounds. A display that moves or resizes mid-composite invalidates it.
+
+**Native first, everywhere. All of the above is the exception path.**
+
+`CGDisplayCreateImage` answers a per-display or region capture, and
+`CGWindowListCreateImage` answers a whole-virtual-desktop capture, whenever they are
+healthy. On a macOS where they are, none of the `screencapture` machinery above ever runs
+and it costs nothing. This is deliberate and it is why there is no OS-version check
+anywhere in this backend:
+
+| | macOS 26.6.2 (25G83) | macOS 26.7 (25G229) |
+|---|---|---|
+| `CGDisplayCreateImage` | ~5.0s → **NULL** | 0.02–0.08s → real image |
+| `CGWindowListCreateImage` | **30.04s** → a correct image | 0.07s → a correct image |
+
+Same machine, measured either side of one OS update. A version table would have encoded
+those two observations as a rule, and been wrong about 26.0–26.5 (never measured) and about
+whatever Apple does next.
+
+**What makes native-first safe when native is broken** is that a call which behaved
+pathologically once is never attempted again in that process. Note the two signatures
+differ, and only one looks like a failure: `CGDisplayCreateImage` returns `NULL`, while
+`CGWindowListCreateImage` returns *exactly the right image*, just far too late to use — 30s
+is also the SSH transport's per-op timeout, so over the wire it does not return a slow
+image, it drops the connection. Only the **duration** catches the second one. A native call
+cannot be cancelled once started; it can be refused a second time, and that is the whole
+mechanism.
+
+A session whose very first capture is a whole-desktop capture has nothing learned yet. It
+settles the question with `CGDisplayCreateImage` (~5s worst case) rather than
+`CGWindowListCreateImage` (~30s), so **nothing ever pays 30 seconds to discover that
+something costs 30 seconds**. That inference — a healthy per-display call means a healthy
+whole-desktop call — is the one soft spot: they are different calls and could in principle
+diverge, in which case the first whole-desktop capture pays once and the session never pays
+again.
+
+The degraded fact lives on the backend instance and is **never persisted**. The remote agent
+is one process per session, so an OS update takes effect on the next session with no cache
+to invalidate — which is not a hypothetical: the update in the table above landed mid-review
+of this change.
+
+**Failure policy.** A guard that refuses — permission, session, topology, budget, or a
+cleanup failure — is reported to the caller. It is never answered by trying a different
+capture: doing so would return an image taken after an explicit refusal, or report success
+while a private capture file remained on disk.
+
+If the compositor itself cannot be set up — for example a pyobjc without the bitmap-context
+symbols — that is **reported, not retried**. There is deliberately no fallback to
+`CGWindowListCreateImage` at that point: the native call was either skipped as degraded or
+returned `None`. Re-attempting a call known to be pathological costs ~30s on
+the macOS where that is true, which is also the SSH transport's per-op timeout. The "retry"
+would drop the connection rather than produce an image.
+
+The session state is re-read at **two** points where wall-clock has passed since the entry
+check: after the health probe and before the real native capture, and again before
+compositing. A native capture call is not free, and the time it consumes is time in which a
+screen can lock — after which a locked screen returns a real, plausible-looking image.
 
 This is a conservative fallback, not a permission prompt or reset. A positive preflight does
-not establish that the utility has the same TCC attribution, and the checks cannot make
-topology or permission use atomic. The 20-second fallback budget includes prior capture and
-setup work; the child receives only time remaining. It leaves a usual 10-second margin below
-the default 30-second wire timeout for encoding, but does not guarantee a hard wall time.
-Multi-display/virtual-desktop capture and region capture while multiple displays are active
-remain outside this fallback's scope. Existing diagnostics are unchanged and this does not
-claim to diagnose or fix a physical display condition.
+not establish that the utility has the same TCC attribution, and none of these checks can
+make topology or permission use atomic — the final whole-layout revalidation is a best-effort
+consistency check, not atomic topology access, and the layout can move again immediately
+after it passes. The 20-second fallback budget includes prior capture and setup work; the
+child receives only time remaining. It leaves a usual 10-second margin below the default
+30-second wire timeout for encoding, but does not guarantee a hard wall time. Existing
+diagnostics are unchanged and this does not claim to diagnose or fix a physical display
+condition.
 
 Offline logic tests cover this adaptation, and it **has** now been verified on real macOS
 hardware: [exact-head report on PR #13](https://github.com/microsoft/amplifier-bundle-computer-use/pull/13#issuecomment-5688667363).
@@ -650,38 +720,79 @@ SSH production path (`registry.select_backend({"target": "ssh://..."}) -> Remote
 guard refused spuriously across four consecutive runs. On that machine the native
 `CGDisplayCreateImage` returned `None` in ~5.0s and `screencapture` completed in ~0.23s.
 
-What that run does **not** establish, stated so it is not inferred: nothing about multiple
-active displays (out of scope here - see PR #11), three or more displays, non-top-aligned
-arrangements, or whether `-m` still follows the main display when main is not the first
-active display. A positive preflight still does not establish that the utility has the same
-TCC attribution, and the topology and permission checks remain non-atomic regardless of this
-result. The capture-alternative lead was reported by
+The multi-display paths were verified on the same machine with a second display attached, a
+genuinely mixed-DPI pair — a 2x built-in (1728x1117 points at the origin) beside the 1x
+5120x1440 ultrawide. Whole-desktop capture returned the same 13696x2880 canvas as
+`CGWindowListCreateImage` in 0.47s against its 30.04s, and region capture — which fails
+outright on macOS 26.6.2 without the per-display form — returned an exact 800x600 crop.
+
+**Not** covered by any of those runs, stated so it is not inferred: three or more displays
+and non-top-aligned display arrangements.
+
+**Known limits, accepted deliberately rather than left ambiguous:**
+
+- **Mixed-DPI screenshot/input coordinate mismatch** — inherited from the pre-existing
+  backend, not introduced here. A virtual-desktop screenshot spans displays at the largest
+  backing scale, while input coordinates map through a single scale factor. Fixing it means
+  per-display coordinate mapping in the *input* path and its own hardware verification, so
+  it is out of scope for this capture work.
+- **No hard native-call deadline.** CoreGraphics offers no way to cancel a capture call in
+  flight. The 20-second budget is elapsed-time accounting for the child process; a
+  pathological native call is bounded by *never being repeated*, not by being interrupted.
+- **Three or more displays, and secondary `-D` ordering there**, are unverified. `-D`
+  ordinals index `CGGetActiveDisplayList`, whose contract puts main first; that contract is
+  relied upon rather than re-checked.
+- **Non-top-aligned arrangements** are unverified.
+- A positive preflight still does not establish that the `screencapture` utility has the same
+  TCC attribution, and the topology and permission checks remain non-atomic.
+
+The capture-alternative lead was reported by
 [@colombod in PR #11](https://github.com/microsoft/amplifier-bundle-computer-use/pull/11).
 
 ---
 
 ## 9. Known issues
 
-### macOS `type_text` silently no-ops while returning success — OPEN
+### macOS `type_text` silently no-ops while returning success — FIXED
 
-**Status: open defect.** Logged in `BACKLOG.md` (found 2026-08-03).
+**Status: fixed** in `ccf0913` (2026-08-04). This section described it as open for six
+weeks after the fix landed, because that commit changed `macos.py` and its tests and
+never touched this file or the README. The stale label is itself part of the record — an
+agent reading it will tell a user the feature is broken.
 
-On an unlocked Mac, with the screen state confirmed by the presence guard:
+**What the defect actually was.** `type_text` posted a keycode-**0** event carrying the
+string via `CGEventKeyboardSetUnicodeString` — Apple's documented "arbitrary Unicode, no
+layout table" technique. `CGEventPost` accepts that event, signals nothing, and macOS
+delivers nothing. It was confirmed at both `kCGHIDEventTap` and `kCGSessionEventTap`, in
+process and over the remote-agent wire.
 
-- `key` (e.g. `cmd+space`) works. Spotlight opened, verified by screenshot.
-- `type` returned `success: true` and **entered nothing**.
+**The hypothesis this section used to carry — "the type path posts events to a specific
+app rather than the system-wide event tap" — was wrong.** Both paths used the same tap;
+only the keycode differed. It is left named here rather than deleted, because it is the
+kind of plausible, evidence-shaped guess that cost this defect two wrong retractions.
 
-This is **not** the lock defect — the screen was unlocked and capture returned real desktop
-content, so the lock guard correctly did not fire. `key` works and `type_text` does not,
-which localizes it to the type path. The current hypothesis, unconfirmed: the type path
-posts events to a specific app rather than the system-wide event tap.
+**The fix.** Every character resolves to a real, non-zero keycode (plus Shift where
+needed) through the same US-ANSI table `key()` already depends on, and `CGEventSetFlags`
+is called unconditionally — skipping it for the no-modifier case left plain lowercase and
+digits undelivered while shifted characters landed. A character with no keycode on that
+layout raises `BackendError` naming every unsupported character, typing nothing at all,
+rather than silently falling back to the technique measured to deliver nothing.
 
-It is the same shape as every other defect this bundle keeps surfacing — **a write that
-fails while reporting success** — and by the project's own no-fallbacks rule it must fail
-loud rather than report success. It does not yet.
+**Re-verified 2026-09-15** on macOS 26.6.2 (25G83), driven remotely over SSH, using this
+project's own Spotlight method — reading the pixels back, not just checking that no
+exception was raised:
 
-**Impact:** `key`-only flows on macOS are unaffected. Any flow that depends on `type` on
-macOS is blocked. Windows and Linux `type` are unaffected.
+```
+key("cmd+space")                     -> Spotlight opened
+type_text("amplifier typing test")
+capture                              -> Spotlight field reads: amplifier typing test
+                                        (and returned live results for that query)
+key("escape")                        -> dismissed
+```
+
+**Impact:** none outstanding. `type` on macOS works. See also `BACKLOG.md`'s
+"RETRACTED 2026-08-03" entry, which is *also* wrong — it retracted a real defect as a
+locked-screen artifact, on a re-test that never compared pixel content.
 
 ### Other stated gaps
 
