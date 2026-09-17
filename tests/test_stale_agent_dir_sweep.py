@@ -45,6 +45,10 @@ def test_sweep_removes_only_old_unlocked_v2_leases(tmp_path: Path) -> None:
     assert fresh.exists()
 
 
+def test_sweep_missing_explicit_temp_base_is_a_noop(tmp_path: Path) -> None:
+    assert sweep_stale_agent_dirs(temp_dir=str(tmp_path / "does-not-exist")) == 0
+
+
 def test_sweep_preserves_legacy_unknown_and_unleased_directories(
     tmp_path: Path,
 ) -> None:

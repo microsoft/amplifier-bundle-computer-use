@@ -7,6 +7,7 @@ Every scratch directory is under pytest's ``tmp_path`` and every child gets
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -79,11 +80,19 @@ def _close_owned(process: subprocess.Popen[bytes]) -> None:
 
 @contextmanager
 def _running_bootstrap(
-    tmp_path: Path, payload: bytes, *, ready_prefix: bytes | None = None
+    tmp_path: Path,
+    payload: bytes,
+    *,
+    ready_prefix: bytes | None = None,
+    test_preamble: str = "",
 ) -> Iterator[tuple[subprocess.Popen[bytes], bytes | None]]:
     """Yield an owned bootstrap child and clean it on every setup/test failure."""
     process = subprocess.Popen(
-        [sys.executable, "-c", ssh_transport._bootstrap_stub(5.0, True)],
+        [
+            sys.executable,
+            "-c",
+            test_preamble + ssh_transport._bootstrap_stub(5.0, True),
+        ],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -191,13 +200,74 @@ def test_full_real_payload_bootstraps_headless_and_cleans_its_own_scratch(
     tmp_path: Path,
 ) -> None:
     payload = ssh_transport._build_payload(PACKAGE_DIR)
+    orphaned = tmp_path / f"{lease.AGENT_SCRATCH_DIR_PREFIX}old-unlocked"
+    orphaned.mkdir(mode=0o700)
+    os.chmod(orphaned, 0o700)
+    orphaned_fd = lease.acquire_agent_lease(orphaned)
+    assert orphaned_fd is not None
+    os.close(orphaned_fd)
+    os.utime(orphaned / lease.LEASE_FILENAME, (time.time() - 48 * 60 * 60,) * 2)
+    legacy = tmp_path / "amplifier-cu-agent-legacy"
+    legacy.mkdir(mode=0o700)
+    os.chmod(legacy, 0o700)
     with _running_bootstrap(tmp_path, payload) as (process, _):
         assert process.stdout is not None
         handshake = json.loads(_readline(process.stdout))
         assert handshake["ok"] is True
         assert handshake["result"]["backend"] == "none"
+        assert (
+            handshake["result"]["agent_sha256"] == hashlib.sha256(payload).hexdigest()
+        )
         assert process.wait(timeout=5) == 1
+        assert not orphaned.exists()
+        assert legacy.exists()
         assert not list(tmp_path.glob(f"{lease.AGENT_SCRATCH_DIR_PREFIX}*"))
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux", reason="requires a headless Linux backend probe"
+)
+def test_startup_continues_when_stale_sweep_unexpectedly_fails(tmp_path: Path) -> None:
+    payload = ssh_transport._build_payload(PACKAGE_DIR)
+    candidate = tmp_path / f"{lease.AGENT_SCRATCH_DIR_PREFIX}blocked"
+    candidate.mkdir(mode=0o700)
+    os.chmod(candidate, 0o700)
+    candidate_fd = lease.acquire_agent_lease(candidate)
+    assert candidate_fd is not None
+    os.close(candidate_fd)
+    os.utime(candidate / lease.LEASE_FILENAME, (time.time() - 48 * 60 * 60,) * 2)
+    test_preamble = (
+        "import shutil\n"
+        "_real_rmtree = shutil.rmtree\n"
+        "def _fail_dir_fd_rmtree(path, *args, **kwargs):\n"
+        "    if kwargs.get('dir_fd') is not None:\n"
+        "        raise TypeError('injected dir_fd rmtree failure')\n"
+        "    return _real_rmtree(path, *args, **kwargs)\n"
+        "_fail_dir_fd_rmtree.avoids_symlink_attacks = True\n"
+        "shutil.rmtree = _fail_dir_fd_rmtree\n"
+    )
+    with _running_bootstrap(tmp_path, payload, test_preamble=test_preamble) as (
+        process,
+        _,
+    ):
+        assert process.stdout is not None
+        handshake = json.loads(_readline(process.stdout))
+        assert handshake["ok"] is True
+        assert handshake["result"]["backend"] == "none"
+        assert (
+            handshake["result"]["agent_sha256"] == hashlib.sha256(payload).hexdigest()
+        )
+        assert process.wait(timeout=5) == 1
+        assert candidate.exists()
+        assert not [
+            path
+            for path in tmp_path.glob(f"{lease.AGENT_SCRATCH_DIR_PREFIX}*")
+            if path != candidate
+        ]
+        assert process.stderr is not None
+        stderr = process.stderr.read()
+        assert b"stale-dir sweep failed; continuing startup" in stderr
+        assert b"injected dir_fd rmtree failure" in stderr
 
 
 def test_bootstrap_setup_failure_cleans_owned_child_and_scratch(tmp_path: Path) -> None:

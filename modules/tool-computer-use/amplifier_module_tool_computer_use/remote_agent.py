@@ -842,7 +842,12 @@ def main(argv: list[str] | None = None) -> int:
     # see `sweep_stale_agent_dirs`'s docstring. Runs before backend selection
     # so it happens on every connection attempt, including ones where this
     # machine turns out to have no usable backend at all.
-    sweep_stale_agent_dirs()
+    try:
+        sweep_stale_agent_dirs()
+    except Exception:
+        logger.warning(
+            "stale-dir sweep failed; continuing startup:\n%s", traceback.format_exc()
+        )
 
     try:
         backend = select_backend({})
