@@ -227,3 +227,40 @@ def test_interactive_approval_possible_false_when_isatty_raises(monkeypatch):
 
     monkeypatch.setattr(hook_mod.sys.stdin, "isatty", _boom)
     assert hook_mod._interactive_approval_possible() is False
+
+
+def test_host_approval_capability_reaches_ask_user_without_a_terminal(monkeypatch):
+    monkeypatch.setattr(hook_mod, "_interactive_approval_possible", lambda: False)
+    computer = _FakeComputerTool(gate_writes=True)
+    coord = _FakeCoordinator({"computer": computer})
+    coord.get_capability = lambda name: True if name == "approval.interactive" else None
+    result = _run(
+        hook_mod._make_gate_handler(coord)(
+            "tool:pre",
+            {"tool_name": "computer", "tool_input": {"action": "left_click"}},
+        )
+    )
+    assert result.action == "ask_user"
+    assert result.approval_default == "deny"
+    assert computer._unattended_writes_ok is False
+
+
+def test_unavailable_or_malformed_host_transport_never_uses_tty_fallback(monkeypatch):
+    monkeypatch.setattr(hook_mod, "_interactive_approval_possible", lambda: True)
+    coord = _FakeCoordinator({"computer": _FakeComputerTool(gate_writes=True)})
+    for value in (False, "true", 1, {}, lambda: True):
+        coord.get_capability = lambda _name, value=value: value
+        result = _run(
+            hook_mod._make_gate_handler(coord)(
+                "tool:pre", {"tool_name": "computer", "tool_input": {"action": "type"}}
+            )
+        )
+        assert result.action == "deny"
+
+    def unavailable(_name):
+        raise RuntimeError("transport unavailable")
+
+    coord.get_capability = unavailable
+    assert hook_mod._host_approval_possible(coord) is False
+    coord.get_capability = lambda _name: None
+    assert hook_mod._host_approval_possible(coord) is True

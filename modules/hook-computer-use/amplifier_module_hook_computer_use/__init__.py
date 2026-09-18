@@ -821,12 +821,12 @@ _GATE_MUTATING_ACTIONS = {
 
 
 def _interactive_approval_possible() -> bool:
-    """Can an `ask_user` approval prompt actually reach a human on THIS process?
+    """Legacy fallback for hosts without an explicit approval transport capability.
 
     The app-layer `ApprovalSystem` that answers `ask_user` (`amplifier_core.approval`,
     implemented outside this bundle - CLI/web/API) is not something this hook can
     inspect or wrap. What it CAN check, in the same process, is the one precondition
-    every known interactive implementation shares: a real terminal to prompt on.
+    historical terminal implementations shared: a real terminal to prompt on.
     `sys.stdin.isatty()` is False for exactly the case that used to crash silently -
     a backgrounded run, a piped/redirected stdin, a service with no controlling
     terminal - and True for a normal interactive session, unchanged.
@@ -844,6 +844,26 @@ def _interactive_approval_possible() -> bool:
         # answers `isatty()` with one of these - treat exactly like "no TTY",
         # never like "yes, interactive" (fail loud, never optimistic).
         return False
+
+
+def _host_approval_possible(coordinator: Any) -> bool:
+    """Prefer an explicit app transport capability; preserve legacy CLI probing.
+
+    A boolean ``approval.interactive`` says that the app can deliver ``ask_user``
+    to a person even when the runtime's stdin is a pipe. It grants no permission:
+    the normal approval system still owns the answer and deny-by-default policy.
+    Explicit False, malformed values and lookup failures never fall back to a TTY.
+    Only an absent capability uses the legacy heuristic.
+    """
+    getter = getattr(coordinator, "get_capability", None)
+    if callable(getter):
+        try:
+            capability = getter("approval.interactive")
+        except Exception:  # noqa: BLE001 - uncertain transport must not grant availability
+            return False
+        if capability is not None:
+            return capability is True
+    return _interactive_approval_possible()
 
 
 def _make_gate_handler(coordinator: Any, unattended_writes_ok: bool = False):
@@ -946,7 +966,7 @@ def _make_gate_handler(coordinator: Any, unattended_writes_ok: bool = False):
             return HookResult(action="continue")
         backend_name = getattr(getattr(computer, "_backend", None), "name", "?")
 
-        if not _interactive_approval_possible():
+        if not _host_approval_possible(coordinator):
             # The EOF fix: never hand this to `ask_user` - the app-layer approval
             # system's own `input()` would hit immediate EOF with no diagnostic at
             # all (see this function's docstring). Decide here instead, with a
@@ -968,9 +988,9 @@ def _make_gate_handler(coordinator: Any, unattended_writes_ok: bool = False):
                 reason=(
                     f"action {tool_name}.{action!r} requires human approval "
                     f"(gate_writes is enabled for backend {backend_name!r}), but "
-                    "no interactive session is available to ask (stdin is not a "
-                    "TTY - this looks like a backgrounded, piped, or otherwise "
-                    "non-interactive run). The write was NOT sent. To proceed: "
+                    "no interactive approval transport is available to ask "
+                    "(the app must advertise approval.interactive, or legacy "
+                    "stdin must be a TTY). The write was NOT sent. To proceed: "
                     "(1) run this session interactively so the approval prompt "
                     "can be answered, or (2) set hook-computer-use config "
                     "'unattended_writes_ok: true' to explicitly allow writes on "
