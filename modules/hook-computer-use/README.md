@@ -14,3 +14,11 @@ it is not treated as confirmed absence.
 When `computer` is present, the existing native capability probes, compatibility
 checks, and unsupported-provider warnings remain unchanged. Skipping a probe
 does not assert that a provider supports native computer use.
+
+Interactive applications with piped runtime stdin may register the boolean
+coordinator capability `approval.interactive` before module initialization.
+`True` means the app can deliver the standard `ask_user` approval to a person;
+it does not approve any action. `False` explicitly disables interactive prompting.
+Missing capability retains the legacy stdin-TTY check; malformed values or lookup
+failure fail closed. The gate still defaults to deny and never infers unattended
+write permission. This separates approval transport from write authorization.
