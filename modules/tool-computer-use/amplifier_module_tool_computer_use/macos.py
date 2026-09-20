@@ -605,6 +605,10 @@ class MacOSBackend:
         return ProbeResult(True)
 
     # -- lazy Accessibility (input) gate ------------------------------------------
+    def screen_capture_permission(self) -> bool | None:
+        """Read Screen Recording authorization without capture or a prompt."""
+        return _cg_preflight_screen_capture_access()
+
     def _ensure_input_trusted(self) -> None:
         """Gate discrete input (move/click/drag/scroll/key/type) on Accessibility TCC.
 
@@ -1408,7 +1412,7 @@ class MacOSBackend:
                 "being composited, so the composite no longer describes the screen"
             ) from None
 
-    def capture(self, region: tuple[int, int, int, int] | None = None) -> bytes:
+    def capture(self, region: tuple[int, int, int, int] | None = None, *, allow_utility_fallback: bool = True) -> bytes:
         """Return PNG bytes at native (physical-pixel) resolution.
 
         Single-display or region-within-one-display path (the common case, and the
@@ -1566,6 +1570,10 @@ class MacOSBackend:
             else self._call_native(Quartz.CGDisplayCreateImage, display_id)
         )
         if full_image is None:
+            if not allow_utility_fallback:
+                # A short-lived, cancellable observer must not leave a utility
+                # child or temporary screenshot behind when the host kills it.
+                raise BackendError("Native capture returned no image; utility fallback is disabled")
             if len(ids) == 1 and display_id == ids[0] and int(m.id) == ids[0]:
                 full_image = self._screencapture_single_display(m, fallback_deadline)
             elif display_id is not None and int(m.id) in ids:
@@ -1885,7 +1893,9 @@ class MacOSBackend:
             if foreground is None:
                 foreground = handle
             rect = self._window_rect(entry.get("kCGWindowBounds"))
-            windows.append(WindowInfo(handle, title, minimized=False, rect=rect))
+            owner = entry.get("kCGWindowOwnerName")
+            windows.append(WindowInfo(handle, title, minimized=False, rect=rect,
+                                      app_name=str(owner) if owner else None))
         return WindowList(windows, foreground)
 
     def _window_rect(self, bounds: Any) -> tuple[int, int, int, int] | None:
