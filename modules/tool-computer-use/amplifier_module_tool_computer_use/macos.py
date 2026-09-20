@@ -1412,7 +1412,12 @@ class MacOSBackend:
                 "being composited, so the composite no longer describes the screen"
             ) from None
 
-    def capture(self, region: tuple[int, int, int, int] | None = None, *, allow_utility_fallback: bool = True) -> bytes:
+    def capture(
+        self,
+        region: tuple[int, int, int, int] | None = None,
+        *,
+        allow_utility_fallback: bool = True,
+    ) -> bytes:
         """Return PNG bytes at native (physical-pixel) resolution.
 
         Single-display or region-within-one-display path (the common case, and the
@@ -1573,7 +1578,9 @@ class MacOSBackend:
             if not allow_utility_fallback:
                 # A short-lived, cancellable observer must not leave a utility
                 # child or temporary screenshot behind when the host kills it.
-                raise BackendError("Native capture returned no image; utility fallback is disabled")
+                raise BackendError(
+                    "Native capture returned no image; utility fallback is disabled"
+                )
             if len(ids) == 1 and display_id == ids[0] and int(m.id) == ids[0]:
                 full_image = self._screencapture_single_display(m, fallback_deadline)
             elif display_id is not None and int(m.id) in ids:
@@ -1894,8 +1901,15 @@ class MacOSBackend:
                 foreground = handle
             rect = self._window_rect(entry.get("kCGWindowBounds"))
             owner = entry.get("kCGWindowOwnerName")
-            windows.append(WindowInfo(handle, title, minimized=False, rect=rect,
-                                      app_name=str(owner) if owner else None))
+            windows.append(
+                WindowInfo(
+                    handle,
+                    title,
+                    minimized=False,
+                    rect=rect,
+                    app_name=str(owner) if owner else None,
+                )
+            )
         return WindowList(windows, foreground)
 
     def _window_rect(self, bounds: Any) -> tuple[int, int, int, int] | None:
