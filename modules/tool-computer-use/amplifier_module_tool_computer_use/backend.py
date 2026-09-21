@@ -145,6 +145,8 @@ class WindowInfo:
     title: str
     minimized: bool = False
     rect: tuple[int, int, int, int] | None = None
+    # OS-reported owning application, when the backend can identify it.
+    app_name: str | None = None
 
 
 @dataclass(frozen=True)
