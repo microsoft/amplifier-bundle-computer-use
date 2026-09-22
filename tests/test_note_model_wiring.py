@@ -731,3 +731,51 @@ def test_wrapped_complete_tolerates_a_coordinator_that_cannot_find_the_tool():
 
     result = _run(provider.complete(_FakeRequest(model="claude-sonnet-4-5-20250929")))
     assert result == "ok"
+
+
+@pytest.mark.parametrize("already_wrapped", [False, True])
+def test_request_effective_model_primes_native_spec_before_request_is_built(
+    already_wrapped,
+):
+    computer = _with_resolved_display(ComputerTool(_FakeBackend(), {}))
+    provider = _AnthropicProviderNoStream("claude-opus-5")
+    other = _AnthropicProviderNoStream("claude-opus-5")
+    openai = _OpenAIProviderNoStream("opaque-model")
+    coordinator = _FakeCoordinator(
+        {"computer": computer}, {"openai": openai, "first": other, "selected": provider}
+    )
+    _run(hook_mod.mount(coordinator))
+    handler = coordinator.hooks.handlers[hook_mod.PROVIDER_REQUEST]
+    if already_wrapped:
+        _run(handler(hook_mod.PROVIDER_REQUEST, {"provider": "selected"}))
+        assert computer.native_tool_spec["type"] == "computer_20251124"
+    for model, expected in (
+        ("claude-sonnet-4-5-20250929", "computer_20250124"),
+        ("claude-opus-5", "computer_20251124"),
+    ):
+        _run(
+            handler(hook_mod.PROVIDER_REQUEST, {"provider": "selected", "model": model})
+        )
+        # This declaration is copied into ChatRequest before complete() is
+        # called; correcting only the mutable tool during complete is too late.
+        declaration = dict(computer.native_tool_spec)
+        assert declaration["type"] == expected
+        request = _FakeRequest(model, [_computer_tool()])
+        assert _run(provider.complete(request)) == "ok"
+        assert declaration == computer.native_tool_spec
+    assert provider.default_model == other.default_model == "claude-opus-5"
+    assert not getattr(other, hook_mod._WRAPPED_FLAG, False)
+    assert not getattr(openai, hook_mod._WRAPPED_FLAG, False)
+
+
+def test_request_falls_back_to_kernel_model_metadata_before_legacy_attribute():
+    from types import SimpleNamespace
+
+    computer = _with_resolved_display(ComputerTool(_FakeBackend(), {}))
+    provider = _AnthropicProviderNoStream("claude-opus-5")
+    provider.get_info = lambda: SimpleNamespace(
+        defaults={"model": "claude-sonnet-4-5-20250929"}
+    )
+    coordinator = _FakeCoordinator({"computer": computer}, {"selected": provider})
+    _mount_and_dispatch_provider_request(coordinator, "selected")
+    assert computer.native_tool_spec["type"] == "computer_20250124"

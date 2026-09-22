@@ -703,7 +703,21 @@ def _request_declares_computer_tool(request: Any) -> bool:
     return False
 
 
-def _wrap_provider(provider: Any, coordinator: Any, max_inline: int) -> bool:
+def _provider_default_model(provider: Any) -> str | None:
+    """Prefer kernel metadata; retain compatibility with older provider modules."""
+    try:
+        info = provider.get_info()
+        model = (getattr(info, "defaults", None) or {}).get("model")
+        if isinstance(model, str) and model:
+            return model
+    except Exception:
+        logger.debug("computer-use: provider model metadata unavailable", exc_info=True)
+    return getattr(provider, "default_model", None)
+
+
+def _wrap_provider(
+    provider: Any, coordinator: Any, max_inline: int, *, model: str | None = None
+) -> bool:
     native_tool_type = _provider_supports_native_computer_tool(provider)
     if native_tool_type is None:
         # provider:request fires every turn. The cached negative probe must
@@ -727,7 +741,7 @@ def _wrap_provider(provider: Any, coordinator: Any, max_inline: int) -> bool:
         return False
 
     _select_provider_native_tool_type_on_computer_tool(
-        coordinator, native_tool_type, getattr(provider, "default_model", None)
+        coordinator, native_tool_type, model or _provider_default_model(provider)
     )
     if getattr(provider, _WRAPPED_FLAG, False):
         # The dialect is re-primed above for every provider:request, even when
@@ -751,8 +765,10 @@ def _wrap_provider(provider: Any, coordinator: Any, max_inline: int) -> bool:
 
     async def complete(request: Any, **kwargs: Any):
         if _request_declares_computer_tool(request):
-            _effective_model = getattr(request, "model", None) or getattr(
-                provider, "default_model", None
+            _effective_model = (
+                kwargs.get("model")
+                or getattr(request, "model", None)
+                or _provider_default_model(provider)
             )
             _select_provider_native_tool_type_on_computer_tool(
                 coordinator, native_tool_type, _effective_model
@@ -1262,7 +1278,16 @@ async def mount(
                 name,
             )
         else:
-            _wrap_provider(provider, coordinator, max_inline)
+            # The orchestrator emits the effective model BEFORE it snapshots
+            # native_tool_spec. A complete() override alone arrives too late:
+            # that request already contains its serialized tool declaration.
+            model = (data or {}).get("model")
+            _wrap_provider(
+                provider,
+                coordinator,
+                max_inline,
+                model=model if isinstance(model, str) and model else None,
+            )
         return HookResult(action="continue")
 
     coordinator.hooks.register(
