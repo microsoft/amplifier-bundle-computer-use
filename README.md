@@ -129,7 +129,9 @@ monkey-patched on disk; nothing rots when the orchestrator changes.
 **`computer`** — the native action set: `screenshot`, `zoom`, `cursor_position`,
 `mouse_move`, `left_click`, `right_click`, `middle_click`, `double_click`,
 `triple_click`, `left_mouse_down`, `left_mouse_up`, `left_click_drag`, `scroll`, `key`,
-`hold_key`, `type`, `wait`, plus `screen_info`, `list_windows`, `focus_window`.
+`hold_key`, `type`, `wait`, plus `screen_info`, `list_windows`, `focus_window`. `key` also
+accepts an optional integer `repeat` from 1 to 100 (default 1); each press is independently
+guarded, and a target or policy change stops the remaining presses.
 
 **`desktop`** — what the native schema cannot express: `list_windows`, `focus_window`,
 `screen_info`, `get_clipboard`, `set_clipboard`, `list_monitors`, `select_monitor`.
