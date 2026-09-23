@@ -1,0 +1,88 @@
+[
+  {
+    "path": "delegate.png",
+    "sha256": "5dc1e850ca1d8f214791d11a06a1d260db762064cd70fd5d0ccb7f835884ac5d",
+    "originalScreenshotPath": "/home/work/.amplifier/computer-use/shots/d92fbe6be4854ba5bfad523c3efb201a/3fb4cba497004f9888561d01a256380e.png",
+    "sourceTranscript": "session-files/-home-work-workspace/sessions/0000000000000000-d55b1829efbb468d_computer-use-computer-operator/transcript.jsonl",
+    "message": {
+      "role": "tool",
+      "name": "computer",
+      "tool_call_id": "call_X3pEO0NlzFNeE9kQastssesb",
+      "content": "{\"error\": null, \"output\": \"{\\\"__amplifier_computer_use__\\\": 1, \\\"text\\\": \\\"screenshot captured (1280x800)\\\", \\\"images\\\": [\\\"/home/work/.amplifier/computer-use/shots/d92fbe6be4854ba5bfad523c3efb201a/3fb4cba497004f9888561d01a256380e.png\\\"]}\", \"success\": true}"
+    },
+    "assistantCall": {
+      "role": "assistant",
+      "tool_calls": [
+        {
+          "id": "call_X3pEO0NlzFNeE9kQastssesb",
+          "tool": "computer",
+          "arguments": {
+            "actions": [
+              {
+                "type": "screenshot"
+              }
+            ]
+          }
+        }
+      ],
+      "content": [
+        {
+          "type": "tool_call",
+          "id": "call_X3pEO0NlzFNeE9kQastssesb",
+          "name": "computer",
+          "input": {
+            "actions": [
+              {
+                "type": "screenshot"
+              }
+            ]
+          },
+          "visibility": null
+        }
+      ]
+    }
+  },
+  {
+    "path": "root.png",
+    "sha256": "5dc1e850ca1d8f214791d11a06a1d260db762064cd70fd5d0ccb7f835884ac5d",
+    "originalScreenshotPath": "/home/work/.amplifier/computer-use/shots/fad567ed8fa04f0fb4e6e9cd0a459404/ab99fe2533f94c1d9e01ed3e1cc76d46.png",
+    "sourceTranscript": "session-files/-home-work-workspace/sessions/a04f92e6-e6d3-47bd-8bfd-e758bbd151c5/transcript.jsonl",
+    "message": {
+      "role": "tool",
+      "name": "computer",
+      "tool_call_id": "call_GOp2IA3sZOE8WCcPXH5yylfZ",
+      "content": "{\"error\": null, \"output\": \"{\\\"__amplifier_computer_use__\\\": 1, \\\"text\\\": \\\"screenshot captured (1280x800)\\\", \\\"images\\\": [\\\"/home/work/.amplifier/computer-use/shots/fad567ed8fa04f0fb4e6e9cd0a459404/ab99fe2533f94c1d9e01ed3e1cc76d46.png\\\"]}\", \"success\": true}"
+    },
+    "assistantCall": {
+      "role": "assistant",
+      "tool_calls": [
+        {
+          "id": "call_GOp2IA3sZOE8WCcPXH5yylfZ",
+          "tool": "computer",
+          "arguments": {
+            "actions": [
+              {
+                "type": "screenshot"
+              }
+            ]
+          }
+        }
+      ],
+      "content": [
+        {
+          "type": "tool_call",
+          "id": "call_GOp2IA3sZOE8WCcPXH5yylfZ",
+          "name": "computer",
+          "input": {
+            "actions": [
+              {
+                "type": "screenshot"
+              }
+            ]
+          },
+          "visibility": null
+        }
+      ]
+    }
+  }
+]
