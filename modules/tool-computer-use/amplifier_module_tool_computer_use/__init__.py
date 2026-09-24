@@ -152,6 +152,42 @@ ACTIONS = [
 ]
 
 #: Actions that change the user's machine. Used for the confirm/read-only gate.
+#: The native key action may request a bounded logical repeat. This is kept
+#: separate from the provider readers: any caller can send the existing `key`
+#: action plus this field, while provider-specific action shapes stay unchanged.
+KEY_REPEAT_MIN = 1
+KEY_REPEAT_MAX = 100
+
+
+def _key_repeat(params: dict[str, Any]) -> int:
+    """Return the requested key count without changing the caller's payload.
+
+    `bool` is intentionally rejected even though it subclasses `int`: a repeat
+    is an exact count, never a truthy flag. Other actions deliberately do not
+    inspect this field so their historical permissive parameter behavior stays
+    unchanged.
+    """
+    repeat = params.get("repeat", 1)
+    if type(repeat) is not int or not KEY_REPEAT_MIN <= repeat <= KEY_REPEAT_MAX:
+        raise ValueError(
+            "action 'key' repeat must be an integer from "
+            f"{KEY_REPEAT_MIN} to {KEY_REPEAT_MAX}, got {repeat!r}"
+        )
+    return repeat
+
+
+def _preflight_key_repeat(input: dict[str, Any]) -> None:
+    """Reject an invalid native key repeat before disclosure or dispatch.
+
+    The Anthropic wire form is the only single-action form. Keeping this
+    preflight narrow preserves lazy OpenAI batch parsing and leaves unknown
+    fields for every non-key action exactly as they were.
+    """
+    action = input.get("action")
+    if isinstance(action, str) and action.strip() == "key":
+        _key_repeat(input)
+
+
 MUTATING = {
     "mouse_move",
     "left_click",
@@ -608,7 +644,11 @@ class ComputerTool:
 
     @_read_only.setter
     def _read_only(self, value: bool) -> None:
-        self._binding = replace(self._binding, read_only=value)
+        # Serialize a live policy tightening with each repeated key dispatch.
+        # `_run_key_press` holds this lock from its binding check through
+        # `backend.key()`, so an update cannot slip between those two steps.
+        with self._announce_lock:
+            self._binding = replace(self._binding, read_only=value)
 
     @property
     def _gate_writes(self) -> bool:
@@ -1101,6 +1141,12 @@ class ComputerTool:
                 "text": {
                     "type": "string",
                     "description": "Text to type, or key combo such as 'ctrl+s'.",
+                },
+                "repeat": {
+                    "type": "integer",
+                    "minimum": KEY_REPEAT_MIN,
+                    "maximum": KEY_REPEAT_MAX,
+                    "description": "Number of times to press a key combo; valid only for action 'key' (default: 1).",
                 },
                 "scroll_direction": {
                     "type": "string",
@@ -2460,6 +2506,12 @@ class ComputerTool:
         throwaway protocol-compliance probe can never trigger it.
         """
         try:
+            _preflight_key_repeat(input)
+        except ValueError as exc:
+            return ToolResult(
+                success=False, error={"message": str(exc), "type": "ValueError"}
+            )
+        try:
             await asyncio.to_thread(self._ensure_announced)
         except AnnouncementRefused as exc:
             return ToolResult(
@@ -2482,6 +2534,54 @@ class ComputerTool:
             return await self._execute_calls(input)
         finally:
             await asyncio.to_thread(self._band_exit, band_token)
+
+    def _run_key_press(
+        self, params: dict[str, Any], binding: _Binding, index: int, repeat: int
+    ) -> tuple[str, str | None]:
+        """Synchronously check and issue one press against a pinned binding.
+
+        This runs in the worker thread so a same-event-loop policy update may
+        wait for the in-flight key without deadlocking the coroutine that must
+        release the lock. `retarget()` and `_read_only` use this same lock.
+        """
+        with self._announce_lock:
+            if self._binding is not binding:
+                raise BackendError(
+                    f"key repeat stopped after {index} of {repeat} presses: "
+                    "target or policy changed"
+                )
+            if binding.read_only:
+                raise BackendError(
+                    "action 'key' blocked: computer-use is mounted read_only"
+                )
+            return self._run("key", params, binding=binding)
+
+    async def _run_key_repeat(
+        self, params: dict[str, Any], binding: _Binding, repeat: int
+    ) -> tuple[str, str | None]:
+        """Dispatch a logical key repeat one guarded press at a time.
+
+        Each press deliberately takes the ordinary `_run("key", ...)` path,
+        including its coexistence, exclusion, and backend handling. The binding
+        is captured once by `_execute_calls`; a retarget or policy swap between
+        presses stops the repeat rather than allowing its remainder to land on a
+        different desktop. Awaiting every synchronous backend call also leaves a
+        cancellation point between presses, so cancelling this coroutine cannot
+        schedule another key after the one already in flight.
+        """
+        last_summary = ""
+        last_image_b64: str | None = None
+        for index in range(repeat):
+            last_summary, last_image_b64 = await asyncio.to_thread(
+                self._run_key_press, params, binding, index, repeat
+            )
+            if index + 1 < repeat:
+                # Do not issue the next press in the same event-loop turn:
+                # cancellation and a concurrent retarget must be observed first.
+                await asyncio.sleep(0)
+        if repeat > 1:
+            last_summary = f"{last_summary} ({repeat} times)"
+        return last_summary, last_image_b64
 
     async def _execute_calls(self, input: dict[str, Any]) -> ToolResult:
         """The dialect-read + per-action dispatch loop, unchanged from
@@ -2519,6 +2619,12 @@ class ComputerTool:
                             "message": f"unknown action {action!r}; expected one of {', '.join(ACTIONS)}"
                         },
                     )
+                try:
+                    repeat = _key_repeat(params) if action == "key" else 1
+                except ValueError as exc:
+                    return ToolResult(
+                        success=False, error={"message": str(exc), "type": "ValueError"}
+                    )
                 # ONE binding read covering BOTH the policy check below AND
                 # the dispatch (`_run(..., binding=binding)`) - see this
                 # method's own docstring and `_run`'s.
@@ -2531,17 +2637,22 @@ class ComputerTool:
                         },
                     )
                 try:
-                    # C4: `Backend` stays synchronous (local paths and all existing
-                    # tests untouched), but a remote action can block on a network
-                    # round trip for hundreds of milliseconds. Running it in a
-                    # thread keeps the event loop live so cancellation can actually
-                    # be serviced during that wait, instead of stalling behind a
-                    # screenshot transfer. Cheap locally too - `asyncio.to_thread`
-                    # on a microsecond-scale X11/Quartz call costs a thread-pool
-                    # round trip, not a network one.
-                    summary, image_b64 = await asyncio.to_thread(
-                        self._run, action, params, binding=binding
-                    )
+                    if action == "key":
+                        summary, image_b64 = await self._run_key_repeat(
+                            params, binding, repeat
+                        )
+                    else:
+                        # C4: `Backend` stays synchronous (local paths and all existing
+                        # tests untouched), but a remote action can block on a network
+                        # round trip for hundreds of milliseconds. Running it in a
+                        # thread keeps the event loop live so cancellation can actually
+                        # be serviced during that wait, instead of stalling behind a
+                        # screenshot transfer. Cheap locally too - `asyncio.to_thread`
+                        # on a microsecond-scale X11/Quartz call costs a thread-pool
+                        # round trip, not a network one.
+                        summary, image_b64 = await asyncio.to_thread(
+                            self._run, action, params, binding=binding
+                        )
                 except HaltedError as exc:
                     return self._record_halt_result(action, exc)
                 except (BackendError, ValueError) as exc:
