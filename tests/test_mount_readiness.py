@@ -26,6 +26,16 @@ from amplifier_module_tool_computer_use.ssh_transport import SshConnectError
 from amplifier_module_tool_computer_use.wire import Response
 
 
+def _run(awaitable):
+    # Own the loop without replacing/clearing the ambient policy loop expected
+    # by existing synchronous tests. asyncio.run and pytest-asyncio alter it.
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(awaitable)
+    finally:
+        loop.close()
+
+
 class Wire:
     def __init__(self, mode="display-error", *, close_fails=False):
         self.mode = mode
@@ -127,16 +137,13 @@ def tools(coordinator):
     }
 
 
-@pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["disconnect", "display-error"])
-async def test_display_readiness_failure_mounts_only_unavailable_and_releases(
-    harness, mode
-):
+def test_display_readiness_failure_mounts_only_unavailable_and_releases(harness, mode):
     wires, handles, _ = harness
     wire = Wire(mode)
     wires.append(wire)
     coordinator = MockCoordinator()
-    manifest = await cu.mount(coordinator, config())
+    manifest = _run(cu.mount(coordinator, config()))
     assert manifest["provides"] == ["computer_use_unavailable"]
     stub = tools(coordinator)["computer_use_unavailable"]
     assert set(tools(coordinator)) == {"computer_use_unavailable"}
@@ -148,38 +155,36 @@ async def test_display_readiness_failure_mounts_only_unavailable_and_releases(
     assert wire.closed == 1
 
 
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "mode,passes",
     [("disconnect", True), ("display-error", True), ("programming-error", False)],
 )
-async def test_real_core_validator_classifies_operational_and_programming_failure(
+def test_real_core_validator_classifies_operational_and_programming_failure(
     harness, mode, passes
 ):
     wires, handles, _ = harness
     wire = Wire(mode)
     wires.append(wire)
     result = ValidationResult(module_type="tool", module_path="fixture")
-    await ToolValidator()._check_protocol_compliance(result, cu.mount, config=config())
+    _run(ToolValidator()._check_protocol_compliance(result, cu.mount, config=config()))
     assert result.passed is passes, result.summary()
     assert handles[0]._released
     assert handles[0]._entry.refcount == 0
     assert wire.closed == 1
 
 
-@pytest.mark.asyncio
-async def test_failed_activation_retains_stub_then_explicit_retry_gets_new_connection(
+def test_failed_activation_retains_stub_then_explicit_retry_gets_new_connection(
     harness,
 ):
     wires, handles, _ = harness
     wire = Wire()
     wires.append(wire)
     coordinator = MockCoordinator()
-    await cu.mount(coordinator, config())
+    _run(cu.mount(coordinator, config()))
     stub = tools(coordinator)["computer_use_unavailable"]
     failed = Wire()
     wires.append(failed)
-    result = await stub._activate("ssh://fixture.invalid")
+    result = _run(stub._activate("ssh://fixture.invalid"))
     assert not result.success
     assert result.error["type"] == "BackendNotReady"
     assert set(tools(coordinator)) == {"computer_use_unavailable"}
@@ -188,7 +193,7 @@ async def test_failed_activation_retains_stub_then_explicit_retry_gets_new_conne
 
     healthy = Wire("healthy")
     wires.append(healthy)
-    result = await stub._activate("ssh://fixture.invalid")
+    result = _run(stub._activate("ssh://fixture.invalid"))
     assert result.success
     mounted = tools(coordinator)
     computer = mounted["computer"]
@@ -237,13 +242,12 @@ def test_cleanup_failure_preserves_original_build_error(harness, mode, exception
     assert wire.closed == 1
 
 
-@pytest.mark.asyncio
-async def test_failed_connect_also_releases_ownership_and_preserves_diagnostic(harness):
+def test_failed_connect_also_releases_ownership_and_preserves_diagnostic(harness):
     wires, handles, _ = harness
     wire = Wire("connect-error", close_fails=True)
     wires.append(wire)
     coordinator = MockCoordinator()
-    manifest = await cu.mount(coordinator, config())
+    manifest = _run(cu.mount(coordinator, config()))
     assert manifest["provides"] == ["computer_use_unavailable"]
     assert (
         "synthetic handshake failure"
@@ -272,8 +276,7 @@ def test_guard_programming_error_preserved_after_successful_display(
     assert wire.closed == 1
 
 
-@pytest.mark.asyncio
-async def test_failed_retarget_preserves_current_binding_and_releases_candidate(
+def test_failed_retarget_preserves_current_binding_and_releases_candidate(
     harness,
 ):
     wires, handles, _ = harness
@@ -295,7 +298,7 @@ async def test_failed_retarget_preserves_current_binding_and_releases_candidate(
         return handle
 
     with patch.object(registry, "_build_ssh_transport", acquire):
-        result = await asyncio.to_thread(current.retarget, "ssh://different.invalid")
+        result = _run(asyncio.to_thread(current.retarget, "ssh://different.invalid"))
     assert not result.success
     assert current._binding is old_binding
     assert current._cfg == config()
@@ -304,8 +307,7 @@ async def test_failed_retarget_preserves_current_binding_and_releases_candidate(
     assert healthy.closed == 0
 
 
-@pytest.mark.asyncio
-async def test_local_display_readiness_has_same_failure_contract(harness, monkeypatch):
+def test_local_display_readiness_has_same_failure_contract(harness, monkeypatch):
     class LocalBackend:
         name = "fixture-local"
         is_remote = False
@@ -326,7 +328,7 @@ async def test_local_display_readiness_has_same_failure_contract(harness, monkey
     backend = LocalBackend()
     monkeypatch.setattr(cu, "select_backend", lambda cfg: backend)
     coordinator = MockCoordinator()
-    manifest = await cu.mount(coordinator, {})
+    manifest = _run(cu.mount(coordinator, {}))
     assert manifest["provides"] == ["computer_use_unavailable"]
     assert (
         "synthetic no active desktop"
