@@ -266,10 +266,21 @@ def select_backend(
         # re-probing anything remote. Nothing here needs the return value
         # directly; the assignment inside `connect()` is what keeps it
         # reachable.
-        backend.connect(
-            required_permissions=tuple(config.get("required_permissions") or ()),
-            connect_timeout=float(config.get("connect_timeout", 30.0)),
-        )
+        try:
+            backend.connect(
+                required_permissions=tuple(config.get("required_permissions") or ()),
+                connect_timeout=float(config.get("connect_timeout", 30.0)),
+            )
+        except Exception:
+            # Selection owns this reference until it returns a backend. A failed
+            # handshake must not leak it or replace the original connection error.
+            try:
+                backend.close()
+            except Exception:  # noqa: BLE001 - best-effort failed-selection cleanup
+                logger.debug(
+                    "computer-use: failed-connect cleanup failed", exc_info=True
+                )
+            raise
         logger.info(
             "computer-use: selected remote backend %r (target=%r)", backend.name, target
         )

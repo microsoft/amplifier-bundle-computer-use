@@ -4584,6 +4584,10 @@ class _MountRefused(RuntimeError):
     """
 
 
+class _BackendNotReady(RuntimeError):
+    """A selected backend could not report its display during initialization."""
+
+
 def _select_and_build(cfg: dict[str, Any]) -> ComputerTool:
     """The blocking half of "get a working `ComputerTool` from a config":
     select a backend (may block for seconds on a remote `connect()` -
@@ -4605,51 +4609,63 @@ def _select_and_build(cfg: dict[str, Any]) -> ComputerTool:
 
     Raises `NoBackendAvailable`, `ValueError`/`TypeError` (malformed
     `target`), `RemoteTargetUnavailable` (from `.remote_backend`, imported
-    lazily by `select_backend` itself), or `_MountRefused` - exactly the
-    set both callers already know how to translate into a diagnostic.
+    lazily by `select_backend` itself), `_BackendNotReady` (operational
+    display-readiness failure), or `_MountRefused`. Other exceptions remain
+    module failures. A failed build always releases its own backend reference.
     """
     backend = select_backend(cfg)
-    computer = ComputerTool(backend, cfg)
-    # D2: resolve display once, here, before the tool ever answers a provider
-    # request - not lazily on the first `native_tool_spec` read.
-    computer.resolve_display()
-    # Human/agent coexistence (docs/designs/coexistence.md) - only built for
-    # backends with a proven presence-detector wiring (see
-    # `_build_coexistence_guard`). `None` on every other backend, unchanged
-    # from before this feature existed.
-    computer._coexistence_guard = _build_coexistence_guard(backend, cfg)
-    # Band lifetime (docs/designs/band-lifetime.md): the channel-scoped
-    # ledger and depth-counter this session's held-input tracking and
-    # band-lowering decisions use - `None` whenever no guard was built
-    # (same population as before this feature existed: no coexistence
-    # layer at all). Computed from the SAME backend `_build_coexistence_guard`
-    # was just given, so `_channel_identity` returns the identical key.
-    if computer._coexistence_guard is not None:
-        computer._channel_key = _channel_identity(backend)
-        computer._ledger = _get_channel_ledger(computer._channel_key)
-        computer._band_state = _get_channel_band_state(computer._channel_key)
-    # Defect fix (docs/designs/coexistence.md §7.6): `coexistence.announce`/
-    # `coexistence.enabled` declining disclosure used to surface only as an
-    # ordinary-looking `ToolResult(success=False)` on this session's first
-    # real action (`_ensure_announced` fires there, not here). Check here, at
-    # mount, with a single side-effect-free presence sample: refuse to mount
-    # outright when a human is already detected present with no disclosure
-    # channel, exactly as loud and exactly as early as `NoBackendAvailable`.
-    mount_coexistence_cfg = dict(cfg.get("coexistence") or {})
-    disclosure_refusal = _refuse_if_disclosure_declined_with_human_present(
-        mount_coexistence_cfg, computer._coexistence_guard, backend
-    )
-    if disclosure_refusal is not None:
+    try:
+        computer = ComputerTool(backend, cfg)
+        # D2: resolve display once, here, before the tool ever answers a provider
+        # request - not lazily on the first `native_tool_spec` read.
+        try:
+            computer.resolve_display()
+        except BackendError as exc:
+            raise _BackendNotReady(
+                f"computer-use backend {backend.name!r} was selected but could not "
+                f"prepare its display: {exc}. Check the target desktop session, "
+                "display permissions, and connection, then retry activation. "
+                "No other computer was selected."
+            ) from exc
+        # Human/agent coexistence (docs/designs/coexistence.md) - only built for
+        # backends with a proven presence-detector wiring (see
+        # `_build_coexistence_guard`). `None` on every other backend, unchanged
+        # from before this feature existed.
+        computer._coexistence_guard = _build_coexistence_guard(backend, cfg)
+        # Band lifetime (docs/designs/band-lifetime.md): the channel-scoped
+        # ledger and depth-counter this session's held-input tracking and
+        # band-lowering decisions use - `None` whenever no guard was built
+        # (same population as before this feature existed: no coexistence
+        # layer at all). Computed from the SAME backend `_build_coexistence_guard`
+        # was just given, so `_channel_identity` returns the identical key.
+        if computer._coexistence_guard is not None:
+            computer._channel_key = _channel_identity(backend)
+            computer._ledger = _get_channel_ledger(computer._channel_key)
+            computer._band_state = _get_channel_band_state(computer._channel_key)
+        # Defect fix (docs/designs/coexistence.md §7.6): `coexistence.announce`/
+        # `coexistence.enabled` declining disclosure used to surface only as an
+        # ordinary-looking `ToolResult(success=False)` on this session's first
+        # real action (`_ensure_announced` fires there, not here). Check here, at
+        # mount, with a single side-effect-free presence sample: refuse to mount
+        # outright when a human is already detected present with no disclosure
+        # channel, exactly as loud and exactly as early as `NoBackendAvailable`.
+        mount_coexistence_cfg = dict(cfg.get("coexistence") or {})
+        disclosure_refusal = _refuse_if_disclosure_declined_with_human_present(
+            mount_coexistence_cfg, computer._coexistence_guard, backend
+        )
+        if disclosure_refusal is not None:
+            raise _MountRefused(disclosure_refusal)
+        return computer
+    except Exception:
+        # Release only this builder's ownership. Shared transports keep any
+        # sibling references alive; cleanup must not replace the build failure.
         try:
             backend.close()
-        except Exception:  # noqa: BLE001 - best-effort cleanup on refusal
+        except Exception:  # noqa: BLE001 - preserve the original failure
             logger.debug(
-                "tool-computer-use: backend.close() failed after a "
-                "mount-time disclosure refusal",
-                exc_info=True,
+                "tool-computer-use: failed-build cleanup failed", exc_info=True
             )
-        raise _MountRefused(disclosure_refusal)
-    return computer
+        raise
 
 
 async def _mount_backend(coordinator: Any, cfg: dict[str, Any]) -> dict[str, Any]:
@@ -5216,6 +5232,11 @@ class ComputerUseUnavailableTool:
                     "type": type(exc).__name__,
                 },
             )
+        except _BackendNotReady as exc:
+            return ToolResult(
+                success=False,
+                error={"message": str(exc), "type": "BackendNotReady"},
+            )
         except _MountRefused as exc:
             return ToolResult(
                 success=False,
@@ -5365,7 +5386,7 @@ async def mount(
         return await _mount_unavailable(
             coordinator, f"invalid configuration: {exc}", cfg, loud=True
         )
-    except _MountRefused as exc:
+    except (_BackendNotReady, _MountRefused) as exc:
         return await _mount_unavailable(coordinator, str(exc), cfg, loud=True)
     except Exception as exc:
         # Defect 2 fix: `select_backend`'s remote branch raises
