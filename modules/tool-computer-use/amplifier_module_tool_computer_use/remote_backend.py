@@ -23,7 +23,7 @@ from .backend import (
     WindowList,
 )
 from .ssh_transport import AgentStderrError, SshConnectError, SshTransport
-from .wire import Request, Response, classify_op
+from .wire import AgentBackendUnavailableError, Request, Response, classify_op
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +43,7 @@ def _decode_rect(raw: Any) -> tuple[int, int, int, int] | None:
 
 
 class RemoteTargetUnavailable(AgentStderrError):
-    """A `target:` was explicitly configured and could not be reached.
+    """An explicit `target:` could not be reached or has no usable desktop.
 
     Deliberately NOT a subclass of `registry.NoBackendAvailable` - that type is
     caught by `mount()` and degrades to a silent skip, which is exactly the
@@ -152,6 +152,11 @@ class RemoteBackend:
         except SshConnectError as exc:
             raise RemoteTargetUnavailable(
                 exc.message, agent_stderr=exc.agent_stderr
+            ) from exc
+        except AgentBackendUnavailableError as exc:
+            raise RemoteTargetUnavailable(
+                f"{exc}. Check the configured target's active desktop and "
+                "permissions, then retry activation. No other computer was selected."
             ) from exc
         self._connected = True
         self.name = f"remote-ssh:{handshake.get('backend', '?')}"

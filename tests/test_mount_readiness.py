@@ -23,7 +23,7 @@ from amplifier_core.validation.tool import ToolValidator
 from amplifier_module_tool_computer_use import registry, shared_transport
 from amplifier_module_tool_computer_use.backend import BackendError
 from amplifier_module_tool_computer_use.ssh_transport import SshConnectError
-from amplifier_module_tool_computer_use.wire import Response
+from amplifier_module_tool_computer_use.wire import Response, validate_handshake
 
 
 def _run(awaitable):
@@ -93,6 +93,24 @@ class Wire:
             raise OSError("synthetic cleanup failure")
 
 
+class HandshakeWire(Wire):
+    """The real handshake validator, with no SSH or desktop actions."""
+
+    def __init__(self, **overrides):
+        super().__init__("healthy")
+        self.overrides = overrides
+
+    def connect(self, *, required_permissions=(), **kwargs):
+        handshake = super().connect(**kwargs)
+        handshake.update(self.overrides)
+        validate_handshake(
+            handshake,
+            expected_sha256="fixture",
+            required_permissions=required_permissions,
+        )
+        return handshake
+
+
 @pytest.fixture
 def harness(monkeypatch):
     def forbidden(*args, **kwargs):
@@ -135,6 +153,120 @@ def tools(coordinator):
         for item in coordinator.mount_history
         if item["mount_point"] == "tools"
     }
+
+
+def unavailable_probe():
+    return {"available": False, "reason": "macos: zero active displays"}
+
+
+@pytest.mark.parametrize("cached", [False, True])
+def test_unavailable_handshake_passes_core_without_other_computer(harness, cached):
+    wires, handles, acquire = harness
+    wire = HandshakeWire(probe=unavailable_probe())
+    wires.append(wire)
+    sibling = None
+    if cached:
+        # Exercise revalidation of a saved shared record independently of the
+        # first-connect validator. A failed fresh handshake is never cached.
+        sibling = acquire()
+        sibling._entry.handshake = {
+            "protocol": 1,
+            "agent_sha256": "fixture",
+            "probe": unavailable_probe(),
+            "permissions": {},
+        }
+    result = ValidationResult(module_type="tool", module_path="fixture")
+    _run(ToolValidator()._check_protocol_compliance(result, cu.mount, config=config()))
+    assert result.passed, result.summary()
+    assert handles[-1]._released
+    assert wire.calls == ([] if cached else ["connect"])
+    if sibling:
+        assert not sibling._released
+        assert sibling._entry.refcount == 1
+        assert wire.closed == 0
+        sibling.close()
+    else:
+        assert handles[-1]._entry.handshake is None
+    assert wire.closed == 1
+
+
+@pytest.mark.parametrize("cached", [False, True])
+@pytest.mark.parametrize("failure", ["protocol", "permission", "malformed-probe"])
+def test_handshake_hard_rejections_still_fail_core(harness, cached, failure):
+    wires, handles, acquire = harness
+    overrides = {"probe": unavailable_probe()}
+    if failure == "protocol":
+        overrides["protocol"] = 999
+    elif failure == "permission":
+        overrides["permissions"] = {"accessibility": False}
+    else:
+        overrides["probe"] = {"available": "false"}
+    wire = HandshakeWire(**overrides)
+    wires.append(wire)
+    if cached:
+        sibling = acquire()
+        sibling._entry.handshake = {
+            "protocol": 1,
+            "agent_sha256": "fixture",
+            "permissions": {"accessibility": True},
+            **overrides,
+        }
+    cfg = config()
+    if failure == "permission":
+        cfg["required_permissions"] = ["accessibility"]
+    result = ValidationResult(module_type="tool", module_path="fixture")
+    _run(ToolValidator()._check_protocol_compliance(result, cu.mount, config=cfg))
+    assert not result.passed
+    assert handles[-1]._released
+    assert wire.calls == ([] if cached else ["connect"])
+
+
+def test_payload_integrity_failure_still_fails_core(harness):
+    wires, handles, _ = harness
+    wire = HandshakeWire(agent_sha256="wrong", probe=unavailable_probe())
+    wires.append(wire)
+    result = ValidationResult(module_type="tool", module_path="fixture")
+    _run(ToolValidator()._check_protocol_compliance(result, cu.mount, config=config()))
+    assert not result.passed
+    assert any("sha256" in check.message for check in result.checks)
+    assert wire.closed == 1
+    assert handles[-1]._released
+
+
+def test_unavailable_handshake_stub_retries_only_on_explicit_activation(harness):
+    wires, handles, _ = harness
+    unavailable = HandshakeWire(probe=unavailable_probe())
+    wires.append(unavailable)
+    coordinator = MockCoordinator()
+    manifest = _run(cu.mount(coordinator, config()))
+    assert manifest["provides"] == ["computer_use_unavailable"]
+    stub = tools(coordinator)["computer_use_unavailable"]
+    assert "zero active displays" in stub.description
+    assert "retry activation" in stub.description
+    assert "No other computer was selected" in stub.description
+    assert stub._cfg == config()
+    assert unavailable.calls == ["connect"]
+    assert unavailable.closed == 1
+
+    failed = HandshakeWire(probe=unavailable_probe())
+    wires.append(failed)
+    result = _run(stub._activate("ssh://fixture.invalid"))
+    assert not result.success
+    assert result.error["type"] == "RemoteTargetUnavailable"
+    assert set(tools(coordinator)) == {"computer_use_unavailable"}
+    assert failed.closed == 1
+
+    healthy = HandshakeWire()
+    wires.append(healthy)
+    result = _run(stub._activate("ssh://fixture.invalid"))
+    assert result.success
+    computer = tools(coordinator)["computer"]
+    assert computer._backend.is_remote
+    assert computer._gate_writes is True
+    assert computer._read_only is False
+    assert computer._clipboard_read_policy == "redact"
+    assert computer._announced is False
+    assert handles[-1]._entry is not handles[0]._entry
 
 
 @pytest.mark.parametrize("mode", ["disconnect", "display-error"])
@@ -276,8 +408,10 @@ def test_guard_programming_error_preserved_after_successful_display(
     assert wire.closed == 1
 
 
+@pytest.mark.parametrize("handshake_unavailable", [False, True])
 def test_failed_retarget_preserves_current_binding_and_releases_candidate(
     harness,
+    handshake_unavailable,
 ):
     wires, handles, _ = harness
     healthy = Wire("healthy")
@@ -285,7 +419,9 @@ def test_failed_retarget_preserves_current_binding_and_releases_candidate(
     current = cu._select_and_build(config())
     old_binding = current._binding
     # Different key/target to exercise candidate initialization, not same-target no-op.
-    failed = Wire()
+    failed = (
+        HandshakeWire(probe=unavailable_probe()) if handshake_unavailable else Wire()
+    )
     wires.append(failed)
     failed_key = ("fixture", uuid.uuid4().hex, None)
     from unittest.mock import patch
