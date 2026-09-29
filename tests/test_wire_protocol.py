@@ -14,6 +14,7 @@ sys.path.insert(0, str(ROOT / "modules" / "tool-computer-use"))
 import pytest
 from amplifier_module_tool_computer_use.wire import (
     PROTOCOL_VERSION,
+    AgentBackendUnavailableError,
     ProtocolMismatchError,
     Request,
     Response,
@@ -139,11 +140,41 @@ def test_validate_handshake_rejects_sha_mismatch():
 
 
 def test_validate_handshake_rejects_unavailable_probe():
-    with pytest.raises(ProtocolMismatchError, match="unavailable"):
+    with pytest.raises(AgentBackendUnavailableError, match="unavailable"):
         validate_handshake(
             _good_handshake(probe={"available": False, "reason": "no display"}),
             expected_sha256="abc123",
         )
+
+
+@pytest.mark.parametrize(
+    "overrides,reason",
+    [
+        ({"protocol": 999}, "protocol"),
+        ({"agent_sha256": "wrong"}, "sha256"),
+        ({"permissions": {"accessibility": False}}, "accessibility"),
+    ],
+)
+def test_unavailable_probe_cannot_mask_hard_requirements(overrides, reason):
+    handshake = _good_handshake(
+        probe={"available": False, "reason": "no active display"}, **overrides
+    )
+    with pytest.raises(ProtocolMismatchError, match=reason) as caught:
+        validate_handshake(
+            handshake,
+            expected_sha256="abc123",
+            required_permissions=("accessibility",),
+        )
+    assert not isinstance(caught.value, AgentBackendUnavailableError)
+
+
+@pytest.mark.parametrize(
+    "probe", [None, {}, [], {"available": 0}, {"available": "false"}]
+)
+def test_malformed_probe_is_not_operational_unavailability(probe):
+    with pytest.raises(ProtocolMismatchError, match="boolean") as caught:
+        validate_handshake(_good_handshake(probe=probe), expected_sha256="abc123")
+    assert not isinstance(caught.value, AgentBackendUnavailableError)
 
 
 def test_validate_handshake_rejects_missing_required_permission():

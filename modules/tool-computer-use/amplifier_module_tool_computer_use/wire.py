@@ -179,6 +179,15 @@ class ProtocolMismatchError(RuntimeError):
     """
 
 
+class AgentBackendUnavailableError(ProtocolMismatchError):
+    """A verified payload reports no usable desktop on this target.
+
+    The connection is still rejected; callers may expose an unavailable tool
+    instead of treating this operational state as a broken module contract.
+    Protocol, payload integrity and required permissions must pass first.
+    """
+
+
 def validate_handshake(
     handshake: dict[str, Any],
     *,
@@ -202,15 +211,17 @@ def validate_handshake(
             f"agent-reported {got_sha!r} - refusing a possibly-corrupted or "
             "tampered deploy"
         )
-    probe = handshake.get("probe") or {}
-    if not probe.get("available", False):
-        raise ProtocolMismatchError(
-            f"agent backend unavailable: {probe.get('reason', 'no reason given')}"
-        )
     permissions = handshake.get("permissions") or {}
     missing = [p for p in required_permissions if not permissions.get(p, False)]
     if missing:
         raise ProtocolMismatchError(
             f"required permission(s) not granted on target: {missing} "
             f"(reported permissions: {permissions})"
+        )
+    probe = handshake.get("probe")
+    if not isinstance(probe, dict) or not isinstance(probe.get("available"), bool):
+        raise ProtocolMismatchError("agent probe must report boolean available")
+    if probe["available"] is False:
+        raise AgentBackendUnavailableError(
+            f"agent backend unavailable: {probe.get('reason', 'no reason given')}"
         )
