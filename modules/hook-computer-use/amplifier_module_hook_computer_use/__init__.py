@@ -13,8 +13,10 @@ import copy
 import json
 import logging
 import os
+import stat
 import sys
 import warnings
+from collections import deque
 from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
@@ -146,9 +148,37 @@ def _parse_marker(content: Any) -> dict[str, Any] | None:
     return None
 
 
-def _image_block(path: str) -> dict[str, Any] | None:
+def _image_block(path: str, capture: tuple) -> dict[str, Any] | None:
     try:
-        raw = Path(path).read_bytes()
+        issued_path, canonical, identity = capture
+        try:
+            resolved = str(Path(path).resolve())
+        except RuntimeError:  # Python 3.11's resolution-specific symlink-loop error.
+            return None
+        if path != issued_path or resolved != canonical:
+            return None
+        # Open once, reject final-component links, and read only the descriptor
+        # whose identity the tool obtained while writing the genuine capture.
+        with os.fdopen(
+            os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), "rb"
+        ) as shot:
+
+            def unchanged() -> bool:
+                status = os.fstat(shot.fileno())
+                return stat.S_ISREG(status.st_mode) and identity == (
+                    status.st_dev,
+                    status.st_ino,
+                    status.st_mode,
+                    status.st_size,
+                    status.st_mtime_ns,
+                    status.st_ctime_ns,
+                )
+
+            if not unchanged():
+                return None
+            raw = shot.read()
+            if not unchanged():
+                return None
     except OSError:
         logger.warning("computer-use: screenshot %s is gone; sending text only", path)
         return None
@@ -168,6 +198,60 @@ def _read_content(msg: Any) -> Any:
     )
 
 
+def _field(msg: Any, name: str) -> Any:
+    return msg.get(name) if isinstance(msg, dict) else getattr(msg, name, None)
+
+
+def _make_capture_authority(coordinator: Any, max_inline: int):
+    """Bounded, memory-only transfer from real issuance to tool:post call/result.
+
+    Text cannot populate this authority. Restart/eviction loses it deliberately;
+    history remains text rather than reauthorizing local reads from marker paths.
+    """
+    records: deque = deque(maxlen=max(64, max_inline))
+
+    async def post(event: str, data: dict[str, Any]) -> HookResult:
+        name, call_id = data.get("tool_name"), data.get("tool_call_id")
+        if not isinstance(name, str) or not isinstance(call_id, str) or not call_id:
+            return HookResult(action="continue")
+        tool = coordinator.get("tools", name)
+        take = getattr(tool, "_take_issued_capture_result", None)
+        if not _has_neutral_intent(tool) or not callable(take):
+            return HookResult(action="continue")
+        result = data.get("result")
+        captures = take(result)
+        if captures and not any(r[0:2] == (name, call_id) for r in records):
+            records.append((name, call_id, tool, copy.deepcopy(result), captures))
+        return HookResult(action="continue")
+
+    def lookup(msg: Any, payload: dict) -> list | None:
+        if _field(msg, "role") != "tool":
+            return None
+        name, call_id = _field(msg, "name"), _field(msg, "tool_call_id")
+        for alias, issued_id, tool, result, captures in records:
+            if name != alias or call_id != issued_id:
+                continue
+            if coordinator.get("tools", alias) is not tool:
+                return None
+            if payload != _parse_marker(result):
+                return None
+            original = _read_content(msg)
+            try:
+                envelope = (
+                    _loads_leading(original) if isinstance(original, str) else original
+                )
+            except (TypeError, ValueError):
+                return None
+            # Both supported result shapes are derived from the exact issued
+            # result; appended hook context is retained but grants no authority.
+            if envelope != result and envelope != payload:
+                return None
+            return captures
+        return None
+
+    return post, lookup
+
+
 def _with_content(msg: Any, content: Any) -> Any:
     """Copy messages; use generic raw blocks without serializer-added wire fields."""
     if isinstance(msg, dict):
@@ -183,7 +267,9 @@ def _with_content(msg: Any, content: Any) -> Any:
         return msg
 
 
-def _expand_tool_results(messages: list[Any], max_inline: int) -> list[Any]:
+def _expand_tool_results(
+    messages: list[Any], max_inline: int, capture_for_message=None
+) -> list[Any]:
     """Generic recency projection retaining complete original error/reference text.
 
     Native image selection and replay obligations belong to the provider. In
@@ -194,7 +280,7 @@ def _expand_tool_results(messages: list[Any], max_inline: int) -> list[Any]:
     for msg in reversed(messages):
         original = _read_content(msg)
         payload = _parse_marker(original)
-        if payload is None:
+        if payload is None or _field(msg, "role") != "tool":
             rewritten.append(msg)
             continue
         # A marker is not evidence of success. Keep failed ToolResult envelopes
@@ -213,13 +299,18 @@ def _expand_tool_results(messages: list[Any], max_inline: int) -> list[Any]:
         ):
             rewritten.append(_with_content(msg, copy.deepcopy(original)))
             continue
+        captures = capture_for_message(msg, payload) if capture_for_message else None
+        if captures is None:
+            rewritten.append(msg)
+            continue
         text = str(payload.get("text") or "screenshot")
         images = [p for p in payload.get("images", []) if isinstance(p, str)]
         blocks = []
         missing = False
         if budget > 0:
             for path in images:
-                block = _image_block(path)
+                capture = next((c for c in captures if c[0] == path), None)
+                block = _image_block(path, capture) if capture is not None else None
                 if block is None:
                     missing = True
                 else:
@@ -275,7 +366,9 @@ def _computer_for_tool(tool: Any, name: str) -> Any:
     return None
 
 
-def _wrap_provider(provider: Any, coordinator: Any, max_inline: int) -> bool:
+def _wrap_provider(
+    provider: Any, coordinator: Any, max_inline: int, capture_for_message=None
+) -> bool:
     if getattr(provider, _WRAPPED_FLAG, False):
         return False
     _fail_if_stream_incompatible(provider)
@@ -293,7 +386,9 @@ def _wrap_provider(provider: Any, coordinator: Any, max_inline: int) -> bool:
             if hasattr(request, "model_copy")
             else copy.deepcopy(request)
         )
-        clone.messages = _expand_tool_results(clone.messages, max_inline)
+        clone.messages = _expand_tool_results(
+            clone.messages, max_inline, capture_for_message
+        )
         _trace(
             f"request projection: markers={sum(_parse_marker(_read_content(m)) is not None for m in messages)} messages_with_blocks={sum(isinstance(_read_content(m), list) for m in clone.messages)}"
         )
@@ -524,6 +619,7 @@ async def mount(
         )
     priority = int(cfg.get("priority", 50))
     unattended_writes_ok = bool(cfg.get("unattended_writes_ok", False))
+    capture_post, capture_for_message = _make_capture_authority(coordinator, max_inline)
 
     async def handler(event: str, data: dict[str, Any]) -> HookResult:
         # No provider knowledge is needed to detect explicit intent; aliases
@@ -556,7 +652,7 @@ async def mount(
                 name,
             )
         else:
-            _wrap_provider(provider, coordinator, max_inline)
+            _wrap_provider(provider, coordinator, max_inline, capture_for_message)
         return HookResult(action="continue")
 
     coordinator.hooks.register(
@@ -567,6 +663,12 @@ async def mount(
         _make_gate_handler(coordinator, unattended_writes_ok=unattended_writes_ok),
         priority=priority,
         name="hook-computer-use-gate",
+    )
+    coordinator.hooks.register(
+        TOOL_POST,
+        capture_post,
+        priority=priority,
+        name="hook-computer-use-capture",
     )
     coordinator.hooks.register(
         TOOL_POST,

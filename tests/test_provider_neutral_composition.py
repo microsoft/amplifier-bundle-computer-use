@@ -19,7 +19,14 @@ from amplifier_module_provider_anthropic import AnthropicProvider
 from amplifier_module_provider_openai import OpenAIProvider
 from anthropic import AsyncAnthropic
 from openai import AsyncOpenAI
-from test_neutral_computer import CLICK, Coordinator, batch, hook, run
+from test_neutral_computer import (
+    CLICK,
+    batch,
+    core_coordinator,
+    core_dispatch,
+    hook,
+    run,
+)
 from test_neutral_computer import computer as computer
 
 
@@ -173,7 +180,8 @@ def test_actual_sdk_reply_tool_execution_hook_budget_and_replay(
             # Inject only the SDK transport, not native provenance/history.
             provider._client = sdk
         try:
-            assert hook._wrap_provider(provider, Coordinator(computer), 3)
+            coordinator = await core_coordinator(computer, provider)
+            assert getattr(provider, hook._WRAPPED_FLAG)
             request = ChatRequest(
                 messages=[Message(role="user", content="click the visible button")],
                 tools=[spec],
@@ -192,7 +200,9 @@ def test_actual_sdk_reply_tool_execution_hook_budget_and_replay(
                     raise BackendError("offline injected failure after possible input")
 
                 computer._backend.on_input = fail
-            result = await computer.execute(call.arguments)
+            result = await core_dispatch(
+                coordinator, computer, call.arguments, call_id=call.id, name=call.name
+            )
             assert result.success is not failure
             # Carry exactly the provider-produced blocks/metadata, never private seeding.
             history = [

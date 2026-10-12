@@ -39,6 +39,10 @@ sys.path.insert(0, str(ROOT / "modules" / "hook-computer-use"))
 
 import amplifier_module_hook_computer_use as hook_mod
 import amplifier_module_tool_computer_use as tool_mod
+from amplifier_core.message_models import ChatRequest, Message
+from test_native_screenshot_preflight import Provider
+from test_neutral_computer import computer as computer
+from test_neutral_computer import core_coordinator, core_dispatch, run
 
 #: The exact real-world envelope shape captured from a live session's
 #: transcript.jsonl, byte-for-byte (only the shot path/dimensions vary).
@@ -104,32 +108,24 @@ def test_parse_marker_still_rejects_genuinely_malformed_json():
     assert hook_mod._parse_marker(content) is None
 
 
-def test_expand_tool_results_inlines_image_despite_trailing_reminder(tmp_path):
+def test_expand_tool_results_inlines_image_despite_trailing_reminder(computer):
     """End-to-end: `_expand_tool_results` must still produce a real image block
     when the tool-result message carries a marker with trailing appended text -
     exactly the message shape that reached the provider in the live repro."""
-    shot = tool_mod.SHOT_DIR / "trailing-content-test.png"
-    shot.parent.mkdir(parents=True, exist_ok=True)
-    png_1px = bytes.fromhex(
-        "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
-        "0000000d4944415478da6360000002000155020ff31af0e00000000049454e44ae426082"
+    provider = Provider()
+    coordinator = run(core_coordinator(computer, provider))
+    result = run(core_dispatch(coordinator, computer, {"action": "screenshot"}))
+    content = result.model_dump_json() + _TRAILING_REMINDER
+    request = ChatRequest(
+        messages=[
+            Message(
+                role="tool", name="my_desktop", tool_call_id="capture", content=content
+            )
+        ]
     )
-    shot.write_bytes(png_1px)
-    try:
-        marker = json.dumps(
-            {tool_mod.MARKER: 1, "text": "screenshot captured", "images": [str(shot)]}
-        )
-        envelope = json.dumps({"error": None, "output": marker, "success": True})
-        content = envelope + _TRAILING_REMINDER
-
-        out = hook_mod._expand_tool_results(
-            [{"role": "tool", "content": content}], max_inline=3
-        )
-
-        result_content = hook_mod._read_content(out[0])
-        assert isinstance(result_content, list), (
-            f"expected a real image content block list, got: {result_content!r}"
-        )
-        assert any(b.get("type") == "image" for b in result_content)
-    finally:
-        shot.unlink(missing_ok=True)
+    projected = run(provider.complete(request))
+    result_content = projected.messages[0].content
+    assert isinstance(result_content, list)
+    assert any(b.get("type") == "image" for b in result_content)
+    assert result_content[0]["text"].endswith(_TRAILING_REMINDER)
+    assert request.messages[0].content == content

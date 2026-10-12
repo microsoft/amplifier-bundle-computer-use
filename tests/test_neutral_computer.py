@@ -13,6 +13,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from amplifier_core.coordinator import ModuleCoordinator
 from amplifier_core.message_models import ToolSpec
 from PIL import Image
 
@@ -105,6 +106,31 @@ def batch(*actions, capture=True):
 CLICK = {"action": "left_click", "coordinate": [20, 30]}
 
 
+async def core_coordinator(computer, provider=None, *, max_inline=3):
+    """Real Core mounts/registry; only the platform and HTTP are test doubles."""
+    coordinator = ModuleCoordinator()
+    await coordinator.mount("tools", computer, name="my_desktop")
+    if provider is not None:
+        await coordinator.mount("providers", provider, name="test-provider")
+    await hook.mount(coordinator, {"max_inline_screenshots": max_inline})
+    if provider is not None:
+        await coordinator.hooks.emit("provider:request", {"provider": "test-provider"})
+    return coordinator
+
+
+async def core_dispatch(
+    coordinator, tool, arguments, *, call_id="capture", name="my_desktop"
+):
+    """Supported TOOL_PRE/execute/TOOL_POST plumbing, matching Loop's result dump."""
+    data = {"tool_name": name, "tool_call_id": call_id, "tool_input": arguments}
+    pre = await coordinator.hooks.emit("tool:pre", data)
+    pre = await coordinator.process_hook_result(pre, "tool:pre", name)
+    assert pre.action != "deny", pre.reason
+    result = await tool.execute(arguments)
+    await coordinator.hooks.emit("tool:post", {**data, "result": result.model_dump()})
+    return result
+
+
 def test_explicit_intent_real_toolspec_cached_dimensions_and_no_discovery(computer):
     expected = computer.native_tool_spec
     assert expected["type"] == "function"
@@ -157,6 +183,12 @@ def test_intent_unknown_geometry_does_not_guess_and_local_limitations_are_explic
         {"action": "left_click", "coordinate": [10**400, 3]},
         {"action": "type", "text": 3},
         {"action": "scroll", "scroll_direction": "diagonal"},
+        {"action": "scroll", "scroll_direction": ["down"]},
+        {"action": "scroll", "scroll_direction": {"direction": "down"}},
+        {"action": "scroll", "scroll_direction": 1},
+        {"action": "scroll", "scroll_direction": True},
+        {"action": "scroll", "direction": ["down"]},
+        {"action": "scroll", "direction": {"direction": "down"}},
         {"action": "focus_window"},
         {"action": "key", "text": "enter", "keys": ["shift"]},
         {"type": "click", "x": 1, "y": 2},
@@ -233,6 +265,52 @@ def test_capture_after_false_does_not_capture(computer):
     assert result.success
     assert json.loads(result.output)["images"] == []
     assert [c[0] for c in computer._backend.calls] == ["click"]
+
+
+@pytest.mark.parametrize("flat", [False, True])
+def test_real_persistence_obstruction_is_failed_image_free_result_with_cleanup(
+    computer, tmp_path, monkeypatch, flat
+):
+    occupied = tmp_path / "occupied-output-directory"
+    occupied.write_text("real filesystem obstruction")
+    monkeypatch.setattr(cu, "SHOT_DIR", occupied)
+    exits = []
+    computer._band_enter = lambda: "normal-cleanup"
+    computer._band_exit = lambda token: exits.append(token)
+    result = run(computer.execute({"action": "screenshot"} if flat else batch(CLICK)))
+    assert not result.success
+    assert result.error["type"] == "FileExistsError"
+    assert "screenshot persistence failed" in result.error["message"]
+    assert exits == ["normal-cleanup"]
+    assert not computer._issued_capture_results
+    assert occupied.read_text() == "real filesystem obstruction"
+    if flat:
+        # Core's normal ToolResult supplies error text as output when omitted.
+        assert result.output == result.error["message"]
+        assert result.content is None
+        assert computer._backend.calls == [("capture", None)]
+    else:
+        payload = json.loads(result.output)
+        assert payload["images"] == []
+        assert payload["progress"] == {
+            "completed": 1,
+            "total": 1,
+            "uncertain_in_flight": None,
+        }
+        assert "left_click at [20, 30]" in payload["text"]
+        assert [c[0] for c in computer._backend.calls] == ["click", "capture"]
+
+
+@pytest.mark.parametrize("direction", ["up", "down", "left", "right"])
+@pytest.mark.parametrize("key", ["scroll_direction", "direction"])
+def test_scroll_direction_aliases_and_zero_amount_are_valid(computer, direction, key):
+    result = run(
+        computer.execute(
+            batch({"action": "scroll", key: direction, "amount": 0}, capture=False)
+        )
+    )
+    assert result.success, result.error
+    assert computer._backend.calls == [("scroll", direction, 0)]
 
 
 def test_flat_canonical_compatibility(computer):
@@ -501,7 +579,8 @@ def test_cancelled_worker_halt_is_recorded_once_against_pinned_target(
     assert [call[0] for call in backend.calls] == ["click"]
 
 
-def test_cancellation_during_band_cleanup_retains_completed_progress(computer):
+@pytest.mark.parametrize("capture", [False, True])
+def test_cancellation_during_band_cleanup_retains_completed_progress(computer, capture):
     started, release, finished = threading.Event(), threading.Event(), threading.Event()
     exits = []
     computer._band_enter = lambda: "cleanup-token"
@@ -515,7 +594,7 @@ def test_cancellation_during_band_cleanup_retains_completed_progress(computer):
     computer._band_exit = exit_band
 
     async def scenario():
-        task = asyncio.create_task(computer.execute(batch(CLICK, capture=False)))
+        task = asyncio.create_task(computer.execute(batch(CLICK, capture=capture)))
         assert await asyncio.to_thread(started.wait, 1)
         task.cancel()
         result = await task
@@ -528,7 +607,10 @@ def test_cancellation_during_band_cleanup_retains_completed_progress(computer):
 
     run(scenario())
     assert exits == ["cleanup-token"]
-    assert [call[0] for call in computer._backend.calls] == ["click"]
+    assert [call[0] for call in computer._backend.calls] == (
+        ["click", "capture"] if capture else ["click"]
+    )
+    assert not computer._issued_capture_results
 
 
 def test_provider_private_probes_and_model_observation_are_absent():

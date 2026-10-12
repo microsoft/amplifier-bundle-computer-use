@@ -17,6 +17,11 @@ A successful `capture_after` batch returns a full final screenshot, reusing only
 terminal full screenshot. Earlier screenshots or cropped zooms are not sufficient.
 Errors retain partial progress and are never disguised by recapture. ToolResult and
 `__amplifier_computer_use__` text/images markers remain the result boundary.
+Expected screenshot persistence/packaging failures produce an image-free failed
+result, retaining settled batch summaries and progress without replay or recapture.
+Successful captures provide a bounded, one-shot in-memory issuance handoff to the
+companion hook's actual coordinator `tool:post` association; marker paths alone
+cannot authorize local image reads.
 
 Providers own model/endpoint support, native declarations, vendor unit translation,
 safety requirements and replay. The companion hook projects copied generic histories.

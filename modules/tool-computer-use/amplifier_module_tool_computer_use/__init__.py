@@ -35,6 +35,7 @@ import socket
 import threading
 import time
 import uuid
+from collections import deque
 from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
@@ -441,6 +442,10 @@ class ComputerTool:
         # session previously wrote into together. See `execute()` and
         # `_prune_shots()`.
         self._session_id: str = uuid.uuid4().hex
+        # One-shot handoff to the hook's real tool:post call association. Only
+        # successful image results emitted by this instance enter this queue.
+        # It is bounded, memory-only, and cannot be reconstructed from history.
+        self._issued_capture_results: deque = deque(maxlen=64)
 
         # -- security hardening: clipboard read policy ------------------------
         # `get_clipboard` (docs/DesktopTool) previously had no gate
@@ -2494,7 +2499,8 @@ class ComputerTool:
                     f"batch duration must be finite seconds in 0..{MAX_BATCH_DURATION_SECONDS:g}"
                 )
         if action == "scroll":
-            if (params.get("scroll_direction") or params.get("direction")) not in {
+            direction = params.get("scroll_direction") or params.get("direction")
+            if not isinstance(direction, str) or direction not in {
                 "up",
                 "down",
                 "left",
@@ -2517,15 +2523,21 @@ class ComputerTool:
         image: str | None = None,
         presses_completed: int = 0,
         display: Display | None = None,
+        captures: list | None = None,
     ) -> ToolResult:
         text = "; ".join(summaries) or "no actions completed"
         if error:
             text += f"; stopped: {error['message']}"
         payload = {MARKER: 1, "text": text, "images": []}
         if image is not None:
-            payload = json.loads(
-                self._screenshot_tool_result(text, image, display=display).output
+            packaged = self._screenshot_tool_result(
+                text, image, display=display, captures=captures
             )
+            if packaged.success:
+                payload = json.loads(packaged.output)
+            else:
+                error = packaged.error
+                payload["text"] += f"; stopped: {error['message']}"
         payload["progress"] = {
             "completed": len(summaries),
             "total": total,
@@ -2674,6 +2686,7 @@ class ComputerTool:
             "cleanup": None,
         }
         result = None
+        captures: list = []
         try:
             result = await self._execute_calls(
                 calls,
@@ -2682,8 +2695,8 @@ class ComputerTool:
                 binding=binding,
                 approved=approved,
                 flight=flight,
+                captures=captures,
             )
-            return result
         finally:
             with flight["lock"]:
                 deferred = flight["running"]
@@ -2713,6 +2726,23 @@ class ComputerTool:
                         payload = json.loads(result.output)
                         payload["text"] += "; " + result.error["message"]
                         result.output = json.dumps(payload)
+        # Cleanup can change success (notably cancellation). Register only the
+        # final emitted result, never an intermediate screenshot or failed batch.
+        if result.success and captures:
+            self._issued_capture_results.append(
+                (copy.deepcopy(result.model_dump()), captures)
+            )
+        return result
+
+    def _take_issued_capture_result(self, result: Any) -> list | None:
+        """Consume an exact issued result at the actual coordinator tool:post seam."""
+        if not isinstance(result, dict) or result.get("success") is not True:
+            return None
+        for record in self._issued_capture_results:
+            if record[0] == result:
+                self._issued_capture_results.remove(record)
+                return record[1]
+        return None
 
     def _run_key_press(
         self, params: dict[str, Any], binding: _Binding, index: int, repeat: int
@@ -2811,6 +2841,7 @@ class ComputerTool:
         binding: _Binding,
         approved: bool,
         flight: dict[str, Any],
+        captures: list,
     ) -> ToolResult:
         """Ordered execution with one pinned batch binding and no rollback/replay."""
         summaries: list[str] = []
@@ -2966,11 +2997,17 @@ class ComputerTool:
                 )
         if batch:
             return self._batch_result(
-                summaries, len(calls), image=last_image_b64, display=binding.display
+                summaries,
+                len(calls),
+                image=last_image_b64,
+                display=binding.display,
+                captures=captures,
             )
         if last_image_b64 is None:
             return ToolResult(success=True, output=last_summary)
-        return self._screenshot_tool_result(last_summary, last_image_b64)
+        return self._screenshot_tool_result(
+            last_summary, last_image_b64, captures=captures
+        )
 
     def _record_halt_result(
         self, action: str, exc: HaltedError, *, binding: _Binding | None = None
@@ -3009,7 +3046,12 @@ class ComputerTool:
         )
 
     def _screenshot_tool_result(
-        self, summary: str, image_b64: str, *, display: Display | None = None
+        self,
+        summary: str,
+        image_b64: str,
+        *,
+        display: Display | None = None,
+        captures: list | None = None,
     ) -> ToolResult:
         """Package a successful `_run()` outcome that produced an image into
         the marker `ToolResult` `hook-computer-use` looks for - unchanged
@@ -3030,6 +3072,29 @@ class ComputerTool:
         at creation time, it is not itself a guarantee, so this is what
         actually enforces owner-only access regardless of umask.
         """
+        try:
+            return self._persist_screenshot_result(
+                summary, image_b64, display=display, captures=captures
+            )
+        except (OSError, ValueError) as exc:
+            # Expected persistence/base64 packaging errors are observations, not
+            # uncertain input. Never recapture or relocate to disguise failure.
+            return ToolResult(
+                success=False,
+                error={
+                    "message": f"screenshot persistence failed: {exc}",
+                    "type": type(exc).__name__,
+                },
+            )
+
+    def _persist_screenshot_result(
+        self,
+        summary: str,
+        image_b64: str,
+        *,
+        display: Display | None,
+        captures: list | None,
+    ) -> ToolResult:
         SHOT_DIR.mkdir(parents=True, exist_ok=True)
         os.chmod(SHOT_DIR, _PRIVATE_DIR_MODE)
         # Prune BEFORE creating this call's own session directory - not
@@ -3044,8 +3109,28 @@ class ComputerTool:
         os.chmod(session_dir, _PRIVATE_DIR_MODE)
 
         path = session_dir / f"{uuid.uuid4().hex}.png"
-        path.write_bytes(base64.standard_b64decode(image_b64))
-        os.chmod(path, _PRIVATE_FILE_MODE)
+        # Identity comes from the descriptor we actually wrote, not a later
+        # reopening of a path supplied in text. Exclusive creation rejects links.
+        with path.open("xb") as shot:
+            shot.write(base64.standard_b64decode(image_b64))
+            shot.flush()
+            os.fchmod(shot.fileno(), _PRIVATE_FILE_MODE)
+            status = os.fstat(shot.fileno())
+        if captures is not None:
+            captures.append(
+                (
+                    str(path),
+                    str(path.resolve()),
+                    (
+                        status.st_dev,
+                        status.st_ino,
+                        status.st_mode,
+                        status.st_size,
+                        status.st_mtime_ns,
+                        status.st_ctime_ns,
+                    ),
+                )
+            )
         disp = display if display is not None else self.display
         return ToolResult(
             success=True,

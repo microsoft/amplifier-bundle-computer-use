@@ -6,6 +6,15 @@ unchanged, sync or awaitable budgets and named request options are preserved, an
 screenshots collapse to text under `max_inline_screenshots`. Full error/progress/reference
 text is retained; no vendor image-only projection or extra user-reference turn is created.
 
+Local image reads additionally require a successful capture genuinely emitted by the
+mounted tool, transferred once through the coordinator's `tool:post` call/result
+association. Role/name/call-id/marker text and arbitrary paths grant no authority.
+Projection reuses that memory-only association for budget and completion, checking
+the original file identity before reading; replaced files and symlinks fail closed.
+After restart or bounded association eviction, marker history remains text, not new
+file-read authority. The association window retains at least the configured inline
+image window. Capture issuance awaiting `tool:post` is bounded to 64 image results.
+
 Native declarations, models/endpoints, vendor envelopes, safety requirements and replay
 provenance belong to providers. The hook neither probes private provider methods nor
 observes the effective model. Explicit v1 intent is detected independently of local
