@@ -1,7 +1,7 @@
 [project]
 name = "amplifier-module-hook-computer-use"
 version = "0.1.0"
-description = "Wire-format bridge that makes provider-native computer-use tools work in Amplifier"
+description = "Generic computer screenshot/error history projection and desktop write/halt policy"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }

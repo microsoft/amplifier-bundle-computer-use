@@ -98,24 +98,35 @@ for what evidence it produces and how to read the result. The gate establishes a
 that is unreadable, recent, or otherwise invalid fails the whole run and is never retried
 or excluded from its denominator. Do not publish private host details or raw run logs.
 
-`scripts/wire_check.py` is the same kind of gate for the multi-provider wire-format
-anti-regression scheme (the design notes §11.2, layer 3): it sends
-one minimal, real, declaration-only request per provider (the exact shape
-`providers.py`'s `Dialect.declare()` emits) and records the result in
-`tests/fixtures/wire-check.json`. It needs real credentials and the network, so it is
-**not** run in CI either:
+### Neutral boundary and retained wire obligation
+
+Production computer-use exports neutral v1 intent and executes canonical actions.
+Providers own models, native declarations/headers, vendor units, safety requirements
+and replay. Do not import SDKs, probe private provider methods or infer intent from
+tool names in the production tool/hook.
+
+`scripts/wire_check.py` is a retained historical instrument for the retired bundle
+dialects, **not the neutral-v1 qualification path**. Do not run it to manufacture fresh
+acceptance. The credential-bearing command below is historical guidance only:
 
 ```bash
 ANTHROPIC_API_KEY=... OPENAI_API_KEY=... .venv/bin/python scripts/wire_check.py
 ```
 
-Run it periodically (at least every `MAX_AGE_DAYS`, currently 30 —
-`tests/test_wire_attestation_freshness.py`) and before cutting a release that touches a
-provider dialect. Unlike the coexistence gate, staleness here **is** enforced in the
-normal offline test suite: `test_wire_attestation_freshness.py` fails the build if the
-attestation this script writes is missing, records a rejection, or has gone stale — see
-that module's docstring for why the attestation and its freshness check are deliberately
-two different files.
+`tests/fixtures/wire-check.json` and historical captures remain unchanged. Existing
+offline freshness checks keep the stale-attestation release warning visible.
+**Fresh live wire qualification transfers to the providers and remains UNMET under
+Root.** Provider-owned qualification must establish the final native declarations,
+results and replay for the released combination. Offline tests, dialect deletion and
+old HTTP 200 records do not satisfy this gate. Root owns normal-installed combined
+checks and the remaining live/hardware release decisions.
+
+Focused headless composition requires real qualified provider wheels and SDKs with HTTP
+intercepted, never optional SDK skips or private provenance injection:
+
+```bash
+.venv/bin/python -m pytest tests/test_neutral_computer.py tests/test_native_screenshot_preflight.py tests/test_provider_neutral_composition.py -q
+```
 
 ## Commit conventions
 

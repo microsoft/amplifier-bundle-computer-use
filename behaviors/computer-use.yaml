@@ -1,7 +1,7 @@
 bundle:
   name: computer-use-behavior
   version: 0.1.0
-  description: Real control of a Windows, macOS, or Linux desktop - local or remote - using the LLM provider's native computer-use tool
+  description: Provider-neutral intent and canonical control of a local or remote Windows, macOS, or Linux desktop
 
 tools:
   - module: tool-computer-use
@@ -14,7 +14,7 @@ tools:
       # target: ssh://user@host
       #
       # Screenshots are downscaled to this long edge before the model sees them.
-      # Anthropic's guidance: at or below WXGA. Bigger is slower AND less accurate.
+      # These are screenshot pixels; the tool alone maps them to physical pixels.
       max_edge: 1280
       enable_zoom: true
       # read_only is deliberately UNSET here, not set to false: the code's own
@@ -25,9 +25,8 @@ tools:
       # keep write access on a machine you are not looking at. Set `read_only`
       # explicitly yourself only if you want to override the default in either
       # direction; see docs/SETUP.md \u00a75/\u00a76.
-      # tool_version is deliberately unset: it is resolved from the live model on
-      # every request (Anthropic's type is versioned per model generation; OpenAI's
-      # is the bare `computer`). Setting it statically risks a stale pairing.
+      # Native declarations, model support and vendor unit conversion belong to
+      # the provider. This tool exports explicit neutral v1 intent, not a dialect.
 
 hooks:
   - module: hook-computer-use

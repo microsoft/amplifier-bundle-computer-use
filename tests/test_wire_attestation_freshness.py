@@ -1,4 +1,11 @@
-"""Gate test for layer 3 of the anti-regression scheme
+"""Retained historical staleness signal; NOT neutral-v1 live acceptance.
+
+Fresh live qualification belongs to providers and remains UNMET under Root.
+Do not rewrite historical fixture dates/results or run the retired bundle
+wire-check instrument to make these warnings green. Provider-owned fresh
+declaration/result/replay checks must qualify the released combination.
+
+Historical rationale: gate test for layer 3 of the anti-regression scheme
 (docs/designs/multi-provider-design.md Sec 11.2) - the dated wire attestation
 `scripts/wire_check.py` produces in `tests/fixtures/wire-check.json`.
 
@@ -43,8 +50,8 @@ FIXTURE_PATH = ROOT / "tests" / "fixtures" / "wire-check.json"
 #: often than vendors change their computer-use schema).
 MAX_AGE_DAYS = 30
 
-#: Providers this bundle ships native support for TODAY (see providers.py's
-#: DIALECTS) and therefore must carry a live attestation for. Gemini/Qwen are
+#: Retained historical provider attestations. Fresh wire responsibility has
+#: transferred to providers; Root owns the UNMET release obligation. Gemini/Qwen are
 #: deliberately out of scope (docs/designs/phase2-plans.md Sec "Gemini and
 #: Qwen") - the deferral is a decision already made and dated, not a gap.
 REQUIRED_PROVIDERS = ("anthropic", "openai")
@@ -55,9 +62,8 @@ def _load_attestation() -> dict:
         pytest.fail(
             f"{FIXTURE_PATH} does not exist - this wire has NEVER been "
             "attested against a real API. A missing attestation is treated "
-            "as maximally stale, not skipped or ignored. Run "
-            "`.venv/bin/python scripts/wire_check.py` with real "
-            "ANTHROPIC_API_KEY/OPENAI_API_KEY set before shipping."
+            "as maximally stale, not skipped or ignored. Fresh provider-owned "
+            "wire qualification remains UNMET under Root before shipping."
         )
     return json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
 
@@ -67,8 +73,7 @@ def test_wire_attestation_exists_for_provider(provider: str) -> None:
     attestation = _load_attestation()
     assert provider in attestation, (
         f"no wire attestation recorded for {provider!r} - never verified "
-        f"live. Run `.venv/bin/python scripts/wire_check.py --only "
-        f"{provider}` before shipping."
+        "live. Provider-owned fresh wire qualification remains UNMET under Root."
     )
 
 
@@ -104,7 +109,8 @@ def test_wire_attestation_is_not_stale(provider: str) -> None:
         "limit (test_wire_attestation_freshness.MAX_AGE_DAYS). A green test "
         "suite next to a stale attestation is exactly the false confidence "
         "that let 393 green tests sit on a wire nobody had exercised. "
-        f"Refresh it: `.venv/bin/python scripts/wire_check.py --only {provider}`"
+        "Historical evidence is unchanged. Fresh provider-owned wire qualification "
+        "remains UNMET under Root; do not manufacture a new bundle attestation."
     )
 
 
