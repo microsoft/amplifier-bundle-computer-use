@@ -214,7 +214,19 @@ def stop_owned(process):
     raise RuntimeError("owned Xvfb still present")
 
 
-async def run(args):
+async def run(args, *, output_fd=None):
+    output = args.output.absolute()
+    if output_fd is None:
+        output.mkdir(mode=0o700, parents=True, exist_ok=False)
+    else:
+        # Only the supervisor's inherited directory descriptor permits reuse.
+        # An existing path, environment flag or symlink is not ownership.
+        require(
+            os.path.samestat(os.fstat(output_fd), output.stat(follow_symlinks=False))
+            and output.is_dir(),
+            "output does not match inherited directory",
+        )
+    output = output.resolve()
     require(not os.environ.get("DISPLAY"), "ambient DISPLAY refused")
     require(bool(os.environ.get(args.keyenv)), "caller key environment missing")
     require(30 <= args.deadline_seconds <= 900, "deadline must include cleanup reserve")
@@ -246,8 +258,6 @@ async def run(args):
         args.provider_module == binding["identities"]["provider"]["module"],
         "provider module mismatch",
     )
-    output = args.output.resolve()
-    output.mkdir(mode=0o700, parents=True, exist_ok=False)
     # An entirely private process-local home contains all default screenshot paths.
     # No SHOT_DIR override, private provider method, SDK or replay injection.
     previous = {k: os.environ.get(k) for k in ("HOME", "TMPDIR", "DISPLAY")}
@@ -598,7 +608,20 @@ def wait_owned_exit(process, deadline):
 def supervise(args):
     """Bound synchronous worker stalls and reap only an exclusive owned group."""
     require(30 <= args.deadline_seconds <= 900, "invalid overall deadline")
-    command = [sys.executable, "-B", str(Path(__file__).resolve()), "--worker"]
+    # Claim before spawning or reading any inputs. Do not resolve a preexisting
+    # symlink into its target, or write failure receipts into an old directory.
+    output = args.output.absolute()
+    output.mkdir(mode=0o700, parents=True, exist_ok=False)
+    output = output.resolve()
+    output_fd = os.open(output, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    command = [
+        sys.executable,
+        "-B",
+        str(Path(__file__).resolve()),
+        "--worker",
+        "--output-fd",
+        str(output_fd),
+    ]
     for name in (
         "expected",
         "provider",
@@ -616,13 +639,17 @@ def supervise(args):
         command.extend(["--" + name.replace("_", "-"), str(getattr(args, name))])
     started = time.monotonic()
     deadline = started + args.deadline_seconds
-    process = subprocess.Popen(
-        command,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
+    try:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            pass_fds=(output_fd,),
+        )
+    finally:
+        os.close(output_fd)
     supervision = {
         "worker_pid": process.pid,
         "process_group": process.pid,
@@ -650,9 +677,6 @@ def supervise(args):
                 break
             time.sleep(0.02)
     supervision["elapsed_seconds"] = time.monotonic() - started
-    output = args.output.resolve()
-    if not output.exists():
-        output.mkdir(mode=0o700, parents=True)
     (output / "supervisor.json").write_text(json.dumps(supervision, indent=2) + "\n")
     passed = (
         process.returncode == 0
@@ -676,6 +700,7 @@ def supervise(args):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--output-fd", type=int, help=argparse.SUPPRESS)
     parser.add_argument("--expected", type=Path, required=True)
     parser.add_argument("--provider", required=True, help="opaque binding id")
     parser.add_argument("--provider-module", required=True)
@@ -702,10 +727,19 @@ def main(argv=None):
 
         async def bounded():
             # Cancellation reaches run's finally with an explicit cleanup reserve.
-            return await asyncio.wait_for(run(args), args.deadline_seconds - 15)
+            try:
+                return await asyncio.wait_for(
+                    run(args, output_fd=args.output_fd), args.deadline_seconds - 15
+                )
+            finally:
+                os.close(args.output_fd)
 
+        require(
+            args.worker or args.output_fd is None, "output descriptor is worker-only"
+        )
         if args.worker:
             require(os.getpgid(0) == os.getpid(), "worker must own an exclusive group")
+            require(args.output_fd is not None, "worker requires inherited output")
             status = asyncio.run(bounded())
         else:
             status = supervise(args)

@@ -478,7 +478,10 @@ def test_runner_cleanup_only_owned_process(monkeypatch):
     assert runner.stop_owned(None) == "absent"
 
 
-def test_runner_failed_run_record_no_display_or_network(control, monkeypatch):
+@pytest.mark.parametrize("preclaimed", [False, True])
+def test_runner_failed_run_record_no_display_or_network(
+    control, monkeypatch, preclaimed
+):
     # Deliberate pre-display identity failure. No key is read by a real provider,
     # no Session/display is started, and the receipt cannot pass any live gate.
     _, expected, root = control
@@ -505,13 +508,117 @@ def test_runner_failed_run_record_no_display_or_network(control, monkeypatch):
     def fail(*args):
         raise nq.QualificationError("intentional unit-control identity rejection")
 
+    def no_spawn(*args, **kwargs):
+        pytest.fail("identity failure must not start a display or provider")
+
     monkeypatch.setattr(runner, "verify_identity", fail)
-    assert asyncio.run(runner.run(args)) == "FAIL"
+    monkeypatch.setattr(runner.subprocess, "Popen", no_spawn)
+    if preclaimed:
+        args.output.mkdir(mode=0o700)
+        fd = os.open(args.output, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            assert asyncio.run(runner.run(args, output_fd=fd)) == "FAIL"
+        finally:
+            os.close(fd)
+    else:
+        assert asyncio.run(runner.run(args)) == "FAIL"
     value = nq.load_json(args.output / "session.json")
     assert value["status"] == "FAIL"
     assert value["captures"] == [] and value["observations"]["owned_display"] is None
     assert not any(value["observations"]["public_bounds"]["calls"].values())
     assert os.environ.get("HOME") == old_home
+
+
+@pytest.mark.parametrize(
+    "kind", ["directory", "file", "symlink", "dangling-symlink", "receipt-symlinks"]
+)
+def test_runner_existing_output_preserved_without_worker(tmp_path, monkeypatch, kind):
+    old = tmp_path / "old"
+    old.mkdir()
+    save(old / "session.json", {"status": "PASS", "observations": {}})
+    save(old / "supervisor.json", {"old": "supervisor"})
+    (old / "sentinel").write_bytes(b"preserve\x00sentinel")
+    outside = tmp_path / "outside"
+    outside.write_bytes(b"preserve symlink target")
+    (old / "linked-receipt").symlink_to(outside)
+    if kind == "receipt-symlinks":
+        for name in ("session.json", "supervisor.json"):
+            target = tmp_path / ("original-" + name)
+            (old / name).rename(target)
+            (old / name).symlink_to(target)
+    output = tmp_path / "output"
+    if kind in {"directory", "receipt-symlinks"}:
+        output = old
+    elif kind == "file":
+        output.write_bytes(b"existing output file")
+    else:
+        output.symlink_to(old if kind == "symlink" else tmp_path / "missing")
+    before = {p.name: p.read_bytes() for p in old.iterdir()}
+    output_bytes = output.read_bytes() if kind == "file" else None
+    entries = sorted(p.name for p in tmp_path.iterdir())
+
+    def no_spawn(*args, **kwargs):
+        pytest.fail("existing output must fail before Popen")
+
+    monkeypatch.setattr(runner.subprocess, "Popen", no_spawn)
+    args = Namespace(
+        output=output,
+        deadline_seconds=30,
+        expected=tmp_path / "missing-expected.json",
+        count_policy=tmp_path / "missing-policy.json",
+        provider="opaque",
+        provider_module="unit_provider",
+        model="unit-model",
+        keyenv="UNIT_CONTROL_ENV",
+        xvfb="must-not-start",
+        max_complete=2,
+        max_budget=2,
+        max_estimate=2,
+    )
+    # Inputs are deliberately absent: rejection precedes worker/input reads.
+    with pytest.raises(FileExistsError):
+        runner.supervise(args)
+    assert {p.name: p.read_bytes() for p in old.iterdir()} == before
+    assert outside.read_bytes() == b"preserve symlink target"
+    assert (old / "linked-receipt").is_symlink()
+    if kind == "receipt-symlinks":
+        assert all(
+            (old / name).is_symlink() for name in ("session.json", "supervisor.json")
+        )
+    assert sorted(p.name for p in tmp_path.iterdir()) == entries
+    if kind == "file":
+        assert output.read_bytes() == output_bytes
+    elif kind in {"symlink", "dangling-symlink"}:
+        assert output.is_symlink()
+        assert output.readlink() == (old if kind == "symlink" else tmp_path / "missing")
+
+
+@pytest.mark.parametrize("kind", ["different-directory", "symlink", "file"])
+def test_runner_worker_rejects_unowned_output(tmp_path, monkeypatch, kind):
+    owned = tmp_path / "owned"
+    owned.mkdir(mode=0o700)
+    output = tmp_path / "output"
+    if kind == "different-directory":
+        output.mkdir()
+    elif kind == "symlink":
+        output.symlink_to(owned)
+    else:
+        output.write_bytes(b"not a directory")
+        owned = output
+    fd = os.open(owned, os.O_RDONLY)
+    before = sorted(p.name for p in tmp_path.iterdir())
+
+    def no_spawn(*args, **kwargs):
+        pytest.fail("unowned worker output must fail before Popen")
+
+    monkeypatch.setattr(runner.subprocess, "Popen", no_spawn)
+    try:
+        with pytest.raises(nq.QualificationError, match="inherited directory"):
+            asyncio.run(runner.run(Namespace(output=output), output_fd=fd))
+    finally:
+        os.close(fd)
+    assert sorted(p.name for p in tmp_path.iterdir()) == before
+    assert not (output / "session.json").exists()
 
 
 @pytest.mark.parametrize(
@@ -590,12 +697,15 @@ def test_runner_outer_purity_and_generation_only_projection(control):
     calls.restore()
 
 
-def test_runner_supervisor_timeout_is_owned_and_fail_closed(tmp_path, monkeypatch):
+@pytest.mark.parametrize("timed_out", [False, True])
+def test_runner_supervisor_timeout_is_owned_and_fail_closed(
+    tmp_path, monkeypatch, timed_out
+):
     events = []
 
     class Worker:
         pid = 222
-        returncode = -9
+        returncode = -9 if timed_out else 0
         waits = 0
 
         def wait(self, timeout):
@@ -607,6 +717,15 @@ def test_runner_supervisor_timeout_is_owned_and_fail_closed(tmp_path, monkeypatc
 
     def spawn(command, **kwargs):
         assert "--worker" in command and kwargs["start_new_session"] is True
+        output = Path(command[command.index("--output") + 1])
+        fd = int(command[command.index("--output-fd") + 1])
+        assert kwargs["pass_fds"] == (fd,)
+        assert output.is_dir() and list(output.iterdir()) == []
+        assert output.stat().st_mode & 0o777 == 0o700
+        assert os.path.samestat(os.fstat(fd), output.stat())
+        if not timed_out:
+            # Synthetic worker result only; not a genuine Session/live receipt.
+            save(output / "session.json", {"status": "PASS", "observations": {}})
         events.append("spawn")
         return Worker()
 
@@ -619,7 +738,9 @@ def test_runner_supervisor_timeout_is_owned_and_fail_closed(tmp_path, monkeypatc
 
     monkeypatch.setattr(runner.subprocess, "Popen", spawn)
     monkeypatch.setattr(runner.os, "killpg", kill_group)
-    monkeypatch.setattr(runner, "wait_owned_exit", lambda process, deadline: False)
+    monkeypatch.setattr(
+        runner, "wait_owned_exit", lambda process, deadline: not timed_out
+    )
     args = Namespace(
         expected="unit-control",
         provider="opaque",
@@ -634,9 +755,13 @@ def test_runner_supervisor_timeout_is_owned_and_fail_closed(tmp_path, monkeypatc
         max_budget=2,
         max_estimate=2,
     )
-    assert runner.supervise(args) == "FAIL"
+    assert runner.supervise(args) == ("FAIL" if timed_out else "PASS")
     observed = nq.load_json(args.output / "supervisor.json")
-    assert observed["timed_out"] is True and observed["group_absent"] is True
+    assert observed["timed_out"] is timed_out and observed["group_absent"] is True
+    if not timed_out:
+        result = nq.load_json(args.output / "session.json")
+        assert result["status"] == "PASS"
+        assert result["observations"]["supervision"] == observed
     assert events == ["spawn", "kill-owned-group", "reap"]
 
 
