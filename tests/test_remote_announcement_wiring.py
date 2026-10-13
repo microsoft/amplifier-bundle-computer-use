@@ -392,7 +392,7 @@ def test_mount_never_builds_the_announcement_even_when_it_would_be_refused(
     import asyncio
 
     coordinator = _FakeCoordinator()
-    result = asyncio.get_event_loop().run_until_complete(cu.mount(coordinator, {}))
+    result = asyncio.run(cu.mount(coordinator, {}))
 
     assert coordinator.mounted == ["computer", "desktop"], (
         "mount() must mount both tools unconditionally - refusal is no "
@@ -431,9 +431,7 @@ def test_first_execute_closes_the_backend_when_announcement_is_refused(monkeypat
 
     import asyncio
 
-    result = asyncio.get_event_loop().run_until_complete(
-        tool.execute({"action": "screenshot"})
-    )
+    result = asyncio.run(tool.execute({"action": "screenshot"}))
 
     assert result.success is False
     assert backend.closed is True, (

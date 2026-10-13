@@ -138,7 +138,11 @@ checked as history, not current qualification. The active release consumer requi
 `neutral-qualification-expected.json`, with safe relative receipts/captures under
 that evidence root. Missing, failed, future, older-than-30-day, tampered, wrong-profile
 or unbound evidence fails; historical HTTP 200 is never a fallback.
-**Fresh live qualification remains UNMET under Root until genuine evidence exists.**
+The committed qualification is a bounded observation, not a permanent release grant:
+run the active consumer against its expected bindings and refresh genuinely expired
+or changed-package evidence. Native live cases are screenshot-only; the owned Linux
+X11 approval-policy case verifies byte-exact alphanumeric input, not general text
+fidelity or other platforms. A successful later check never relabels an earlier failure.
 Provider owners supply native declaration/result/replay and actual wire settings,
 finite generation/count HTTP limits and retry observations independently. The neutral
 recorder does not inspect protocol fields or certify truth from hashes/model names.
@@ -148,7 +152,7 @@ receipts are mandatory. Floor qualification is explicitly offline-only. Each bin
 includes actually loaded Core/provider/SDK/tool/hook/loop/context Python manifests;
 producer script digests and production manifests bind final source without fixture
 or HEAD hash recursion. Providers/models are opaque outside provider-owned checks.
-Root owns normal-installed combined checks and remaining live/hardware decisions.
+The independent verifier owns normal-installed combined checks and remaining live/hardware decisions.
 
 ### Public neutral reproduction (test-only)
 
@@ -191,12 +195,22 @@ source-provenance, configuration/transport-bound and actual mounted-run checks.
 False requires affirmative continuation-disabled proof; `"N/A"` requires both knob
 and same-output feature absence, never silence. Source provenance must include a source
 ref matching the bound provider Python manifest; mounted-run refs must be observations.
-Root independently admits relevance and truth against public source/configuration and the monitored
+The independent verifier independently admits relevance and truth against public source/configuration and the monitored
 public-mounted run; hashes, owner strings and PASS do not authenticate claims, and
 an unrelated injected-client run is invalid. Count retries remain separately bounded
 provider-owned policy; actual HTTP bounds/outcomes are still mandatory, and observed
 zero retries do not prove disabled configuration. Absent proof cannot produce a live
 PASS. Sanitize receipt bytes before hashing; only this owned desktop's pixels are allowed.
+Published evidence uses consistent service-ID aliases and opaque positive-integer
+process-role tokens, not actual host OS PIDs. The accompanying identifier-projection
+observation explicitly distinguishes those tokens from privately verified originals,
+retains high-entropy original-wire hash commitments and an independent-verifier
+attestation for the private session, and omits opaque encrypted reasoning content.
+Original session digests are not published: their removed process numbers have low
+entropy and a public unsalted digest would permit offline recovery guesses.
+Published artifact hashes bind the projected bytes; outcome, capture, package, budget
+and timestamp observations are unchanged. Sanitization must never invent an execution
+or convert a failed observation into a pass.
 Failure produces a failed/partial receipt after setup; no observation is backfilled.
 Default finally cleanup uses the public Session/provider lifecycle, ignores hook
 mount metadata that is not a cleanup callable, and closes Tk/backend/Xvfb. A separate
@@ -215,7 +229,7 @@ Unit controls in `tests/test_neutral_qualification.py` are explicitly synthetic,
 created only in temporary test directories, and rejected by the default release
 validator. They prove consumer/controller behavior, not actual wire/GUI acceptance.
 The implementation-only focused tests may pass while the whole freshness gate is
-RED pending Root's genuine qualification; do not skip/weaken that release gate.
+RED pending The independent verifier's genuine qualification; do not skip/weaken that release gate.
 
 Focused headless composition requires real qualified provider wheels and SDKs with HTTP
 intercepted, never optional SDK skips or private provenance injection:

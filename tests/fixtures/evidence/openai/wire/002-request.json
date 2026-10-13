@@ -1,0 +1,27 @@
+{
+  "model": "gpt-5.5",
+  "include": [
+    "reasoning.encrypted_content"
+  ],
+  "input": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "On this isolated owned test desktop, take exactly one screenshot using the desktop tool. Use no other operation. Read and report the alphanumeric receipt code visible in that screenshot."
+        }
+      ]
+    }
+  ],
+  "max_output_tokens": 1200,
+  "parallel_tool_calls": true,
+  "prompt_cache_retention": "24h",
+  "store": false,
+  "tool_choice": "auto",
+  "tools": [
+    {
+      "type": "computer"
+    }
+  ]
+}

@@ -129,11 +129,15 @@ completed and uncertain progress without rollback/replay. A successful final obs
 requires a full terminal screenshot or one new full capture; earlier/zoom images do not
 satisfy it. Errors are not concealed by recapture.
 
-**Fresh live provider wire qualification remains UNMET under Root.** Historical captures
-and `tests/fixtures/wire-check.json` dates/results are retained, not refreshed.
+Fresh qualification is checked by the active neutral fixture consumer against exact
+package bindings and a 30-day freshness window. Historical captures and
+`tests/fixtures/wire-check.json` dates/results are retained, not refreshed;
 `scripts/wire_check.py` is historical bundle-dialect tooling, not a neutral-v1 ship gate.
-Providers own live qualification; Root owns independent normal-installed combined
-checks and remaining live/hardware gates. Offline SDK composition is not release proof.
+The current native live cases are screenshot-only on owned Linux X11. Approved input
+policy is qualified with exact alphanumeric input, not general text fidelity or other
+platforms. Providers supply native evidence; the independent release verifier checks
+combined installed-package and hardware evidence. Offline SDK composition alone is
+not release proof.
 
 ---
 

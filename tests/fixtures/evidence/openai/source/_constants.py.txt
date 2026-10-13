@@ -1,0 +1,111 @@
+"""Constants for OpenAI provider.
+
+This module defines constants used across the OpenAI provider implementation,
+following the principle of single source of truth.
+"""
+
+# Metadata keys for OpenAI Responses API state
+# These keys are namespaced with "openai:" to prevent collisions with other providers
+METADATA_RESPONSE_ID = "openai:response_id"
+METADATA_STATUS = "openai:status"
+METADATA_INCOMPLETE_REASON = "openai:incomplete_reason"
+METADATA_REASONING_ITEMS = "openai:reasoning_items"
+METADATA_CONTINUATION_COUNT = "openai:continuation_count"
+# Hosted `tool_search_call` / `tool_search_output` output items, captured
+# verbatim so they can be replayed into `input` on the next request. Per
+# `TS:854`, dropping a `tool_search_output` item makes every tool it loaded
+# cease to exist for the model AND breaks the cache forward -- so these ride
+# the same provider-state channel the encrypted-reasoning items already use.
+METADATA_TOOL_SEARCH_ITEMS = "openai:tool_search_items"
+# {call_id: namespace} for `function_call` items the model emitted from inside
+# a namespace. MEASURED ON THE WIRE 2026-09-06: replaying such a call WITHOUT
+# its namespace is HTTP 400 -- "Missing namespace for function_call 'glob'. It
+# does not exist in the default namespace. Round-trip the model's function_call
+# item with its namespace field included." The design assumed passing `name`
+# through unchanged was sufficient; it is sufficient for DISPATCH and not for
+# the ROUND TRIP.
+METADATA_TOOL_CALL_NAMESPACES = "openai:tool_call_namespaces"
+
+# Default configuration values
+# Default follows the current Sol family. Explicit operator pins are unchanged.
+# Routing bundles choose their own tiers; this provider default does not lift
+# a downstream matrix's deliberate Sol pause.
+DEFAULT_MODEL = "gpt-6.1-sol"
+DEFAULT_MAX_TOKENS = 4096
+DEFAULT_REASONING_SUMMARY = "detailed"
+DEFAULT_DEBUG_TRUNCATE_LENGTH = 180
+DEFAULT_TIMEOUT = None  # Wait for completion unless the caller selects a deadline.
+# `None` (omit the field) is the cache-friendly default. OpenAI's
+# `truncation="auto"` silently drops oldest messages when context fills,
+# which rewrites the cached prefix and busts prompt caching — listed on
+# OpenAI's caching-troubleshooting checklist as a top cause of low hit
+# rates. With `None`, the API errors loudly on overflow instead of
+# silently degrading. Opt back into the old behavior with
+# `config={"truncation": "auto"}`.
+DEFAULT_TRUNCATION: str | None = None
+
+# Default prompt-cache retention. OpenAI's per-model server-side default
+# is "in_memory" (5–10 min) for gpt-5.4 and below, "24h" for gpt-5.5+.
+# Forcing "24h" everywhere stabilizes cache lifetime across the curated
+# model list. Models that reject "in_memory" are gated by
+# `ModelCapabilities.supports_in_memory_retention`.
+DEFAULT_PROMPT_CACHE_RETENTION: str | None = "24h"
+
+# Maximum number of continuation attempts for incomplete responses
+# This prevents infinite loops while being generous enough for legitimate large responses
+MAX_CONTINUATION_ATTEMPTS = 5
+
+# Deep research / background mode constants
+DEFAULT_POLL_INTERVAL = 5.0  # seconds between status polls
+DEFAULT_BACKGROUND_TIMEOUT = None
+
+# Ceiling on how long close() waits for the HTTP client to shut down.
+# An httpx transport with a wedged connection can leave AsyncOpenAI.close()
+# pending indefinitely; without a bound, that hangs session cleanup for the
+# whole process. See OpenAIProvider.close().
+DEFAULT_CLOSE_TIMEOUT = 5.0  # seconds
+
+# Native tool types that should be passed through to OpenAI without conversion
+# These are OpenAI-hosted tools, not user-defined function tools
+#
+# `computer` (OpenAI's computer-use tool) is unusual among this set: live
+# Responses API traffic against gpt-5.6 confirms it accepts *zero* declaration
+# fields. `{"type": "computer"}` alone -> 200. Adding any of `display_width`,
+# `display_height`, `environment`, or `display_width_px` -> 400
+# "Unknown parameter" (the opposite of Anthropic's `computer_20251124`, which
+# *requires* `display_width_px`/`display_height_px`). See
+# `_convert_tools_from_request` for where this is enforced.
+NATIVE_TOOL_TYPES = frozenset(
+    {
+        "web_search_preview",
+        "web_search_preview_2025_03_11",
+        "web_search",
+        "file_search",
+        "code_interpreter",
+        "apply_patch",
+        "computer",
+    }
+)
+
+# Deep research model aliases. Dated snapshots (e.g. o3-deep-research-2026-XX-XX)
+# are matched by the `startswith` checks at every consumer, so enumerating them
+# here is redundant AND goes stale -- the two 2025-06-26 entries removed here had
+# outlived their snapshots.
+DEEP_RESEARCH_MODELS = frozenset({"o3-deep-research", "o4-mini-deep-research"})
+
+# Background response status values
+BACKGROUND_STATUS_QUEUED = "queued"
+BACKGROUND_STATUS_IN_PROGRESS = "in_progress"
+BACKGROUND_STATUS_SEARCHING = "searching"
+BACKGROUND_STATUS_COMPLETED = "completed"
+BACKGROUND_STATUS_FAILED = "failed"
+BACKGROUND_STATUS_CANCELLED = "cancelled"
+
+# Non-terminal statuses that require continued polling
+BACKGROUND_POLLING_STATUSES = frozenset(
+    {
+        BACKGROUND_STATUS_QUEUED,
+        BACKGROUND_STATUS_IN_PROGRESS,
+        BACKGROUND_STATUS_SEARCHING,
+    }
+)

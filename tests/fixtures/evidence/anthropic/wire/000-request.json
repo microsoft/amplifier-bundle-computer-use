@@ -1,0 +1,76 @@
+{
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "On this isolated owned test desktop, take exactly one screenshot using the desktop tool. Use no other operation. Read and report the alphanumeric receipt code visible in that screenshot."
+        }
+      ]
+    }
+  ],
+  "model": "claude-sonnet-5-5",
+  "tool_choice": {
+    "type": "auto",
+    "disable_parallel_tool_use": true
+  },
+  "tools": [
+    {
+      "type": "computer_toolset_20260801",
+      "configs": {
+        "cursor_position": {
+          "enabled": false
+        },
+        "double_click": {
+          "enabled": false
+        },
+        "hold_key": {
+          "enabled": false
+        },
+        "key": {
+          "enabled": false
+        },
+        "left_click": {
+          "enabled": false
+        },
+        "left_click_drag": {
+          "enabled": false
+        },
+        "left_mouse_down": {
+          "enabled": false
+        },
+        "left_mouse_up": {
+          "enabled": false
+        },
+        "middle_click": {
+          "enabled": false
+        },
+        "mouse_move": {
+          "enabled": false
+        },
+        "right_click": {
+          "enabled": false
+        },
+        "screenshot": {
+          "enabled": true
+        },
+        "scroll": {
+          "enabled": false
+        },
+        "triple_click": {
+          "enabled": false
+        },
+        "type": {
+          "enabled": false
+        },
+        "wait": {
+          "enabled": false
+        },
+        "zoom": {
+          "enabled": false
+        }
+      }
+    }
+  ]
+}

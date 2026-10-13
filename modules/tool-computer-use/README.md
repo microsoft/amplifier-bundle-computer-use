@@ -26,5 +26,7 @@ cannot authorize local image reads.
 Providers own model/endpoint support, native declarations, vendor unit translation,
 safety requirements and replay. The companion hook projects copied generic histories.
 Physical scaling, monitor origins, private capture storage, held-input cleanup and SSH
-transport remain local mechanisms. Fresh live provider wire qualification is **UNMET
-under Root**; retained historical evidence does not qualify neutral v1.
+transport remain local mechanisms. Fresh, bounded qualification is checked through
+`tests/fixtures/neutral-qualification.json` and its expected package bindings.
+Retained historical evidence does not qualify neutral v1; expired or mismatched
+current evidence fails the release consumer.

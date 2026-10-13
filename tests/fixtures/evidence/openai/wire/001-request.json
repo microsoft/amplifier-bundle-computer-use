@@ -1,0 +1,21 @@
+{
+  "model": "gpt-5.5",
+  "input": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "On this isolated owned test desktop, take exactly one screenshot using the desktop tool. Use no other operation. Read and report the alphanumeric receipt code visible in that screenshot."
+        }
+      ]
+    }
+  ],
+  "parallel_tool_calls": true,
+  "tool_choice": "auto",
+  "tools": [
+    {
+      "type": "computer"
+    }
+  ]
+}

@@ -37,4 +37,6 @@ fail closed.
 Headless tests retain historical screenshot bytes and exercise real qualified provider
 SDKs through intercepted HTTP, without optional skips or private provenance seeding.
 This is offline composition evidence, not endpoint or desktop acceptance.
-Fresh live provider wire qualification remains **UNMET under Root**.
+Fresh live provider wire qualification is represented separately by the bounded
+neutral qualification fixtures and their active expiry/package-binding checks.
+The live native cases are screenshot-only, not general-operation or platform proof.
