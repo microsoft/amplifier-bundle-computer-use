@@ -182,11 +182,21 @@ value. Import and `--help` are offline and never provision a display.
 The producer records observed public `complete`/`request_budget`/`estimate` invocation
 counts (absent public methods have zero observations), **not physical HTTP counts**.
 Generation retries zero and auto-continue false are requested through public mount
-config; effective wire delivery remains UNKNOWN in this producer. Count retries are
-separately bounded provider-owned policy, not controlled by generation max_retries.
-The consumer additionally requires independently observed effective controls and
-HTTP bounds/outcomes; absent observations cannot produce a live PASS. All receipt
-bytes must be sanitized before hashing. Only this owned desktop's pixels are allowed.
+config; effective wire delivery remains UNKNOWN in this producer. The consumer requires
+provider-owned `generation_controls`: outer retries exactly zero, transport retries
+bounded to zero or two (two is not disabled), and auto-continue false or `"N/A"`.
+Safe hashed provider proof envelopes bind exact packages/source/profile and timestamps
+within the provider receipt, with positive public mount/factory/generation-path,
+source-provenance, configuration/transport-bound and actual mounted-run checks.
+False requires affirmative continuation-disabled proof; `"N/A"` requires both knob
+and same-output feature absence, never silence. Source provenance must include a source
+ref matching the bound provider Python manifest; mounted-run refs must be observations.
+Root independently admits relevance and truth against public source/configuration and the monitored
+public-mounted run; hashes, owner strings and PASS do not authenticate claims, and
+an unrelated injected-client run is invalid. Count retries remain separately bounded
+provider-owned policy; actual HTTP bounds/outcomes are still mandatory, and observed
+zero retries do not prove disabled configuration. Absent proof cannot produce a live
+PASS. Sanitize receipt bytes before hashing; only this owned desktop's pixels are allowed.
 Failure produces a failed/partial receipt after setup; no observation is backfilled.
 Default finally cleanup uses the public Session/provider lifecycle, ignores hook
 mount metadata that is not a cleanup callable, and closes Tk/backend/Xvfb. A separate

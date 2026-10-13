@@ -35,6 +35,51 @@ def save(path, value):
     path.write_text(json.dumps(value) + "\n", encoding="utf-8")
 
 
+def generation_proof(root, binding, transport=0, continuation=False):
+    """Temporary synthetic controls only; not Root-admitted mounted-run proof."""
+    values = {
+        "outer_max_retries": 0,
+        "transport_max_retries": transport,
+        "auto_continue": continuation,
+    }
+    observed = nq.artifact(root, "unit-control.log", "observation")
+    source = nq.artifact(root, "unit-provider.py", "source")
+    names = [
+        "public_mount",
+        "public_factory",
+        "generation_call_path",
+        "source_provenance",
+        "outer_configuration",
+        "transport_bound",
+        "mounted_run_binding",
+    ]
+    names += (
+        ["continuation_disabled"]
+        if continuation is False
+        else ["continuation_knob_absent", "same_output_feature_absent"]
+    )
+    proof = {
+        "schema": 1,
+        "owner": "provider",
+        "binding": copy.deepcopy(binding),
+        "started_at": (NOW - timedelta(seconds=20)).isoformat(),
+        "finished_at": (NOW - timedelta(seconds=2)).isoformat(),
+        "controls": values,
+        "checks": {
+            name: {
+                "passed": True,
+                "refs": [source if name == "source_provenance" else observed],
+            }
+            for name in names
+        },
+    }
+    save(root / "unit-generation-proof.json", proof)
+    return {
+        **values,
+        "proof_refs": [nq.artifact(root, "unit-generation-proof.json", "provider")],
+    }
+
+
 @pytest.fixture
 def control(tmp_path):
     # Freshness time is fixed for deterministic UNIT CONTROL tests, not a live date.
@@ -51,6 +96,12 @@ def control(tmp_path):
             "manifest": {"__init__.py": DIGEST},
         }
         for r in nq.IDENTITY_ROLES
+    }
+    (tmp_path / "unit-provider.py").write_bytes(
+        b"# SYNTHETIC UNIT CONTROL ONLY; no actual provider source.\n"
+    )
+    packages["provider"]["manifest"] = {
+        "__init__.py": nq.sha256(tmp_path / "unit-provider.py")
     }
     producer = {"revision": REVISION, "scripts": {"unit-control.py": DIGEST}}
     bindings = [
@@ -144,8 +195,7 @@ def control(tmp_path):
                 "attempt_timeout_seconds": 5,
                 "retry_outcomes": ["synthetic-bounded-retry"],
             },
-            "generation_retries": 0,
-            "auto_continue": False,
+            "generation_controls": generation_proof(tmp_path, bindings[0]),
             "count_policy": policy,
             "evidence": evidence,
         },
@@ -199,6 +249,18 @@ def change_receipt(control, owner, change):
     change(value)
     save(path, value)
     ref["sha256"] = nq.sha256(path)
+
+
+def change_generation_proof(control, change):
+    def edit(value):
+        ref = value["observations"]["generation_controls"]["proof_refs"][0]
+        path = control[2] / ref["path"]
+        proof = nq.load_json(path)
+        change(proof)
+        save(path, proof)
+        ref["sha256"] = nq.sha256(path)
+
+    change_receipt(control, "provider", edit)
 
 
 def test_unit_controls_pass_only_explicit_test_validator(control):
@@ -312,7 +374,9 @@ def test_receipt_negative_controls(control, case):
         change_receipt(
             control,
             "provider",
-            lambda v: v["observations"].update(generation_retries="UNKNOWN"),
+            lambda v: v["observations"]["generation_controls"].update(
+                transport_max_retries="UNKNOWN"
+            ),
         )
     elif case == "history":
         change_receipt(
@@ -341,6 +405,309 @@ def test_receipt_negative_controls(control, case):
             ),
         )
     with pytest.raises(nq.QualificationError):
+        validate_control(control)
+
+
+@pytest.mark.parametrize(
+    "transport,continuation", [(0, False), (2, False), (0, "N/A"), (2, "N/A")]
+)
+def test_generation_controls_supported_positive_bound_proof(
+    control, transport, continuation
+):
+    change_receipt(
+        control,
+        "provider",
+        lambda v: v["observations"].update(
+            generation_controls=generation_proof(
+                control[2], v["binding"], transport, continuation
+            )
+        ),
+    )
+    assert validate_control(control)
+    document, expected, root = control
+    with pytest.raises(nq.QualificationError, match="genuine"):
+        nq.validate(document, expected, NOW, evidence_root=root)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("outer_max_retries", False),
+        ("outer_max_retries", 1),
+        ("outer_max_retries", None),
+        ("transport_max_retries", True),
+        ("transport_max_retries", 1),
+        ("transport_max_retries", -1),
+        ("transport_max_retries", None),
+        ("transport_max_retries", "UNKNOWN"),
+        ("transport_max_retries", float("inf")),
+        ("auto_continue", 0),
+        ("auto_continue", True),
+        ("auto_continue", None),
+        ("auto_continue", "UNKNOWN"),
+        ("proof_refs", []),
+        ("proof_refs", None),
+    ],
+)
+def test_generation_controls_invalid_values_fail(control, field, value):
+    change_receipt(
+        control,
+        "provider",
+        lambda v: v["observations"]["generation_controls"].update({field: value}),
+    )
+    with pytest.raises(nq.QualificationError):
+        validate_control(control)
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["outer_max_retries", "transport_max_retries", "auto_continue", "proof_refs"],
+)
+def test_generation_controls_missing_fields_fail(control, field):
+    change_receipt(
+        control,
+        "provider",
+        lambda v: v["observations"]["generation_controls"].pop(field),
+    )
+    with pytest.raises(nq.QualificationError, match="malformed generation controls"):
+        validate_control(control)
+
+
+@pytest.mark.parametrize("where", ["observations", "generation_controls"])
+def test_generation_controls_extra_fields_fail(control, where):
+    def edit(value):
+        target = value["observations"]
+        if where == "generation_controls":
+            target = target[where]
+        target["generation_retries"] = 0
+
+    change_receipt(control, "provider", edit)
+    with pytest.raises(nq.QualificationError, match="malformed"):
+        validate_control(control)
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["schema", "owner", "binding", "started_at", "finished_at", "controls", "checks"],
+)
+def test_generation_proof_missing_fields_fail(control, field):
+    change_generation_proof(control, lambda v: v.pop(field))
+    with pytest.raises(nq.QualificationError, match="malformed generation proof"):
+        validate_control(control)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "extra",
+        "schema_bool",
+        "wrong_owner",
+        "wrong_provider",
+        "wrong_profile",
+        "wrong_source",
+        "wrong_package",
+        "extra_binding",
+        "controls_extra",
+        "controls_missing",
+        "controls_bool",
+        "controls_mismatch",
+        "continuation_mismatch",
+        "extra_check",
+        "wrong_variant",
+        "metadata_only",
+        "unbound_source",
+        "source_only_run",
+        "unrelated_injected_package",
+    ],
+)
+def test_generation_proof_semantic_mismatches_fail(control, case):
+    def edit(proof):
+        if case == "extra":
+            proof["status"] = "PASS"
+        elif case == "schema_bool":
+            proof["schema"] = True
+        elif case == "wrong_owner":
+            proof["owner"] = "session"
+        elif case == "wrong_provider":
+            proof["binding"]["provider"] = "unrelated-injected-run"
+        elif case == "wrong_profile":
+            proof["binding"]["profile"] = "floor"
+            proof["binding"]["mode"] = "offline"
+        elif case == "unrelated_injected_package":
+            proof["binding"]["identities"]["sdk"]["version"] = "injected-client-only"
+        elif case == "wrong_source":
+            proof["binding"]["source"]["unrelated.py"] = DIGEST
+        elif case == "wrong_package":
+            proof["binding"]["identities"]["provider"]["manifest"]["other.py"] = DIGEST
+        elif case == "extra_binding":
+            proof["binding"]["injected_client"] = True
+        elif case == "controls_extra":
+            proof["controls"]["proof_refs"] = []
+        elif case == "controls_missing":
+            proof["controls"].pop("outer_max_retries")
+        elif case == "controls_bool":
+            proof["controls"]["transport_max_retries"] = False
+        elif case == "controls_mismatch":
+            proof["controls"]["transport_max_retries"] = 2
+        elif case == "continuation_mismatch":
+            proof["controls"]["auto_continue"] = "N/A"
+        elif case == "extra_check":
+            proof["checks"]["unrelated"] = {"passed": True, "refs": []}
+        elif case == "wrong_variant":
+            proof["checks"]["continuation_knob_absent"] = proof["checks"].pop(
+                "continuation_disabled"
+            )
+        elif case == "metadata_only":
+            proof["checks"]["source_provenance"]["refs"] = [
+                nq.artifact(control[2], "unit-control.log", "observation")
+            ]
+        elif case == "unbound_source":
+            proof["checks"]["source_provenance"]["refs"] = [
+                nq.artifact(control[2], "unit-control.log", "source")
+            ]
+        else:
+            proof["checks"]["mounted_run_binding"]["refs"] = [
+                nq.artifact(control[2], "unit-provider.py", "source")
+            ]
+
+    change_generation_proof(control, edit)
+    with pytest.raises(nq.QualificationError):
+        validate_control(control)
+
+
+@pytest.mark.parametrize(
+    "start,end",
+    [
+        (-31 * 86400, -2),
+        (-20, 1),
+        (-2, -20),
+        (-26, -2),
+        (-20, 0),
+        ("2026-10-13T11:59:40", -2),
+        ("not a timestamp", -2),
+    ],
+)
+def test_generation_proof_freshness_and_receipt_enclosure_fail(control, start, end):
+    def edit(proof):
+        proof["started_at"] = (
+            start
+            if isinstance(start, str)
+            else (NOW + timedelta(seconds=start)).isoformat()
+        )
+        proof["finished_at"] = (NOW + timedelta(seconds=end)).isoformat()
+
+    change_generation_proof(control, edit)
+    with pytest.raises(nq.QualificationError):
+        validate_control(control)
+
+
+@pytest.mark.parametrize("continuation", [False, "N/A"])
+@pytest.mark.parametrize(
+    "case", ["missing", "failed", "nonboolean", "empty_refs", "extra", "missing_refs"]
+)
+def test_generation_proof_every_required_check_fail_closed(control, continuation, case):
+    change_receipt(
+        control,
+        "provider",
+        lambda v: v["observations"].update(
+            generation_controls=generation_proof(
+                control[2], v["binding"], 0, continuation
+            )
+        ),
+    )
+    document, expected, root = control
+    baseline = copy.deepcopy(document)
+    provider_ref = next(
+        r for r in document["rows"][0]["artifacts"] if r["kind"] == "provider"
+    )
+    provider = nq.load_json(root / provider_ref["path"])
+    proof_ref = provider["observations"]["generation_controls"]["proof_refs"][0]
+    original = nq.load_json(root / proof_ref["path"])
+    for name in original["checks"]:
+        # Every required check must independently reject; rehash all envelope layers.
+        save(root / proof_ref["path"], original)
+        save(root / provider_ref["path"], provider)
+        document.clear()
+        document.update(copy.deepcopy(baseline))
+
+        def edit(proof, name=name):
+            check = proof["checks"][name]
+            if case == "missing":
+                proof["checks"].pop(name)
+            elif case == "failed":
+                check["passed"] = False
+            elif case == "nonboolean":
+                check["passed"] = 1
+            elif case == "empty_refs":
+                check["refs"] = []
+            elif case == "extra":
+                check["status"] = "PASS"
+            else:
+                check.pop("refs")
+
+        change_generation_proof((document, expected, root), edit)
+        with pytest.raises(nq.QualificationError):
+            validate_control((document, expected, root))
+
+
+@pytest.mark.parametrize("level", ["proof", "check"])
+@pytest.mark.parametrize(
+    "case",
+    [
+        "missing",
+        "tamper",
+        "digest",
+        "unsafe",
+        "empty_path",
+        "bad_kind",
+        "missing_field",
+        "extra_field",
+    ],
+)
+def test_generation_proof_all_reference_paths_fail(control, level, case):
+    def edit_ref(ref):
+        if case == "missing":
+            ref["path"] = "missing.json"
+        elif case == "tamper":
+            (control[2] / ref["path"]).write_bytes(b"tampered")
+        elif case == "digest":
+            ref["sha256"] = "not a digest"
+        elif case == "unsafe":
+            ref["path"] = "../escape"
+        elif case == "empty_path":
+            ref["path"] = ""
+        elif case == "bad_kind":
+            ref["kind"] = "status-only"
+        elif case == "missing_field":
+            ref.pop("kind")
+        else:
+            ref["status"] = "PASS"
+
+    if level == "proof":
+        change_receipt(
+            control,
+            "provider",
+            lambda v: edit_ref(
+                v["observations"]["generation_controls"]["proof_refs"][0]
+            ),
+        )
+    else:
+        change_generation_proof(
+            control, lambda v: edit_ref(v["checks"]["transport_bound"]["refs"][0])
+        )
+    with pytest.raises(nq.QualificationError):
+        validate_control(control)
+
+
+def test_generation_controls_validate_every_proof_not_any(control):
+    def edit(value):
+        refs = value["observations"]["generation_controls"]["proof_refs"]
+        bad = copy.deepcopy(refs[0])
+        bad["kind"] = "unrelated"
+        refs.append(bad)
+
+    change_receipt(control, "provider", edit)
+    with pytest.raises(nq.QualificationError, match="wrong generation proof kind"):
         validate_control(control)
 
 

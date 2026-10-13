@@ -303,7 +303,137 @@ def public_bounds_check(value):
     )
 
 
-def observations_check(owner, value, captures):
+def generation_controls_check(
+    controls,
+    *,
+    binding,
+    evidence_root,
+    now,
+    receipt_started_at,
+    receipt_finished_at,
+):
+    """Check bound provider proof, not its truth: Root independently admits claims.
+
+    Source bytes must match the provider manifest. Root verifies their relevance,
+    configuration and actual public-mounted run; hashes/PASS do not authenticate
+    those facts, and an unrelated injected-client run is not admissible evidence.
+    """
+    names = {"outer_max_retries", "transport_max_retries", "auto_continue"}
+    object_keys(controls, names | {"proof_refs"}, "generation controls")
+    require(
+        type(controls["outer_max_retries"]) is int
+        and controls["outer_max_retries"] == 0
+        and type(controls["transport_max_retries"]) is int
+        and controls["transport_max_retries"] in {0, 2}
+        and (
+            controls["auto_continue"] is False
+            or (
+                type(controls["auto_continue"]) is str
+                and controls["auto_continue"] == "N/A"
+            )
+        ),
+        "missing effective generation controls",
+    )
+    require(
+        isinstance(controls["proof_refs"], list) and bool(controls["proof_refs"]),
+        "missing generation controls proof",
+    )
+    required = {
+        "public_mount",
+        "public_factory",
+        "generation_call_path",
+        "source_provenance",
+        "outer_configuration",
+        "transport_bound",
+        "mounted_run_binding",
+    }
+    required |= (
+        {"continuation_disabled"}
+        if controls["auto_continue"] is False
+        else {"continuation_knob_absent", "same_output_feature_absent"}
+    )
+    for ref in controls["proof_refs"]:
+        path = reference_check(ref, evidence_root)
+        require(ref["kind"] == "provider", "wrong generation proof kind")
+        proof = load_json(path)
+        object_keys(
+            proof,
+            {
+                "schema",
+                "owner",
+                "binding",
+                "started_at",
+                "finished_at",
+                "controls",
+                "checks",
+            },
+            "generation proof",
+        )
+        binding_check(proof["binding"])
+        require(
+            type(proof["schema"]) is int
+            and proof["schema"] == 1
+            and proof["owner"] == "provider"
+            and proof["binding"] == binding,
+            "generation proof binding mismatch",
+        )
+        start = timestamp(proof["started_at"], now)
+        end = timestamp(proof["finished_at"], now)
+        require(
+            receipt_started_at <= start <= end <= receipt_finished_at,
+            "generation proof outside receipt or disordered",
+        )
+        object_keys(proof["controls"], names, "proven controls")
+        require(
+            all(
+                type(proof["controls"][k]) is type(controls[k])
+                and proof["controls"][k] == controls[k]
+                for k in names
+            ),
+            "generation proof controls mismatch",
+        )
+        object_keys(proof["checks"], required, "generation proof checks")
+        for name, check in proof["checks"].items():
+            object_keys(check, {"passed", "refs"}, "generation proof check")
+            require(
+                check["passed"] is True
+                and isinstance(check["refs"], list)
+                and bool(check["refs"]),
+                "missing or failed generation proof check",
+            )
+            source_bound = False
+            for evidence in check["refs"]:
+                reference_check(evidence, evidence_root)
+                require(
+                    isinstance(evidence["kind"], str)
+                    and evidence["kind"] in {"source", "observation"},
+                    "wrong generation evidence kind",
+                )
+                if name == "mounted_run_binding":
+                    require(
+                        evidence["kind"] == "observation",
+                        "missing mounted run observation",
+                    )
+                source_bound |= (
+                    evidence["kind"] == "source"
+                    and evidence["sha256"]
+                    in binding["identities"]["provider"]["manifest"].values()
+                )
+            if name == "source_provenance":
+                require(source_bound, "missing bound provider source evidence")
+
+
+def observations_check(
+    owner,
+    value,
+    captures,
+    *,
+    binding,
+    evidence_root,
+    now,
+    receipt_started_at,
+    receipt_finished_at,
+):
     if owner == "session":
         object_keys(
             value,
@@ -404,8 +534,7 @@ def observations_check(owner, value, captures):
                 "observer",
                 "generation",
                 "count",
-                "generation_retries",
-                "auto_continue",
+                "generation_controls",
                 "count_policy",
                 "evidence",
             },
@@ -415,11 +544,13 @@ def observations_check(owner, value, captures):
             isinstance(value["observer"], str) and bool(value["observer"]),
             "missing independent provider observer",
         )
-        require(
-            value["generation_retries"] == 0
-            and type(value["generation_retries"]) is int
-            and value["auto_continue"] is False,
-            "missing effective generation controls",
+        generation_controls_check(
+            value["generation_controls"],
+            binding=binding,
+            evidence_root=evidence_root,
+            now=now,
+            receipt_started_at=receipt_started_at,
+            receipt_finished_at=receipt_finished_at,
         )
         for kind in ("generation", "count"):
             object_keys(
@@ -682,7 +813,16 @@ def validate(document, expected, now=None, *, evidence_root, allow_test_controls
                     and len({v["sha256"] for v in data["captures"]}) >= 2,
                     "missing distinct adjacent captures",
                 )
-            observations_check(ref["kind"], data["observations"], data["captures"])
+            observations_check(
+                ref["kind"],
+                data["observations"],
+                data["captures"],
+                binding=row["binding"],
+                evidence_root=evidence_root,
+                now=now,
+                receipt_started_at=start,
+                receipt_finished_at=end,
+            )
             if ref["kind"] in {"session", "provider"}:
                 bounds = data["observations"].get("public_bounds", data["observations"])
                 count_policies.append(bounds["count_policy"])
