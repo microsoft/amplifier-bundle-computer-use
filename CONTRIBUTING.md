@@ -132,13 +132,80 @@ acceptance. The credential-bearing command below is historical guidance only:
 ANTHROPIC_API_KEY=... OPENAI_API_KEY=... .venv/bin/python scripts/wire_check.py
 ```
 
-`tests/fixtures/wire-check.json` and historical captures remain unchanged. Existing
-offline freshness checks keep the stale-attestation release warning visible.
-**Fresh live wire qualification transfers to the providers and remains UNMET under
-Root.** Provider-owned qualification must establish the final native declarations,
-results and replay for the released combination. Offline tests, dialect deletion and
-old HTTP 200 records do not satisfy this gate. Root owns normal-installed combined
-checks and the remaining live/hardware release decisions.
+`tests/fixtures/wire-check.json` and historical captures remain unchanged and are
+checked as history, not current qualification. The active release consumer requires
+`tests/fixtures/neutral-qualification.json` and independently established
+`neutral-qualification-expected.json`, with safe relative receipts/captures under
+that evidence root. Missing, failed, future, older-than-30-day, tampered, wrong-profile
+or unbound evidence fails; historical HTTP 200 is never a fallback.
+**Fresh live qualification remains UNMET under Root until genuine evidence exists.**
+Provider owners supply native declaration/result/replay and actual wire settings,
+finite generation/count HTTP limits and retry observations independently. The neutral
+recorder does not inspect protocol fields or certify truth from hashes/model names.
+For each configured provider, current/live Session and independent provider/policy
+receipts plus exact current/offline and floor/offline installed SDK/composition
+receipts are mandatory. Floor qualification is explicitly offline-only. Each binding
+includes actually loaded Core/provider/SDK/tool/hook/loop/context Python manifests;
+producer script digests and production manifests bind final source without fixture
+or HEAD hash recursion. Providers/models are opaque outside provider-owned checks.
+Root owns normal-installed combined checks and remaining live/hardware decisions.
+
+### Public neutral reproduction (test-only)
+
+`scripts/qualify_neutral_session.py` uses public provider `mount`, Core Session and
+ModuleLoader, canonical capture, and the production image hook. It starts exactly one
+owned Xvfb using `-displayfd`, refuses ambient DISPLAY, renders fresh undisclosed
+markers, and checks two actual adjacent Session cycles retaining image history. Its
+native declaration is a **restricted screenshot-only test**, not evidence that a
+full-operation tool selects native semantics. Captures come from actual tool results;
+no private SDK/client/replay seeding or source-path provider injection is permitted.
+Use normal installed reviewed packages, not editable provider/Core/SDK dependencies.
+Provide an independently established expected binding, public module name, opaque
+model, key environment **name** (the key value remains only in the environment), and
+provider-owned count policy/provenance. No credential is accepted as a CLI/config
+value. Import and `--help` are offline and never provision a display.
+
+```bash
+.venv/bin/python scripts/qualify_neutral_session.py --help
+# Run ONLY in a deliberately owned Linux X11 test environment, with no ambient DISPLAY.
+.venv/bin/python scripts/qualify_neutral_session.py \
+  --expected qualification-expected.json --provider PROVIDER_ID \
+  --provider-module PUBLIC_MODULE --model MODEL --keyenv CALLER_KEY_ENV \
+  --count-policy provider-owned-count-policy.json --output private-new-run \
+  --max-complete 6 --max-budget 12 --max-estimate 12 --deadline-seconds 240
+.venv/bin/python scripts/neutral_qualification.py record rows.json \
+  qualification-expected.json --output neutral-qualification.json
+.venv/bin/python scripts/neutral_qualification.py validate neutral-qualification.json \
+  qualification-expected.json --evidence-root qualification-evidence
+```
+
+The producer records observed public `complete`/`request_budget`/`estimate` invocation
+counts (absent public methods have zero observations), **not physical HTTP counts**.
+Generation retries zero and auto-continue false are requested through public mount
+config; effective wire delivery remains UNKNOWN in this producer. Count retries are
+separately bounded provider-owned policy, not controlled by generation max_retries.
+The consumer additionally requires independently observed effective controls and
+HTTP bounds/outcomes; absent observations cannot produce a live PASS. All receipt
+bytes must be sanitized before hashing. Only this owned desktop's pixels are allowed.
+Failure produces a failed/partial receipt after setup; no observation is backfilled.
+Default finally cleanup uses the public Session/provider lifecycle, ignores hook
+mount metadata that is not a cleanup callable, and closes Tk/backend/Xvfb. A separate
+CLI supervisor bounds synchronous stalls in an exclusive owned worker process group;
+Xvfb/helpers inherit that group. It observes worker exit with WNOWAIT before its final
+owned-group signal, then reaps and checks group absence. The consumer requires this
+final supervision record, so an interim worker receipt cannot satisfy acceptance.
+Generation image observations are distinct from count/budget observations. Caller
+purity is observed outside the production hook's lazy public event projection, while
+an inner observer checks the projected request. All teardown waits use the overall
+deadline; no ambient/human process group is signalled. The private
+output retains owned captures/receipts for inspection; the caller owns their eventual
+removal. No foreign process sweep, persistent display, or host installation is needed.
+
+Unit controls in `tests/test_neutral_qualification.py` are explicitly synthetic,
+created only in temporary test directories, and rejected by the default release
+validator. They prove consumer/controller behavior, not actual wire/GUI acceptance.
+The implementation-only focused tests may pass while the whole freshness gate is
+RED pending Root's genuine qualification; do not skip/weaken that release gate.
 
 Focused headless composition requires real qualified provider wheels and SDKs with HTTP
 intercepted, never optional SDK skips or private provenance injection:
