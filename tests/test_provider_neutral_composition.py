@@ -18,6 +18,7 @@ from amplifier_core.message_models import ChatRequest, Message, ToolSpec
 from amplifier_module_provider_anthropic import AnthropicProvider
 from amplifier_module_provider_openai import OpenAIProvider
 from anthropic import AsyncAnthropic
+from jsonschema import validate
 from openai import AsyncOpenAI
 from test_neutral_computer import (
     CLICK,
@@ -28,6 +29,113 @@ from test_neutral_computer import (
     run,
 )
 from test_neutral_computer import computer as computer
+
+
+@pytest.mark.parametrize("provider_name", ["anthropic", "openai"])
+def test_public_provider_complete_transmits_ordinary_schema_unchanged(
+    computer, provider_name, tmp_path
+):
+    schema = computer.input_schema
+    request = ChatRequest(
+        messages=[Message(role="user", content="ordinary function schema")],
+        tools=[
+            ToolSpec(
+                name="my_desktop", description=computer.description, parameters=schema
+            )
+        ],
+    )
+    original = copy.deepcopy(request.model_dump())
+    seen = []
+    http = httpx if provider_name == "openai" else httpx2
+
+    def respond(wire_request):
+        body = json.loads(wire_request.content)
+        if (
+            "input_tokens" in wire_request.url.path
+            or "count_tokens" in wire_request.url.path
+        ):
+            return http.Response(200, json={"input_tokens": 1})
+        seen.append(body)
+        declaration = body["tools"][0]
+        transmitted = declaration[
+            "parameters" if provider_name == "openai" else "input_schema"
+        ]
+        assert declaration["name"] == "my_desktop"
+        assert transmitted == schema
+        validate(CLICK, transmitted)
+        validate(batch(CLICK), transmitted)
+        if provider_name == "openai":
+            reply = {
+                "id": "schema-response",
+                "object": "response",
+                "created_at": 0,
+                "status": "completed",
+                "model": "gpt-5.5",
+                "output": [],
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            }
+        else:
+            reply = {
+                "id": "schema-message",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-sonnet-5-5",
+                "content": [{"type": "text", "text": "observed"}],
+                "stop_reason": "end_turn",
+                "stop_sequence": None,
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            }
+        return http.Response(200, json=reply)
+
+    async def scenario():
+        http_client = http.AsyncClient(transport=http.MockTransport(respond))
+        config = {
+            "use_streaming": False,
+            "max_retries": 0,
+            "auto_continue": False,
+            "rate_limit_state_path": str(tmp_path / "rate-limit.json"),
+        }
+        if provider_name == "openai":
+            sdk = AsyncOpenAI(
+                api_key="offline-test", http_client=http_client, max_retries=0
+            )
+            provider = OpenAIProvider(
+                api_key="offline-test",
+                client=sdk,
+                config={
+                    **config,
+                    "default_model": "gpt-5.5",
+                    "tool_search": {"mode": "off"},
+                },
+            )
+        else:
+            sdk = AsyncAnthropic(
+                api_key="offline-test", http_client=http_client, max_retries=0
+            )
+            provider = AnthropicProvider(
+                api_key="offline-test",
+                config={**config, "default_model": "claude-sonnet-5-5"},
+            )
+            provider._client = sdk
+        try:
+            await provider.complete(request)
+            assert len(seen) == 1
+            assert request.model_dump() == original
+            assert computer._backend.calls == []
+            disclosed = []
+            computer._ensure_announced = lambda: disclosed.append(True)
+            for bad in ({}, {**CLICK, "version": 1}, {"actions": [CLICK]}):
+                original_bad = copy.deepcopy(bad)
+                result = await computer.execute(bad)
+                assert not result.success
+                assert computer._backend.calls == []
+                assert disclosed == []
+                assert bad == original_bad
+                assert request.model_dump() == original
+        finally:
+            await sdk.close()
+
+    run(scenario())
 
 
 @pytest.mark.parametrize(

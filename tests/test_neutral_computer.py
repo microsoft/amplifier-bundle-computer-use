@@ -15,6 +15,7 @@ from types import SimpleNamespace
 import pytest
 from amplifier_core.coordinator import ModuleCoordinator
 from amplifier_core.message_models import ToolSpec
+from jsonschema import ValidationError, validate
 from PIL import Image
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -104,6 +105,95 @@ def batch(*actions, capture=True):
 
 
 CLICK = {"action": "left_click", "coordinate": [20, 30]}
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        CLICK,
+        {"action": "screenshot"},
+        {"action": "key", "text": "down", "repeat": 2},
+        {"action": "scroll", "direction": "down", "amount": 0},
+        {"action": "zoom", "region": [0, 0, 30, 40]},
+        batch(CLICK),
+        batch(CLICK, capture=False),
+    ],
+)
+def test_public_schema_accepts_flat_aliases_and_complete_batches(computer, payload):
+    original = copy.deepcopy(payload)
+    spec = ToolSpec(
+        name="my_desktop",
+        description=computer.description,
+        parameters=computer.input_schema,
+        **computer.native_tool_spec,
+    )
+    validate(payload, spec.model_dump()["parameters"])
+    result = run(computer.execute(payload))
+    assert result.success, result.error
+    assert computer._backend.calls
+    assert payload == original
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"text": "missing action"},
+        *[
+            {key: value for key, value in batch(CLICK).items() if key != missing}
+            for missing in ("version", "actions", "capture_after")
+        ],
+        *[{key: batch(CLICK)[key]} for key in ("version", "actions", "capture_after")],
+        *[
+            {"action": "screenshot", key: value}
+            for key, values in (
+                ("version", (1, None, "malformed")),
+                ("actions", ([CLICK], None, [])),
+                ("capture_after", (True, False, None)),
+            )
+            for value in values
+        ],
+        {**batch(CLICK), "action": "screenshot"},
+        {**batch(CLICK), "text": "flat-only root key"},
+        {**batch(CLICK), "unexpected": None},
+        {**batch(CLICK), "version": 2},
+        {**batch(CLICK), "actions": []},
+        {**batch(CLICK), "actions": [{}]},
+        {**batch(CLICK), "capture_after": 1},
+    ],
+)
+def test_runtime_rejects_empty_mixed_incomplete_and_extra_roots(computer, payload):
+    # Root-shape enforcement belongs to runtime, even if a schema also rejects it.
+    # Do not require future schemas to accept these malformed combinations.
+    original = copy.deepcopy(payload)
+    disclosed = []
+    computer._ensure_announced = lambda: disclosed.append(True)
+    result = run(computer.execute(payload))
+    assert not result.success
+    assert computer._backend.calls == []
+    assert disclosed == []
+    assert payload == original
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"action": "screenshot", "version": None},
+        {"action": "screenshot", "version": "malformed"},
+        {"action": "screenshot", "actions": None},
+        {"action": "screenshot", "actions": []},
+        {"action": "screenshot", "capture_after": None},
+        {**batch(CLICK), "version": 2},
+        {**batch(CLICK), "actions": []},
+        {**batch(CLICK), "actions": [{}]},
+        {**batch(CLICK), "capture_after": 1},
+    ],
+)
+def test_public_schema_retains_type_const_and_nested_item_constraints(
+    computer, payload
+):
+    with pytest.raises(ValidationError):
+        validate(payload, computer.input_schema)
 
 
 async def core_coordinator(computer, provider=None, *, max_inline=3):

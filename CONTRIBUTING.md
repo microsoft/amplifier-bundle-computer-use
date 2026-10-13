@@ -28,10 +28,24 @@ Python packages, and the test suite imports them by inserting each module's path
 
 ```bash
 # from the repo root
-uv venv
+uv venv --python 3.12
 uv pip install -e modules/tool-computer-use -e modules/hook-computer-use
-uv pip install amplifier-core pytest pytest-asyncio
+uv pip install -r tests/requirements.txt "anthropic==1.13.0" "openai==3.29.0"
+uv pip check
 ```
+
+CI uses the same mandatory `tests/requirements.txt`, including both providers pinned
+to merged Git commits, the directly imported HTTP clients, and JSON Schema validation.
+The SDK versions are test-only pins, not production dependency changes:
+
+| Python | Anthropic SDK | OpenAI SDK |
+|---|---|---|
+| 3.11 | 1.0.0 | 2.9.0 |
+| 3.12 | 1.13.0 | 3.29.0 |
+
+To test the floor row, create the venv with `uv venv --python 3.11` and use
+`uv pip install -r tests/requirements.txt "anthropic==1.0.0" "openai==2.9.0"`.
+CI recreates its venv with `uv venv --clear` before installing.
 
 `modules/tool-computer-use`'s own `pyproject.toml` declares `pillow` unconditionally and
 `python-xlib` / `pyobjc-framework-Quartz` behind `sys_platform` markers, so the editable
@@ -58,11 +72,11 @@ This project uses [Ruff](https://docs.astral.sh/ruff/) for both formatting and l
 configured in the root `ruff.toml`.
 
 ```bash
-uvx ruff format --check .
-uvx ruff check .
+uvx ruff@0.16.1 format --check .
+uvx ruff@0.16.1 check .
 ```
 
-Run `uvx ruff format .` (no `--check`) to auto-format, and `uvx ruff check --fix .` to
+Run `uvx ruff@0.16.1 format .` (no `--check`) to auto-format, and `uvx ruff@0.16.1 check --fix .` to
 apply safe auto-fixes, before committing.
 
 ### The ship gate
@@ -104,6 +118,9 @@ Production computer-use exports neutral v1 intent and executes canonical actions
 Providers own models, native declarations/headers, vendor units, safety requirements
 and replay. Do not import SDKs, probe private provider methods or infer intent from
 tool names in the production tool/hook.
+
+The advertised input schema is a guide. Runtime validation enforces flat-versus-batch
+exclusivity and validates the entire batch before any disclosure or desktop input.
 
 `scripts/wire_check.py` is a retained historical instrument for the retired bundle
 dialects, **not the neutral-v1 qualification path**. Do not run it to manufacture fresh

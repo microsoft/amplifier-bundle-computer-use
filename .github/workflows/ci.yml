@@ -21,7 +21,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12"]
+        include:
+          - python-version: "3.11"
+            anthropic-version: "1.0.0"
+            openai-version: "2.9.0"
+          - python-version: "3.12"
+            anthropic-version: "1.13.0"
+            openai-version: "3.29.0"
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -41,7 +47,8 @@ jobs:
       - name: Install modules and test dependencies
         run: |
           uv pip install -e modules/tool-computer-use -e modules/hook-computer-use
-          uv pip install amplifier-core pytest pytest-asyncio
+          uv pip install -r tests/requirements.txt "anthropic==${{ matrix.anthropic-version }}" "openai==${{ matrix.openai-version }}"
+          uv pip check
 
       - name: Run tests
         run: .venv/bin/python -m pytest tests/ -q

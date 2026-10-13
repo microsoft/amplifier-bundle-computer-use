@@ -1,0 +1,9 @@
+# Mandatory headless test/composition dependencies; SDK pins live in the CI matrix.
+amplifier-core
+pytest
+pytest-asyncio
+httpx
+httpx2
+jsonschema
+git+https://github.com/microsoft/amplifier-module-provider-anthropic@9f9c50c040a2d5f4f24e2f7b9d196d30bf54608b
+git+https://github.com/microsoft/amplifier-module-provider-openai@38fee172673d196ba54b5e99e434490b86290c5d
