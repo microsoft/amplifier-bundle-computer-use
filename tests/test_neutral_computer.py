@@ -467,6 +467,14 @@ class Coordinator:
     def __init__(self, tool, interactive=False):
         self.tools = {"my_desktop": tool}
         self.interactive = interactive
+        self.selected = "Allow"
+        self.approval_requests = []
+        self.approval_system = self
+
+    async def request_approval(self, prompt, options, timeout, default):
+        self.approval_requests.append((prompt, options, timeout, default))
+        selected, self.selected = self.selected, "Deny"
+        return selected
 
     def get(self, category, name=None):
         if category == "tools":
@@ -480,9 +488,9 @@ class Coordinator:
 @pytest.mark.parametrize(
     "interactive, unattended, expected",
     [
-        (False, False, "deny"),
-        (True, False, "ask_user"),
-        (False, True, "continue"),
+        (False, False, False),
+        (True, False, True),
+        (False, True, True),
     ],
 )
 def test_nested_write_gate_alias_and_exact_batch_failsafe(
@@ -493,28 +501,147 @@ def test_nested_write_gate_alias_and_exact_batch_failsafe(
     coord = Coordinator(computer, interactive)
     gate = hook._make_gate_handler(coord, unattended_writes_ok=unattended)
     result = run(gate("tool:pre", {"tool_name": "my_desktop", "tool_input": payload}))
-    assert result.action == expected
-    if expected == "deny":
+    assert result.action == "continue"  # installation is not authorization
+    if not expected:
         assert not run(computer.execute(payload)).success
         assert computer._backend.calls == []
     else:
         assert run(computer.execute(payload)).success
-        if expected == "ask_user":
-            assert result.approval_default == "deny"
+        if interactive:
+            assert coord.approval_requests[0][3] == "deny"
             assert not run(computer.execute(payload)).success  # consumed
 
 
 def test_approval_for_different_batch_cannot_authorize_input(computer):
     computer._gate_writes = True
-    gate = hook._make_gate_handler(Coordinator(computer, True))
+    coord = Coordinator(computer, True)
+    gate = hook._make_gate_handler(coord)
     assert (
         run(
             gate("tool:pre", {"tool_name": "my_desktop", "tool_input": batch(CLICK)})
         ).action
-        == "ask_user"
+        == "continue"
     )
+    assert run(computer.execute(batch(CLICK))).success
+    computer._backend.calls.clear()
     assert not run(computer.execute(batch({"action": "key", "text": "enter"}))).success
     assert computer._backend.calls == []
+
+
+@pytest.mark.parametrize("flat", [False, True])
+@pytest.mark.parametrize(
+    "change", ["caller", "backend", "read_only", "gate", "geometry", "approval_policy"]
+)
+def test_pending_approval_pins_payload_target_and_policy(computer, flat, change):
+    computer._gate_writes = True
+    backend = computer._backend
+    coord = Coordinator(computer, True)
+    gate = hook._make_gate_handler(coord)
+    payload = (
+        copy.deepcopy(CLICK) if flat else batch(copy.deepcopy(CLICK), capture=False)
+    )
+
+    async def scenario():
+        started, release = asyncio.Event(), asyncio.Event()
+
+        class Pending:
+            async def request_approval(self, prompt, options, timeout, default):
+                started.set()
+                await release.wait()
+                return "Allow"
+
+        coord.approval_system = Pending()
+        await gate("tool:pre", {"tool_name": "my_desktop"})
+        task = asyncio.create_task(computer.execute(payload))
+        await asyncio.wait_for(started.wait(), 2)
+        if change == "caller":
+            params = payload if flat else payload["actions"][0]
+            params["coordinate"][:] = [40, 50]
+        elif change == "backend":
+            computer._backend = Backend()
+        elif change == "read_only":
+            computer._read_only = True
+        elif change == "gate":
+            computer._gate_writes = False
+        elif change == "geometry":
+            computer.resolve_display(refresh=True)
+        else:
+            replacement = hook._make_gate_handler(coord, unattended_writes_ok=True)
+            await replacement("tool:pre", {"tool_name": "my_desktop"})
+        release.set()
+        result = await task
+        if change == "caller":
+            assert result.success
+            assert backend.calls == [("click", -1560, 90, "left", 1)]
+            assert params["coordinate"] == [40, 50]  # never overwritten by executor
+        else:
+            assert not result.success
+            assert not backend.calls and not computer._backend.calls
+
+    run(scenario())
+
+
+@pytest.mark.parametrize("flat", [False, True])
+def test_cancelled_approval_cannot_authorize_another_call_and_recovers(computer, flat):
+    computer._gate_writes = True
+    coord = Coordinator(computer, True)
+    gate = hook._make_gate_handler(coord)
+    payload = copy.deepcopy(CLICK) if flat else batch(CLICK, capture=False)
+
+    async def scenario():
+        started = asyncio.Event()
+
+        class Pending:
+            async def request_approval(self, prompt, options, timeout, default):
+                started.set()
+                await asyncio.Future()
+
+        coord.approval_system = Pending()
+        await gate("tool:pre", {"tool_name": "my_desktop"})
+        task = asyncio.create_task(computer.execute(payload))
+        await asyncio.wait_for(started.wait(), 2)
+        task.cancel()
+        if flat:
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            result = await task
+            assert not result.success and result.error["type"] == "CancelledError"
+        assert not computer._backend.calls
+        coord.approval_system = coord
+        coord.selected = "Deny"
+        assert not (await computer.execute(payload)).success
+        assert not computer._backend.calls
+        coord.selected = "Allow"
+        assert (await computer.execute(payload)).success
+        assert len(computer._backend.calls) == 1
+
+    run(scenario())
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"action": "mouse_move"},
+        {"action": "key"},
+        {"action": "type", "text": 4},
+        {"action": "scroll", "direction": "diagonal"},
+        {"action": "left_click", "coordinate": [float("nan"), 2]},
+        {"action": "focus_window"},
+        {"action": "hold_key", "text": "enter", "duration": -1},
+    ],
+)
+def test_flat_malformed_writes_are_validated_before_approval_and_disclosure(
+    computer, bad
+):
+    computer._gate_writes = True
+    coord = Coordinator(computer, True)
+    gate = hook._make_gate_handler(coord)
+    run(gate("tool:pre", {"tool_name": "my_desktop"}))
+    disclosed = []
+    computer._ensure_announced = lambda: disclosed.append(True)
+    assert not run(computer.execute(bad)).success
+    assert not coord.approval_requests and not disclosed and not computer._backend.calls
 
 
 def test_batch_cancellation_reports_uncertainty_no_next_input_and_defers_band_cleanup(

@@ -458,7 +458,38 @@ def _host_approval_possible(coordinator: Any) -> bool:
 
 
 def _make_gate_handler(coordinator: Any, unattended_writes_ok: bool = False):
-    """Keep the existing ask_user/default-deny policy, including nested batch writes."""
+    """Install stable policy, never a shared pre-grant for a pending call."""
+
+    async def approve(prepared: dict[str, Any], binding: Any) -> bool:
+        backend_name = getattr(binding.backend, "name", "?")
+        if not _host_approval_possible(coordinator):
+            if unattended_writes_ok:
+                logger.warning(
+                    "computer-use: unattended_writes_ok=True - auto-ALLOWING write "
+                    "on backend %r with NO interactive approval available and NO "
+                    "human confirmation. Explicit, logged config opt-in, not a default.",
+                    backend_name,
+                )
+                return True
+            raise PermissionError(
+                "gate_writes requires human approval, but no interactive approval "
+                "transport is available (approval.interactive or legacy stdin TTY). "
+                "The write was NOT sent. Run interactively or set hook-computer-use "
+                "'unattended_writes_ok: true' as an explicit, logged opt-in."
+            )
+        approval = getattr(coordinator, "approval_system", None)
+        if approval is None:
+            raise PermissionError("gate_writes requires an available ApprovalSystem")
+        selected = await approval.request_approval(
+            prompt=(
+                f"Computer-use ({backend_name}): allow this exact request on the "
+                f"target desktop?\n{json.dumps(prepared, sort_keys=True)}"
+            ),
+            options=["Allow", "Deny"],
+            timeout=300.0,
+            default="deny",
+        )
+        return isinstance(selected, str) and selected.lower() == "allow"
 
     async def handler(event: str, data: dict[str, Any]) -> HookResult:
         tool_name = (data or {}).get("tool_name")
@@ -467,71 +498,11 @@ def _make_gate_handler(coordinator: Any, unattended_writes_ok: bool = False):
         except Exception:
             return HookResult(action="continue")
         computer = _computer_for_tool(tool, tool_name)
-        if computer is None:
-            return HookResult(action="continue")
-        computer._unattended_writes_ok = unattended_writes_ok
-        computer._interactive_write_approved = False
-        computer._approved_batch_input = None
-        computer._approved_batch_binding = None
-        if not getattr(computer, "_gate_writes", False):
-            return HookResult(action="continue")
-        tool_input = data.get("tool_input") or {}
-        action = tool_input.get("action")
-        batch = "actions" in tool_input
-        if batch:
-            actions = tool_input["actions"]
-            mutating = isinstance(actions, list) and any(
-                isinstance(item, dict) and item.get("action") in _GATE_MUTATING_ACTIONS
-                for item in actions
-            )
-            action = "batch"
-        else:
-            mutating = action in _GATE_MUTATING_ACTIONS
-        if not mutating:
-            return HookResult(action="continue")
-        backend_name = getattr(getattr(computer, "_backend", None), "name", "?")
-        if not _host_approval_possible(coordinator):
-            if unattended_writes_ok:
-                logger.warning(
-                    "computer-use: unattended_writes_ok=True - auto-ALLOWING %s.%s "
-                    "on backend %r with NO interactive approval available and NO "
-                    "human confirmation. Explicit, logged config opt-in, not a default.",
-                    tool_name,
-                    action,
-                    backend_name,
-                )
-                return HookResult(action="continue")
-            return HookResult(
-                action="deny",
-                reason=(
-                    f"action {tool_name}.{action!r} requires human approval "
-                    f"(gate_writes is enabled for backend {backend_name!r}), but "
-                    "no interactive approval transport is available to ask "
-                    "(the app must advertise approval.interactive, or legacy "
-                    "stdin must be a TTY). The write was NOT sent. To proceed: "
-                    "(1) run this session interactively so the approval prompt "
-                    "can be answered, or (2) set hook-computer-use config "
-                    "'unattended_writes_ok: true' to explicitly allow writes on "
-                    "this target with no human confirmation - a deliberate, "
-                    "logged opt-in, never a default."
-                ),
-            )
-        # ask_user blocks execution on decline/timeout. Batch authorization is
-        # exact-payload/target scoped and consumed once by the executor.
-        computer._interactive_write_approved = True
-        if batch:
-            computer._approved_batch_input = copy.deepcopy(tool_input)
-            computer._approved_batch_binding = getattr(computer, "_binding", None)
-        return HookResult(
-            action="ask_user",
-            approval_prompt=(
-                f"Remote computer-use ({backend_name}): allow "
-                f"{tool_name}.{action!r} on the target desktop?"
-            ),
-            approval_options=["Allow", "Deny"],
-            approval_default="deny",
-            reason="gate_writes is enabled for this remote target (\u00a710.4)",
-        )
+        if computer is not None:
+            # Policy/configuration only: every decision is awaited inside execute.
+            computer._write_approval = approve
+            computer._unattended_writes_ok = unattended_writes_ok
+        return HookResult(action="continue")
 
     return handler
 

@@ -121,6 +121,8 @@ tool names in the production tool/hook.
 
 The advertised input schema is a guide. Runtime validation enforces flat-versus-batch
 exclusivity and validates the entire batch before any disclosure or desktop input.
+Write approval belongs to the validated executing call and its pinned target/policy;
+concurrent or later calls must never inherit another call's permission.
 
 `scripts/wire_check.py` is a retained historical instrument for the retired bundle
 dialects, **not the neutral-v1 qualification path**. Do not run it to manufacture fresh

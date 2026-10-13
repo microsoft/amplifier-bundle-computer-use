@@ -8,6 +8,7 @@ These offline traces are NOT fresh wire, model or hardware acceptance.
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 
@@ -29,6 +30,225 @@ from test_neutral_computer import (
     run,
 )
 from test_neutral_computer import computer as computer
+
+
+@pytest.mark.parametrize("shape", ["full_intent_flat", "ordinary_canonical_batch"])
+@pytest.mark.parametrize("same", [False, True])
+@pytest.mark.parametrize("cancel_second", [False, True])
+def test_actual_session_execute_call_local_approval(
+    computer, shape, same, cancel_second, tmp_path
+):
+    """Actual Core Session + installed loop/context + SDK Mock, not native/live proof."""
+    from amplifier_core import AmplifierSession, HookResult, ModuleLoader
+    from test_neutral_computer import cu
+
+    class OrdinaryBatchComputer(cu.ComputerTool):
+        @property
+        def native_tool_spec(self):
+            # Explicit ordinary ToolSpec, recognized by the existing legacy
+            # safety name. Do not claim full-intent OpenAI accepts batch replies.
+            return {}
+
+    tool = (
+        computer
+        if shape == "full_intent_flat"
+        else OrdinaryBatchComputer(computer._backend, {"max_edge": 800})
+    )
+    if tool is not computer:
+        tool.resolve_display()
+    tool._gate_writes = True
+    a = copy.deepcopy(CLICK)
+    b = (
+        copy.deepcopy(CLICK)
+        if same
+        else {"action": "left_click", "coordinate": [40, 50]}
+    )
+    inputs = (
+        [a, b]
+        if shape == "full_intent_flat"
+        else [batch(a, capture=False), batch(b, capture=False)]
+    )
+    original = copy.deepcopy(inputs)
+    trace, requests, caller_pairs = [], [], []
+
+    def respond(request):
+        body = json.loads(request.content)
+        if "input_tokens" in request.url.path:
+            return httpx.Response(200, json={"input_tokens": 100})
+        requests.append(body)
+        if len(requests) == 1:
+            declaration = body["tools"][0]
+            assert declaration["type"] == "function"
+            assert declaration["name"] == "computer"
+            output = [
+                {
+                    "type": "function_call",
+                    "id": f"item{i}",
+                    "call_id": f"call{i}",
+                    "name": "computer",
+                    "arguments": json.dumps(value),
+                    "status": "completed",
+                }
+                for i, value in enumerate(inputs)
+            ]
+        else:
+            output = [
+                {
+                    "type": "message",
+                    "id": "done",
+                    "role": "assistant",
+                    "content": [
+                        {"type": "output_text", "text": "observed", "annotations": []}
+                    ],
+                }
+            ]
+        return httpx.Response(
+            200,
+            json={
+                "id": f"response{len(requests)}",
+                "object": "response",
+                "created_at": 0,
+                "status": "completed",
+                "model": "gpt-5.5",
+                "output": output,
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 20,
+                    "total_tokens": 120,
+                },
+            },
+        )
+
+    async def scenario():
+        allowed_finished = asyncio.Event()
+
+        class Decisions:
+            async def request_approval(self, prompt, options, timeout, default):
+                index = sum(row["stage"] == "approval" for row in trace)
+                trace.append(
+                    {
+                        "stage": "approval",
+                        "ordinal": index,
+                        "prompt": prompt,
+                        "options": options,
+                        "default": default,
+                    }
+                )
+                assert options == ["Allow", "Deny"] and default == "deny"
+                prepared = json.loads(prompt.split("\n", 1)[1])
+                params = (
+                    prepared if shape == "full_intent_flat" else prepared["actions"][0]
+                )
+                allowed = index == 0 if same else params["coordinate"] == [20, 30]
+                if not allowed and cancel_second:
+                    # Observe A actually finished before cancelling the other
+                    # call; do not assume Core schedules SDK output in order.
+                    await asyncio.wait_for(allowed_finished.wait(), 2)
+                    raise asyncio.CancelledError()
+                return "Allow" if allowed else "Deny"
+
+        http_client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+        sdk = AsyncOpenAI(
+            api_key="offline-test", http_client=http_client, max_retries=0
+        )
+        provider = OpenAIProvider(
+            api_key="offline-test",
+            client=sdk,
+            config={
+                "default_model": "gpt-5.5",
+                "use_streaming": False,
+                "auto_continue": False,
+                "tool_search": {"mode": "off"},
+                "rate_limit_state_path": str(tmp_path / "rate-limit.json"),
+            },
+        )
+        session = AmplifierSession(
+            {
+                "session": {
+                    "orchestrator": {
+                        "module": "loop-streaming",
+                        "config": {"max_iterations": 3},
+                    },
+                    "context": {"module": "context-simple"},
+                },
+                "providers": [],
+                "tools": [],
+                "hooks": [],
+            }
+        )
+        coordinator = session.coordinator
+        coordinator.loader = ModuleLoader(coordinator=coordinator)
+        execute = tool.execute
+
+        async def observed(arguments):
+            before = copy.deepcopy(arguments)
+            try:
+                result = await execute(arguments)
+                if result.success:
+                    allowed_finished.set()
+                return result
+            finally:
+                caller_pairs.append((before, copy.deepcopy(arguments)))
+                trace.append({"stage": "execute", "arguments": before})
+
+        async def observe(event, data):
+            trace.append({"stage": event, "data": copy.deepcopy(data)})
+            return HookResult(action="continue")
+
+        tool.execute = observed
+        try:
+            await session.initialize()
+            coordinator.approval_system = Decisions()
+            coordinator.register_capability("approval.interactive", True)
+            await coordinator.mount("providers", provider, name="openai")
+            await coordinator.mount("tools", tool, name="computer")
+            await hook.mount(coordinator, {})
+            coordinator.hooks.register(
+                "tool:pre", observe, priority=1, name="trace-pre"
+            )
+            coordinator.hooks.register(
+                "tool:post", observe, priority=100, name="trace-post"
+            )
+            try:
+                await asyncio.wait_for(
+                    session.execute("Execute two canonical requests."), 10
+                )
+            except asyncio.CancelledError:
+                assert cancel_second
+            except RuntimeError as exc:
+                # Core2's public Session boundary maps coroutine cancellation
+                # to a RuntimeError, rather than preserving CancelledError.
+                assert (
+                    cancel_second
+                    and str(exc).strip() == "Execution failed: CancelledError:"
+                )
+                trace.append({"stage": "session-cancellation", "error": str(exc)})
+            assert sum(row["stage"] == "approval" for row in trace) == 2
+            assert tool._backend.calls == [("click", -1560, 90, "left", 1)]
+            assert inputs == original
+            assert caller_pairs and all(
+                before == after for before, after in caller_pairs
+            )
+            assert len([row for row in trace if row["stage"] == "tool:pre"]) == 2
+        finally:
+            tool.execute = execute
+            await session.cleanup()
+            await sdk.close()
+            (tmp_path / "session-approval-trace.json").write_text(
+                json.dumps(
+                    {
+                        "scope": shape,
+                        "same": same,
+                        "cancel_second": cancel_second,
+                        "events": trace,
+                        "requests": requests,
+                        "caller_pairs": caller_pairs,
+                    },
+                    default=str,
+                )
+            )
+
+    run(scenario())
 
 
 @pytest.mark.parametrize("provider_name", ["anthropic", "openai"])

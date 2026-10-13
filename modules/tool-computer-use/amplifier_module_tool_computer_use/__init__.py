@@ -370,50 +370,11 @@ class ComputerTool:
                     "no confirmation gate. This is a deliberate, logged opt-out, "
                     "not a default."
                 )
-        # `unattended_writes_ok` and `gate_writes` are two answers to the SAME
-        # policy question (\u00a710.4: "gate every write, or gate none") - not two
-        # independent mechanisms. The config knob itself lives in
-        # hook-computer-use (see that module's `mount()` docstring for why:
-        # it is the module that answers `ask_user`/EOF-avoidance too, so it
-        # owns the one place an operator sets it). `hook-computer-use`'s gate
-        # handler syncs the live value onto THIS attribute on every
-        # `tool:pre` call for `computer`/`desktop`, strictly before this
-        # tool's own `execute()` runs for that same call - so by the time
-        # `DesktopTool.execute()`'s fail-safe check reads it below, it
-        # reflects the exact same decision the hook already made, instead of
-        # silently re-deciding and contradicting it. Defaults False: with no
-        # gate hook mounted (or one that has not run yet), this stays False
-        # and the fail-safe denies - never a silent, un-authored escape
-        # hatch.
+        # The hook installs stable policy via the public ApprovalSystem. Decisions
+        # live only in the executing coroutine, never in cross-hook grant slots.
+        self._write_approval: Callable | None = None
+        # Reporting-only configuration for doctor; never execution authority.
         self._unattended_writes_ok: bool = False
-        # A SEPARATE per-call signal from `_unattended_writes_ok` above -
-        # deliberately, not the same flag wearing a second meaning. That one
-        # answers "is nobody at the keyboard, and is that explicitly OK?" -
-        # always False when a human interactively approves via `ask_user`,
-        # since the whole point of that path is a human WAS asked. Reusing
-        # it for the interactive case would make its name lie about which
-        # of the two questions it is answering (see this module's own
-        # incident history: names and return values that did not match
-        # reality). This is the interactive counterpart: "did a human just
-        # grant THIS specific call via `ask_user`?" `hook-computer-use`'s
-        # gate handler resets it to False at the top of every `tool:pre`
-        # call (same unconditional-sync point as `_unattended_writes_ok`,
-        # so a stale True from an earlier approved call can never survive
-        # into a later one), then sets it True only when it is about to
-        # hand this exact call's decision to `ask_user`. That is safe to do
-        # before the human actually answers: `ask_user` is a blocking gate
-        # (`HOOKS_API.md` - priority 2, same tier as `deny`) - if the human
-        # declines or times out, this tool's `execute()` is never called
-        # for that call at all, so no observer ever reads a `True` paired
-        # with a decline. Defaults False: with no gate hook mounted (or one
-        # that has not run yet), this stays False and the fail-safe denies
-        # - same "never a silent, un-authored escape hatch" rule as above.
-        self._interactive_write_approved: bool = False
-        # A batch approval is bound to its exact payload AND target/policy.
-        # The gate supplies this only on its blocking ask_user path; execute
-        # consumes it once. Flat-call compatibility retains the existing flags.
-        self._approved_batch_input: dict[str, Any] | None = None
-        self._approved_batch_binding: _Binding | None = None
         # Per-monitor targeting (see monitors.py): default is "primary", i.e. one
         # real monitor, not the virtual-desktop bounding box around all of them.
         # Set to monitors.VIRTUAL_DESKTOP to opt into the old whole-desktop
@@ -2377,7 +2338,10 @@ class ComputerTool:
                 raise ValueError(
                     f"unknown action {action!r}; expected one of {', '.join(ACTIONS)}"
                 )
-            return [(action, copy.deepcopy(input))], False, False
+            prepared = copy.deepcopy(input)
+            prepared["action"] = action
+            self._validate_batch_action(prepared, binding.display, flat=True)
+            return [(action, prepared)], False, False
         if set(input) != {"version", "actions", "capture_after"}:
             raise ValueError(
                 "v1 batch requires only version, actions and capture_after"
@@ -2402,7 +2366,9 @@ class ComputerTool:
             calls.append((raw["action"], raw))
         return calls, True, input["capture_after"]
 
-    def _validate_batch_action(self, params: Any, display: Display) -> None:
+    def _validate_batch_action(
+        self, params: Any, display: Display | None, *, flat: bool = False
+    ) -> None:
         if not isinstance(params, dict):
             raise ValueError("action must be an object")
         if any(not isinstance(key, str) for key in params):
@@ -2437,7 +2403,7 @@ class ComputerTool:
         if action == "focus_window":
             allowed.add("handle")
         extras = set(params) - allowed
-        if extras:
+        if extras and not flat:
             raise ValueError(f"unsupported parameters for {action!r}: {sorted(extras)}")
 
         def point(value: Any, size: int, label: str) -> None:
@@ -2453,10 +2419,14 @@ class ComputerTool:
                 finite = False
             if not finite:
                 raise ValueError(f"{label} must contain finite numbers")
+            if display is None:
+                raise ValueError("display geometry not resolved")
             for offset in range(0, size, 2):
                 display.to_screen(value[offset], value[offset + 1])
 
         for key in ("coordinate", "start_coordinate", "region"):
+            if flat and key not in allowed:
+                continue
             if key in params:
                 raw = params[key]
                 size = (
@@ -2489,7 +2459,7 @@ class ComputerTool:
             not isinstance(params.get("handle"), str) or not params["handle"]
         ):
             raise ValueError("focus_window requires a nonempty handle")
-        if "duration" in params:
+        if "duration" in allowed and "duration" in params:
             duration = params["duration"]
             if (
                 type(duration) not in (int, float)
@@ -2587,21 +2557,94 @@ class ComputerTool:
                 await asyncio.shield(self._submit_batch_thread(self._band_exit, token))
             raise
 
+    def _disclosed_binding(self, binding: _Binding) -> _Binding:
+        """Accept only first-use announcement lifecycle changes, not new policy."""
+        current = self._binding
+        lifecycle_changed = (
+            current.announcement is not binding.announcement
+            or current.announced != binding.announced
+        )
+        if (
+            (current is not binding and not lifecycle_changed)
+            or current.backend is not binding.backend
+            or current.display is not binding.display
+            or current.current_monitor is not binding.current_monitor
+            or current.coexistence_guard is not binding.coexistence_guard
+            or current
+            != replace(
+                binding, announcement=current.announcement, announced=current.announced
+            )
+        ):
+            raise BackendError("request stopped: target or policy changed")
+        return current
+
+    async def _approve_write(
+        self, prepared: dict[str, Any], binding: _Binding, mutating: bool
+    ) -> Callable | None:
+        if not mutating:
+            return None
+        if binding.read_only:
+            raise PermissionError("write blocked: computer-use is mounted read_only")
+        if not binding.gate_writes:
+            return None
+        approve = self._write_approval
+        if approve is None:
+            raise PermissionError(
+                "gate_writes requires confirmation and no hook-computer-use approval "
+                "callback is installed. The write was NOT sent. Mount the hook with "
+                "interactive approval, or explicitly configure unattended_writes_ok: "
+                "true, or gate_writes: false. See docs/designs/remote-transport.md §10.4."
+            )
+        # Give the callback a separate copy: even the approval transport cannot
+        # rewrite the validated request that will actually execute.
+        allowed = await approve(copy.deepcopy(prepared), binding)
+        if self._write_approval is not approve:
+            raise PermissionError("write stopped: approval policy changed")
+        self._disclosed_binding(binding)
+        if allowed is not True:
+            raise PermissionError("gate_writes approval denied; the write was NOT sent")
+        return approve
+
     async def execute(self, input: dict[str, Any]) -> ToolResult:
         """Run a flat canonical call or one fully prevalidated v1 batch."""
         binding = self._binding
-        approved = (
-            self._interactive_write_approved
-            and self._approved_batch_input == input
-            and self._approved_batch_binding is binding
-        )
-        self._approved_batch_input = None
-        self._approved_batch_binding = None
         try:
             calls, batch, capture_after = self._prepare_calls(input, binding)
         except ValueError as exc:
             return ToolResult(
                 success=False, error={"message": str(exc), "type": "ValueError"}
+            )
+        prepared = (
+            {
+                "version": 1,
+                "actions": [p for _, p in calls],
+                "capture_after": capture_after,
+            }
+            if batch
+            else calls[0][1]
+        )
+        try:
+            approved = await self._approve_write(
+                prepared, binding, any(a in MUTATING for a, _ in calls)
+            )
+            binding = self._disclosed_binding(binding)
+        except asyncio.CancelledError:
+            if not batch:
+                raise
+            return self._batch_result(
+                [],
+                len(calls),
+                error={
+                    "message": "batch cancelled during approval; no input scheduled",
+                    "type": "CancelledError",
+                },
+            )
+        except Exception as exc:
+            error = {"message": str(exc), "type": type(exc).__name__}
+            return (
+                self._batch_result([], len(calls), error=error)
+                if batch
+                else ToolResult(success=False, error=error)
             )
         try:
             await asyncio.to_thread(self._ensure_announced)
@@ -2627,23 +2670,15 @@ class ComputerTool:
                 success=False,
                 error={"message": str(exc), "type": "AnnouncementRefused"},
             )
-        if batch:
-            current = self._binding
-            # First-use disclosure legitimately replaces only these lifecycle
-            # fields. Do not mistake it for a retarget, and do not bless any
-            # concurrent backend/geometry/policy change while disclosure awaited.
-            if current != replace(
-                binding, announcement=current.announcement, announced=current.announced
-            ):
-                return self._batch_result(
-                    [],
-                    len(calls),
-                    error={
-                        "message": "batch stopped during disclosure: target or policy changed",
-                        "type": "BackendError",
-                    },
-                )
-            binding = current
+        try:
+            binding = self._disclosed_binding(binding)
+        except BackendError as exc:
+            error = {"message": str(exc), "type": "BackendError"}
+            return (
+                self._batch_result([], len(calls), error=error)
+                if batch
+                else ToolResult(success=False, error=error)
+            )
         # Band lifetime (docs/designs/band-lifetime.md, Alt A): one raise for
         # the WHOLE call (a batch of N actions is one execute()), lowered in
         # the `finally` below the instant this is the last in-flight
@@ -2745,7 +2780,12 @@ class ComputerTool:
         return None
 
     def _run_key_press(
-        self, params: dict[str, Any], binding: _Binding, index: int, repeat: int
+        self,
+        params: dict[str, Any],
+        binding: _Binding,
+        index: int,
+        repeat: int,
+        approved: Callable | None = None,
     ) -> tuple[str, str | None]:
         """Synchronously check and issue one press against a pinned binding.
 
@@ -2763,10 +2803,15 @@ class ComputerTool:
                 raise BackendError(
                     "action 'key' blocked: computer-use is mounted read_only"
                 )
+            self._check_write("key", binding, approved)
             return self._run("key", params, binding=binding)
 
     async def _run_key_repeat(
-        self, params: dict[str, Any], binding: _Binding, repeat: int
+        self,
+        params: dict[str, Any],
+        binding: _Binding,
+        repeat: int,
+        approved: Callable | None = None,
     ) -> tuple[str, str | None]:
         """Dispatch a logical key repeat one guarded press at a time.
 
@@ -2782,7 +2827,7 @@ class ComputerTool:
         last_image_b64: str | None = None
         for index in range(repeat):
             last_summary, last_image_b64 = await asyncio.to_thread(
-                self._run_key_press, params, binding, index, repeat
+                self._run_key_press, params, binding, index, repeat, approved
             )
             if index + 1 < repeat:
                 # Do not issue the next press in the same event-loop turn:
@@ -2792,29 +2837,47 @@ class ComputerTool:
             last_summary = f"{last_summary} ({repeat} times)"
         return last_summary, last_image_b64
 
+    def _run_flat_step(
+        self,
+        action: str,
+        params: dict[str, Any],
+        binding: _Binding,
+        approved: Callable | None,
+    ) -> tuple[str, str | None]:
+        if not binding.gate_writes:
+            # Preserve ungated local dispatch against its already checked,
+            # pinned backend. It cannot redirect input onto a new binding.
+            return self._run(action, params, binding=binding)
+        with self._announce_lock:
+            self._check_write(action, binding, approved)
+            return self._run(action, params, binding=binding)
+
+    def _check_write(
+        self, action: str, binding: _Binding, approved: Callable | None
+    ) -> None:
+        if self._binding is not binding:
+            raise BackendError("request stopped: target or policy changed")
+        if action in MUTATING or action in MUTATING_DESKTOP:
+            if binding.read_only:
+                raise BackendError("write blocked: computer-use is mounted read_only")
+            if binding.gate_writes and (
+                approved is None or self._write_approval is not approved
+            ):
+                raise BackendError(
+                    "write requires approval for this exact request and target"
+                )
+
     def _run_batch_step(
         self,
         action: str,
         params: dict[str, Any],
         binding: _Binding,
-        approved: bool,
+        approved: Callable | None,
         flight: dict[str, Any],
     ) -> tuple[str, str | None]:
         try:
             with self._announce_lock:
-                if self._binding is not binding:
-                    raise BackendError("batch stopped: target or policy changed")
-                if action in MUTATING:
-                    if binding.read_only:
-                        raise BackendError(
-                            "batch write blocked: computer-use is mounted read_only"
-                        )
-                    if binding.gate_writes and not (
-                        approved or self._unattended_writes_ok
-                    ):
-                        raise BackendError(
-                            "batch write requires approval for this exact batch and target"
-                        )
+                self._check_write(action, binding, approved)
                 outcome = self._run(action, params, binding=binding)
                 with flight["lock"]:
                     flight["outcome"] = outcome
@@ -2839,7 +2902,7 @@ class ComputerTool:
         batch: bool,
         capture_after: bool,
         binding: _Binding,
-        approved: bool,
+        approved: Callable | None,
         flight: dict[str, Any],
         captures: list,
     ) -> ToolResult:
@@ -2861,10 +2924,8 @@ class ComputerTool:
         for index, (action, params) in enumerate(calls):
             presses_completed = 0
             awaiting_step = False
-            if not batch:
-                binding = self._binding
             error = None
-            if batch and self._binding is not binding:
+            if self._binding is not binding:
                 error = {
                     "message": "batch stopped: target or policy changed",
                     "type": "BackendError",
@@ -2873,12 +2934,7 @@ class ComputerTool:
                 error = {
                     "message": f"action {action!r} blocked: computer-use is mounted read_only"
                 }
-            elif (
-                batch
-                and binding.gate_writes
-                and action in MUTATING
-                and not (approved or self._unattended_writes_ok)
-            ):
+            elif binding.gate_writes and action in MUTATING and not approved:
                 error = {
                     "message": "batch write requires approval for this exact batch and target"
                 }
@@ -2903,11 +2959,11 @@ class ComputerTool:
                         summary += f" ({repeat} times)"
                 elif action == "key":
                     summary, image_b64 = await self._run_key_repeat(
-                        params, binding, repeat
+                        params, binding, repeat, approved
                     )
                 else:
                     summary, image_b64 = await asyncio.to_thread(
-                        self._run, action, params, binding=binding
+                        self._run_flat_step, action, params, binding, approved
                     )
             except asyncio.CancelledError:
                 if not batch:
@@ -3316,6 +3372,34 @@ class DesktopTool:
         }
 
     async def execute(self, input: dict[str, Any]) -> ToolResult:
+        if not isinstance(input, dict):
+            return ToolResult(
+                success=False, error={"message": "desktop input must be an object"}
+            )
+        input = copy.deepcopy(input)
+        action = input.get("action")
+        action = action.strip() if isinstance(action, str) else action
+        if action not in DESKTOP_ACTIONS:
+            return ToolResult(
+                success=False, error={"message": f"unknown action {action!r}"}
+            )
+        input["action"] = action
+        binding = self._computer._binding
+        try:
+            if action == "focus_window" and (
+                not isinstance(input.get("handle"), str) or not input["handle"]
+            ):
+                raise ValueError("focus_window requires a nonempty handle")
+            if action == "set_clipboard" and not isinstance(input.get("text"), str):
+                raise ValueError("set_clipboard requires text")
+            approved = await self._computer._approve_write(
+                input, binding, action in MUTATING_DESKTOP
+            )
+            binding = self._computer._disclosed_binding(binding)
+        except Exception as exc:
+            return ToolResult(
+                success=False, error={"message": str(exc), "type": type(exc).__name__}
+            )
         # M3 disclosure-gate exemption (docs/designs/capability-awareness.md
         # \u00a75.4) - dispatched BEFORE `_ensure_announced`, deliberately, and
         # this is the one place in the whole module that is. `doctor` is the
@@ -3376,6 +3460,12 @@ class DesktopTool:
                 success=False,
                 error={"message": str(exc), "type": "AnnouncementRefused"},
             )
+        try:
+            binding = self._computer._disclosed_binding(binding)
+        except BackendError as exc:
+            return ToolResult(
+                success=False, error={"message": str(exc), "type": "BackendError"}
+            )
         # Band lifetime (docs/designs/band-lifetime.md, Alt A): `desktop`
         # shares `computer`'s ComputerTool instance (and therefore its
         # channel), so this participates in the SAME depth counter - a
@@ -3390,11 +3480,13 @@ class DesktopTool:
                 error={"message": str(exc), "type": "AnnouncementRefused"},
             )
         try:
-            return await self._execute_action(input)
+            return await self._execute_action(input, binding=binding, approved=approved)
         finally:
             await asyncio.to_thread(self._computer._band_exit, band_token)
 
-    async def _execute_action(self, input: dict[str, Any]) -> ToolResult:
+    async def _execute_action(
+        self, input: dict[str, Any], *, binding: _Binding, approved: Callable | None
+    ) -> ToolResult:
         """The actual per-action dispatch, unchanged from before band-
         lifetime tracking existed - split out of `execute()` only so that
         method's own `try/finally` around `_band_enter`/`_band_exit` does
@@ -3407,7 +3499,6 @@ class DesktopTool:
                     "message": f"unknown action {action!r}; expected one of {', '.join(DESKTOP_ACTIONS)}"
                 },
             )
-        binding = self._computer._binding
         if binding.read_only and action in _READ_ONLY_BLOCKED:
             return ToolResult(
                 success=False,
@@ -3451,14 +3542,20 @@ class DesktopTool:
                     )
                 return ToolResult(success=True, output=output)
             if action == "set_clipboard":
-                body = str(input.get("text") or "")
+                body = input["text"]
+
                 # Same guard discipline every other mutating action in
                 # `ComputerTool._run` now gets (§2) - `set_clipboard` mutates
                 # target state but is dispatched here, not through `_run`,
                 # so it needs its own explicit wiring rather than inheriting
                 # `_guard_write` for free.
-                with self._computer._guard_write(binding=binding):
-                    await asyncio.to_thread(backend.set_clipboard, body)
+                def set_clipboard():
+                    with self._computer._announce_lock:
+                        self._computer._check_write(action, binding, approved)
+                        with self._computer._guard_write(binding=binding):
+                            backend.set_clipboard(body)
+
+                await asyncio.to_thread(set_clipboard)
                 # §3 audit hardening: digest, never plaintext - the same
                 # discipline `type` uses, since clipboard content is exactly
                 # the kind of thing that "frequently includes credentials."
@@ -3496,50 +3593,8 @@ class DesktopTool:
                         f"{disp.model_width}x{disp.model_height}"
                     ),
                 )
-            if (
-                binding.gate_writes
-                and action in MUTATING_DESKTOP
-                and not self._computer._unattended_writes_ok
-                and not self._computer._interactive_write_approved
-            ):
-                # Fail-safe of last resort: reached only when NOTHING already
-                # granted this write - no gate hook synced
-                # `unattended_writes_ok=True` (the explicit unattended
-                # config opt-in), no gate hook synced
-                # `interactive_write_approved=True` (a human granting THIS
-                # call via `ask_user`), and `gate_writes` was not explicitly
-                # turned off. Every remedy is named here, not just pointed
-                # at - a doc pointer alone has already shipped as an
-                # unreachable-in-the-moment reference three times in this
-                # repo.
-                return ToolResult(
-                    success=False,
-                    error={
-                        "message": (
-                            f"action {action!r} requires confirmation "
-                            "(gate_writes) and nothing granted it: no gate "
-                            "hook is registered (or none has run yet), "
-                            "'unattended_writes_ok' is not set, and "
-                            "'gate_writes' was not explicitly disabled. The "
-                            "write was NOT sent. To proceed, do ONE of: (1) "
-                            "mount hook-computer-use so its 'tool:pre' gate "
-                            "hook can grant approval (interactively via "
-                            "'ask_user', or unattended - see (2)); (2) set "
-                            "hook-computer-use config "
-                            "'unattended_writes_ok: true' to allow writes on "
-                            "this target with no human confirmation - a "
-                            "deliberate, logged opt-in, never a default; or "
-                            "(3) set tool-computer-use config "
-                            "'gate_writes: false' to disable the gate "
-                            "entirely for this target - a deliberate, "
-                            "logged opt-out. See "
-                            "docs/designs/remote-transport.md \u00a710.4 for "
-                            "the policy rationale."
-                        )
-                    },
-                )
             summary, _ = await asyncio.to_thread(
-                self._computer._run, action, input, binding=binding
+                self._computer._run_flat_step, action, input, binding, approved
             )
             return ToolResult(success=True, output=summary)
         except (BackendError, ValueError) as exc:
@@ -3735,7 +3790,6 @@ def _action_surface(computer: ComputerTool) -> dict[str, Any]:
             action in MUTATING_DESKTOP
             and computer._gate_writes
             and not computer._unattended_writes_ok
-            and not computer._interactive_write_approved
         ):
             return (
                 "blocked: gate_writes is on and nothing has approved this "
