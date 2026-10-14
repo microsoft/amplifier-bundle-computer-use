@@ -28,10 +28,24 @@ Python packages, and the test suite imports them by inserting each module's path
 
 ```bash
 # from the repo root
-uv venv
+uv venv --python 3.12
 uv pip install -e modules/tool-computer-use -e modules/hook-computer-use
-uv pip install amplifier-core pytest pytest-asyncio
+uv pip install -r tests/requirements.txt "anthropic==1.13.0" "openai==3.29.0"
+uv pip check
 ```
+
+CI uses the same mandatory `tests/requirements.txt`, including both providers pinned
+to merged Git commits, the directly imported HTTP clients, and JSON Schema validation.
+The SDK versions are test-only pins, not production dependency changes:
+
+| Python | Anthropic SDK | OpenAI SDK |
+|---|---|---|
+| 3.11 | 1.0.0 | 2.9.0 |
+| 3.12 | 1.13.0 | 3.29.0 |
+
+To test the floor row, create the venv with `uv venv --python 3.11` and use
+`uv pip install -r tests/requirements.txt "anthropic==1.0.0" "openai==2.9.0"`.
+CI recreates its venv with `uv venv --clear` before installing.
 
 `modules/tool-computer-use`'s own `pyproject.toml` declares `pillow` unconditionally and
 `python-xlib` / `pyobjc-framework-Quartz` behind `sys_platform` markers, so the editable
@@ -46,6 +60,11 @@ route around per-contribution.
 .venv/bin/python -m pytest tests/ -q
 ```
 
+Ordinary PR/main CI checks archived neutral evidence **AS RECORDED** against its
+independently established expectations, including deep hashed artifact references.
+That integrity check is neither real-time freshness nor a match to today's checkout
+or installed packages; it does not grant current release qualification.
+
 **Tests must pass on Linux with no desktop present.** This project targets CI on
 `ubuntu-latest` with no X server, no Xvfb, no display of any kind — the suite is
 designed for that and stubs/fakes the platform layer rather than driving a real screen.
@@ -58,11 +77,11 @@ This project uses [Ruff](https://docs.astral.sh/ruff/) for both formatting and l
 configured in the root `ruff.toml`.
 
 ```bash
-uvx ruff format --check .
-uvx ruff check .
+uvx ruff@0.16.1 format --check .
+uvx ruff@0.16.1 check .
 ```
 
-Run `uvx ruff format .` (no `--check`) to auto-format, and `uvx ruff check --fix .` to
+Run `uvx ruff@0.16.1 format .` (no `--check`) to auto-format, and `uvx ruff@0.16.1 check --fix .` to
 apply safe auto-fixes, before committing.
 
 ### The ship gate
@@ -98,24 +117,149 @@ for what evidence it produces and how to read the result. The gate establishes a
 that is unreadable, recent, or otherwise invalid fails the whole run and is never retried
 or excluded from its denominator. Do not publish private host details or raw run logs.
 
-`scripts/wire_check.py` is the same kind of gate for the multi-provider wire-format
-anti-regression scheme (the design notes §11.2, layer 3): it sends
-one minimal, real, declaration-only request per provider (the exact shape
-`providers.py`'s `Dialect.declare()` emits) and records the result in
-`tests/fixtures/wire-check.json`. It needs real credentials and the network, so it is
-**not** run in CI either:
+### Neutral boundary and retained wire obligation
+
+Production computer-use exports neutral v1 intent and executes canonical actions.
+Providers own models, native declarations/headers, vendor units, safety requirements
+and replay. Do not import SDKs, probe private provider methods or infer intent from
+tool names in the production tool/hook.
+
+The advertised input schema is a guide. Runtime validation enforces flat-versus-batch
+exclusivity and validates the entire batch before any disclosure or desktop input.
+Write approval belongs to the validated executing call and its pinned target/policy;
+concurrent or later calls must never inherit another call's permission.
+
+`scripts/wire_check.py` is a retained historical instrument for the retired bundle
+dialects, **not the neutral-v1 qualification path**. Do not run it to manufacture fresh
+acceptance. The credential-bearing command below is historical guidance only:
 
 ```bash
 ANTHROPIC_API_KEY=... OPENAI_API_KEY=... .venv/bin/python scripts/wire_check.py
 ```
 
-Run it periodically (at least every `MAX_AGE_DAYS`, currently 30 —
-`tests/test_wire_attestation_freshness.py`) and before cutting a release that touches a
-provider dialect. Unlike the coexistence gate, staleness here **is** enforced in the
-normal offline test suite: `test_wire_attestation_freshness.py` fails the build if the
-attestation this script writes is missing, records a rejection, or has gone stale — see
-that module's docstring for why the attestation and its freshness check are deliberately
-two different files.
+`tests/fixtures/wire-check.json` and historical captures remain unchanged and are
+checked as history, not current qualification. The separate pre-release consumer requires
+`tests/fixtures/neutral-qualification.json` and independently established
+`neutral-qualification-expected.json`, with safe relative receipts/captures under
+that evidence root. Missing, failed, future, older-than-30-day, tampered, wrong-profile
+or unbound evidence fails; historical HTTP 200 is never a fallback.
+The committed qualification is a bounded observation, not a permanent release grant.
+Before making a release claim, this strict command must pass on **both SDK rows**
+listed above; it checks current checkout/script manifests, actually loaded packages,
+the real-time 30-day window and deep artifact integrity:
+
+```bash
+.venv/bin/python -m pytest release_checks/ -q
+```
+
+After merge, use **Actions → CI → Run workflow** for that two-row check.
+`workflow_dispatch` becomes available when this workflow is on the default branch.
+Ordinary PR/main runs execute `tests/` only. Dispatch checks existing evidence offline;
+it does not regenerate evidence or enforce release publication, tags or branch
+protection. Paid provider calls and an owned display are needed only for actual fresh
+live regeneration, not these checks. Refresh genuinely expired or changed-binding
+evidence through independent qualification, never by editing dates or prior verdicts.
+Native live cases are screenshot-only; the owned Linux
+X11 approval-policy case verifies byte-exact alphanumeric input, not general text
+fidelity or other platforms. A successful later check never relabels an earlier failure.
+Provider owners supply native declaration/result/replay and actual wire settings,
+finite generation/count HTTP limits and retry observations independently. The neutral
+recorder does not inspect protocol fields or certify truth from hashes/model names.
+For each configured provider, current/live Session and independent provider/policy
+receipts plus exact current/offline and floor/offline installed SDK/composition
+receipts are mandatory. Floor qualification is explicitly offline-only. Each binding
+includes actually loaded Core/provider/SDK/tool/hook/loop/context Python manifests;
+producer script digests and production manifests bind final source without fixture
+or HEAD hash recursion. Providers/models are opaque outside provider-owned checks.
+The independent verifier owns normal-installed combined checks and remaining live/hardware decisions.
+
+### Public neutral reproduction (test-only)
+
+`scripts/qualify_neutral_session.py` uses public provider `mount`, Core Session and
+ModuleLoader, canonical capture, and the production image hook. It starts exactly one
+owned Xvfb using `-displayfd`, refuses ambient DISPLAY, renders fresh undisclosed
+markers, and checks two actual adjacent Session cycles retaining image history. Its
+native declaration is a **restricted screenshot-only test**, not evidence that a
+full-operation tool selects native semantics. Captures come from actual tool results;
+no private SDK/client/replay seeding or source-path provider injection is permitted.
+Use normal installed reviewed packages, not editable provider/Core/SDK dependencies.
+Provide an independently established expected binding, public module name, opaque
+model, key environment **name** (the key value remains only in the environment), and
+provider-owned count policy/provenance. No credential is accepted as a CLI/config
+value. Import and `--help` are offline and never provision a display.
+
+```bash
+.venv/bin/python scripts/qualify_neutral_session.py --help
+# Run ONLY in a deliberately owned Linux X11 test environment, with no ambient DISPLAY.
+.venv/bin/python scripts/qualify_neutral_session.py \
+  --expected qualification-expected.json --provider PROVIDER_ID \
+  --provider-module PUBLIC_MODULE --model MODEL --keyenv CALLER_KEY_ENV \
+  --count-policy provider-owned-count-policy.json --output private-new-run \
+  --max-complete 6 --max-budget 12 --max-estimate 12 --deadline-seconds 240
+.venv/bin/python scripts/neutral_qualification.py record rows.json \
+  qualification-expected.json --output neutral-qualification.json
+.venv/bin/python scripts/neutral_qualification.py validate neutral-qualification.json \
+  qualification-expected.json --evidence-root qualification-evidence
+```
+
+The `neutral_qualification.py validate` CLI checks the supplied expectations, not
+their agreement with the current checkout or installed packages. Use the
+`release_checks/` command above for those current-binding checks and deep integrity.
+
+The producer records observed public `complete`/`request_budget`/`estimate` invocation
+counts (absent public methods have zero observations), **not physical HTTP counts**.
+Generation retries zero and auto-continue false are requested through public mount
+config; effective wire delivery remains UNKNOWN in this producer. The consumer requires
+provider-owned `generation_controls`: outer retries exactly zero, transport retries
+bounded to zero or two (two is not disabled), and auto-continue false or `"N/A"`.
+Safe hashed provider proof envelopes bind exact packages/source/profile and timestamps
+within the provider receipt, with positive public mount/factory/generation-path,
+source-provenance, configuration/transport-bound and actual mounted-run checks.
+False requires affirmative continuation-disabled proof; `"N/A"` requires both knob
+and same-output feature absence, never silence. Source provenance must include a source
+ref matching the bound provider Python manifest; mounted-run refs must be observations.
+The independent verifier independently admits relevance and truth against public source/configuration and the monitored
+public-mounted run; hashes, owner strings and PASS do not authenticate claims, and
+an unrelated injected-client run is invalid. Count retries remain separately bounded
+provider-owned policy; actual HTTP bounds/outcomes are still mandatory, and observed
+zero retries do not prove disabled configuration. Absent proof cannot produce a live
+PASS. Sanitize receipt bytes before hashing; only this owned desktop's pixels are allowed.
+Published evidence uses consistent service-ID aliases and opaque positive-integer
+process-role tokens, not actual host OS PIDs. The accompanying identifier-projection
+observation explicitly distinguishes those tokens from privately verified originals,
+retains high-entropy original-wire hash commitments and an independent-verifier
+attestation for the private session, and omits opaque encrypted reasoning content.
+Original session digests are not published: their removed process numbers have low
+entropy and a public unsalted digest would permit offline recovery guesses.
+Published artifact hashes bind the projected bytes; outcome, capture, package, budget
+and timestamp observations are unchanged. Sanitization must never invent an execution
+or convert a failed observation into a pass.
+Failure produces a failed/partial receipt after setup; no observation is backfilled.
+Default finally cleanup uses the public Session/provider lifecycle, ignores hook
+mount metadata that is not a cleanup callable, and closes Tk/backend/Xvfb. A separate
+CLI supervisor bounds synchronous stalls in an exclusive owned worker process group;
+Xvfb/helpers inherit that group. It observes worker exit with WNOWAIT before its final
+owned-group signal, then reaps and checks group absence. The consumer requires this
+final supervision record, so an interim worker receipt cannot satisfy acceptance.
+Generation image observations are distinct from count/budget observations. Caller
+purity is observed outside the production hook's lazy public event projection, while
+an inner observer checks the projected request. All teardown waits use the overall
+deadline; no ambient/human process group is signalled. The private
+output retains owned captures/receipts for inspection; the caller owns their eventual
+removal. No foreign process sweep, persistent display, or host installation is needed.
+
+Unit controls in `tests/test_neutral_qualification.py` are explicitly synthetic,
+created only in temporary test directories, and rejected by the default release
+validator. They prove consumer/controller behavior, not actual wire/GUI acceptance.
+The ordinary suite may PASS while the separate pre-release check is RED pending
+the independent verifier's genuine qualification; do not skip or weaken that release gate.
+
+Focused headless composition requires real qualified provider wheels and SDKs with HTTP
+intercepted, never optional SDK skips or private provenance injection:
+
+```bash
+.venv/bin/python -m pytest tests/test_neutral_computer.py tests/test_native_screenshot_preflight.py tests/test_provider_neutral_composition.py -q
+```
 
 ## Commit conventions
 

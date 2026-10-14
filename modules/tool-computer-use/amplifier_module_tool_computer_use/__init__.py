@@ -1,13 +1,9 @@
-"""Amplifier tool module: `computer` - Anthropic native computer-use, on whichever
-desktop this machine can actually reach.
+"""Provider-neutral desktop intent and canonical execution.
 
-The tool mounts under the name `computer` so the orchestrator can execute the
-`tool_use` blocks Claude emits for its built-in computer tool. `hook-computer-use`
-promotes this tool's declaration to the *native* Anthropic tool type on the wire and
-turns screenshot markers into real image content blocks.
-
-Without the hook the tool still works as an ordinary function tool (Claude drives it
-from the JSON schema below), it just cannot show Claude the screen.
+`native_tool_spec` exports explicit v1 intent through ToolSpec extras. Providers
+own native declarations, model capabilities, argument translation and replay.
+This module owns screenshot-to-physical scaling and guarded desktop execution;
+the companion hook projects persisted screenshot markers into generic images.
 
 Platform backend
 -----------------
@@ -27,15 +23,19 @@ from __future__ import annotations
 import asyncio
 import atexit
 import base64
+import contextvars
+import copy
 import hashlib
 import inspect
 import json
 import logging
+import math
 import os
 import socket
 import threading
 import time
 import uuid
+from collections import deque
 from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
@@ -72,13 +72,7 @@ from .presence import (
     PresenceSnapshot,
     PresenceState,
 )
-from .providers import ANTHROPIC, dialect_for_tool_type, read_call
 from .registry import _TARGET_MODEL, NoBackendAvailable, select_backend
-from .tool_versions import (
-    beta_header_for,
-    require_static_pairing,
-    resolve_tool_version,
-)
 from .type_pacing import resolve_type_pacing_ms
 from .windows import WindowsBackend
 
@@ -151,12 +145,22 @@ ACTIONS = [
     "focus_window",
 ]
 
+# Window/geometry helpers retain ordinary function support (also on `desktop`).
+# Neutral computer intent describes screenshot/input operations, not helper APIs.
+COMPUTER_OPERATIONS = [
+    action
+    for action in ACTIONS
+    if action not in {"screen_info", "list_windows", "focus_window"}
+]
+
 #: Actions that change the user's machine. Used for the confirm/read-only gate.
 #: The native key action may request a bounded logical repeat. This is kept
-#: separate from the provider readers: any caller can send the existing `key`
-#: action plus this field, while provider-specific action shapes stay unchanged.
+#: available to any canonical caller, independently of native wire formats.
 KEY_REPEAT_MIN = 1
 KEY_REPEAT_MAX = 100
+# Explicit batch-only bound: a desktop batch cannot schedule an unbounded wait
+# or held key. Flat calls retain their existing duration compatibility.
+MAX_BATCH_DURATION_SECONDS = 60.0
 
 
 def _key_repeat(params: dict[str, Any]) -> int:
@@ -177,12 +181,7 @@ def _key_repeat(params: dict[str, Any]) -> int:
 
 
 def _preflight_key_repeat(input: dict[str, Any]) -> None:
-    """Reject an invalid native key repeat before disclosure or dispatch.
-
-    The Anthropic wire form is the only single-action form. Keeping this
-    preflight narrow preserves lazy OpenAI batch parsing and leaves unknown
-    fields for every non-key action exactly as they were.
-    """
+    """Reject an invalid flat key repeat before disclosure or dispatch."""
     action = input.get("action")
     if isinstance(action, str) and action.strip() == "key":
         _key_repeat(input)
@@ -319,7 +318,7 @@ class _Binding:
 
 
 class ComputerTool:
-    """Executes Anthropic computer-tool actions against whatever desktop the
+    """Executes canonical computer actions against whatever desktop the
     selected `Backend` can reach."""
 
     def __init__(self, backend: Backend, config: dict[str, Any] | None = None) -> None:
@@ -338,20 +337,6 @@ class ComputerTool:
         self._max_edge = int(cfg.get("max_edge", 1280))
         self._max_pixels = int(cfg.get("max_pixels", 1_150_000))
         self._enable_zoom = bool(cfg.get("enable_zoom", True))
-
-        # -- model <-> tool_version coupling fix -----------------------------
-        # `_configured_tool_version`/`_model_hint` are the raw config values;
-        # `_tool_version` is the live, resolved value `native_tool_spec` reads.
-        # Resolved once here (may raise ToolVersionError - see tool_versions.py
-        # module docstring for why mount time is allowed to fail loud) and then
-        # kept current by `note_model()`, called by hook-computer-use on every
-        # `provider:request` with the model actually about to be used.
-        self._configured_tool_version: str | None = cfg.get("tool_version")
-        self._model_hint: str | None = cfg.get("model")
-        self._tool_version: str = require_static_pairing(
-            self._model_hint, self._configured_tool_version
-        )
-        self._cross_dialect_override_notices: set[tuple[str, str]] = set()
 
         # -- remote-target safety posture ------------------------------------
         # `is_remote` is a plain attribute (not an isinstance/import check) so
@@ -385,45 +370,11 @@ class ComputerTool:
                     "no confirmation gate. This is a deliberate, logged opt-out, "
                     "not a default."
                 )
-        # `unattended_writes_ok` and `gate_writes` are two answers to the SAME
-        # policy question (\u00a710.4: "gate every write, or gate none") - not two
-        # independent mechanisms. The config knob itself lives in
-        # hook-computer-use (see that module's `mount()` docstring for why:
-        # it is the module that answers `ask_user`/EOF-avoidance too, so it
-        # owns the one place an operator sets it). `hook-computer-use`'s gate
-        # handler syncs the live value onto THIS attribute on every
-        # `tool:pre` call for `computer`/`desktop`, strictly before this
-        # tool's own `execute()` runs for that same call - so by the time
-        # `DesktopTool.execute()`'s fail-safe check reads it below, it
-        # reflects the exact same decision the hook already made, instead of
-        # silently re-deciding and contradicting it. Defaults False: with no
-        # gate hook mounted (or one that has not run yet), this stays False
-        # and the fail-safe denies - never a silent, un-authored escape
-        # hatch.
+        # The hook installs stable policy via the public ApprovalSystem. Decisions
+        # live only in the executing coroutine, never in cross-hook grant slots.
+        self._write_approval: Callable | None = None
+        # Reporting-only configuration for doctor; never execution authority.
         self._unattended_writes_ok: bool = False
-        # A SEPARATE per-call signal from `_unattended_writes_ok` above -
-        # deliberately, not the same flag wearing a second meaning. That one
-        # answers "is nobody at the keyboard, and is that explicitly OK?" -
-        # always False when a human interactively approves via `ask_user`,
-        # since the whole point of that path is a human WAS asked. Reusing
-        # it for the interactive case would make its name lie about which
-        # of the two questions it is answering (see this module's own
-        # incident history: names and return values that did not match
-        # reality). This is the interactive counterpart: "did a human just
-        # grant THIS specific call via `ask_user`?" `hook-computer-use`'s
-        # gate handler resets it to False at the top of every `tool:pre`
-        # call (same unconditional-sync point as `_unattended_writes_ok`,
-        # so a stale True from an earlier approved call can never survive
-        # into a later one), then sets it True only when it is about to
-        # hand this exact call's decision to `ask_user`. That is safe to do
-        # before the human actually answers: `ask_user` is a blocking gate
-        # (`HOOKS_API.md` - priority 2, same tier as `deny`) - if the human
-        # declines or times out, this tool's `execute()` is never called
-        # for that call at all, so no observer ever reads a `True` paired
-        # with a decline. Defaults False: with no gate hook mounted (or one
-        # that has not run yet), this stays False and the fail-safe denies
-        # - same "never a silent, un-authored escape hatch" rule as above.
-        self._interactive_write_approved: bool = False
         # Per-monitor targeting (see monitors.py): default is "primary", i.e. one
         # real monitor, not the virtual-desktop bounding box around all of them.
         # Set to monitors.VIRTUAL_DESKTOP to opt into the old whole-desktop
@@ -452,6 +403,10 @@ class ComputerTool:
         # session previously wrote into together. See `execute()` and
         # `_prune_shots()`.
         self._session_id: str = uuid.uuid4().hex
+        # One-shot handoff to the hook's real tool:post call association. Only
+        # successful image results emitted by this instance enter this queue.
+        # It is bounded, memory-only, and cannot be reconstructed from history.
+        self._issued_capture_results: deque = deque(maxlen=64)
 
         # -- security hardening: clipboard read policy ------------------------
         # `get_clipboard` (docs/DesktopTool) previously had no gate
@@ -1048,11 +1003,9 @@ class ComputerTool:
         """Switch the active target (a monitor id, `"primary"`, or
         `monitors.VIRTUAL_DESKTOP`) and re-resolve `display` for it.
 
-        Safe to call mid-session. `hook-computer-use` reads `native_tool_spec`
-        fresh on *every* provider request (see that property's docstring) - it is
-        never cached at the hook layer - so the very next request after this call
-        returns automatically declares the new `display_width_px`/
-        `display_height_px` with no extra plumbing. The only state this needs to
+        Safe to call mid-session. The orchestrator reads `native_tool_spec`
+        fresh for each request, so the next request carries the new neutral
+        screenshot-pixel image_space without discovery. The only state this needs to
         update is `self._display`/`self._current_monitor`, exactly what
         `_resolve_display_for_target` already does.
 
@@ -1087,10 +1040,9 @@ class ComputerTool:
         resolved - and that difference is deliberate. This is read at the very
         top of `execute()`, BEFORE its error handling; raising here would turn
         every unmounted-display tool call into an exception escaping `execute()`
-        instead of the clean `ToolResult` error it returns today. A dialect that
-        needs the size and is handed `None` raises `ValueError` naming what is
-        missing, which `execute()` already converts into an ordinary tool error.
-        Loud, in the right place, without moving the failure outside the handler.
+        instead of a clean `ToolResult` error. Unknown geometry stays absent in
+        intent; canonical batches refuse it before input, and providers decide
+        ordinary fallback or native-required refusal.
         """
         return None if self._display is None else self._display.image_space
 
@@ -1115,7 +1067,7 @@ class ComputerTool:
 
     @property
     def input_schema(self) -> dict[str, Any]:
-        return {
+        flat = {
             "type": "object",
             "properties": {
                 "action": {
@@ -1167,163 +1119,54 @@ class ComputerTool:
             },
             "required": ["action"],
         }
+        batch_item = copy.deepcopy(flat)
+        batch_item["properties"]["duration"].update(
+            minimum=0, maximum=MAX_BATCH_DURATION_SECONDS
+        )
+        return {
+            "type": "object",
+            "description": (
+                "Supply one flat action, OR exactly version=1, actions and "
+                "capture_after. Mixed forms are rejected before desktop input."
+            ),
+            "properties": {
+                **flat["properties"],
+                "version": {"type": "integer", "const": 1},
+                "actions": {"type": "array", "minItems": 1, "items": batch_item},
+                "capture_after": {"type": "boolean"},
+            },
+        }
 
-    # -- native promotion (read by hook-computer-use) ---------------------------
-    @property
-    def native_tool_type(self) -> str:
-        """The native tool type this tool has resolved for THIS turn - the key
-        `providers.dialect_for_tool_type` dispatches on.
-
-        Exists because `hook-computer-use` needs exactly this fact and had no
-        honest way to get it. It was reading `native_tool_spec["type"]`, i.e.
-        recovering a vendor-neutral fact by parsing a VENDOR-SHAPED artifact.
-        That works only for vendors that happen to put their type under a key
-        named `type`; a vendor that discriminates by some other key has no
-        `type` at all, and the hook silently fell back to a default belonging to
-        a different vendor and probed the mounted provider for the wrong wire
-        convention entirely.
-
-        The fix is not to teach the hook more wire formats - it declares
-        `dependencies = []` and cannot import `providers.py`, by design. It is
-        to stop making it infer: the tool already knows the answer, so it says
-        it. Plain `str`, no import, no coupling - the same duck-typed read the
-        hook already does for `native_tool_spec`.
-
-        For both dialects that put their type on the wire this is exactly
-        `native_tool_spec["type"]`, so the hook's answer for them is unchanged -
-        pinned in `tests/test_provider_dialects.py`.
-        """
-        return self._tool_version
-
+    # -- explicit neutral intent (transported by ToolSpec extras) ---------------
     @property
     def native_tool_spec(self) -> dict[str, Any]:
-        """The native tool declaration for whichever dialect `_tool_version`
-        belongs to (`providers.py`) - sized to the cached display when that
-        dialect requires a size, bare when it rejects one.
-
-        This used to build ONE shape (Anthropic's: `name` +
-        `display_width_px`/`display_height_px`) no matter which provider was in
-        play, and gate `enable_zoom` on `self._tool_version >=
-        "computer_20251124"` - a string comparison that silently did double
-        duty as a provider check, because OpenAI's bare `"computer"` happens to
-        sort below it. OpenAI tolerated the surplus fields only because
-        `provider-openai` discards everything but `type`; the declaration
-        itself was wrong for that wire and nothing here said so. Each dialect
-        now owns its own shape (see `providers._declare_anthropic` /
-        `_declare_openai`).
-
-        D2 fix: this used to call `self._bridge.display()`, a property that shelled
-        out to PowerShell with a 30s timeout on *every single* provider request. That
-        subprocess call is why the hook's `hasattr` guard (D3) mattered so much: any
-        transient bridge failure here raised on the hot path. Display is now resolved
-        once at mount and cached in-memory; this property does no I/O and cannot
-        raise for that reason again.
-
-        Per-monitor targeting tension: `desktop.select_monitor` can change what
-        `self.display` reports *mid-session*, and this property's declared
-        `display_width_px`/`display_height_px` must never drift out of sync with
-        what `computer.screenshot` is actually capturing. That is why this stays a
-        plain property reading `self.display` rather than something cached at
-        construction: the orchestrator's `ToolSpec` construction (see
-        `amplifier-module-loop-streaming`'s `_build_tool_spec`, which reads this
-        property fresh to build every request's tool list - it is never cached
-        there either; only D2's *I/O* was cached here, not the *value*) re-reads
-        `native_tool_spec` on every `provider:request`, so the very next request
-        after a monitor switch automatically declares the new dimensions. The
-        in-memory state this property reads (`self._display`) is exactly what
-        `select_monitor` updates - one piece of state, two readers (this property
-        and `_run`), always in sync.
-        """
-        disp = self.display
-        return dialect_for_tool_type(self._tool_version).declare(
-            self._tool_version,
-            width=disp.model_width,
-            height=disp.model_height,
-            enable_zoom=self._enable_zoom,
-        )
-
-    @property
-    def native_beta_header(self) -> str | None:
-        """`None` when the vendor owning this tool type has no beta-header
-        mechanism at all - a distinct answer from any header string, and one
-        this used to be unable to give (see `tool_versions.beta_header_for`).
-        A caller must send no header for `None`, never an empty one."""
-        return beta_header_for(self._tool_version)
-
-    def select_provider_native_tool_type(
-        self, native_tool_type: str, model: str | None = None
-    ) -> None:
-        """Select the provider-proven native dialect before building its spec."""
-        selected_dialect = dialect_for_tool_type(native_tool_type)
-        configured = self._configured_tool_version
-        if configured and dialect_for_tool_type(configured) is not selected_dialect:
-            notice = (native_tool_type, configured)
-            if notice not in self._cross_dialect_override_notices:
-                logger.info(
-                    "computer-use: ignoring cross-dialect configured tool_version %r "
-                    "while provider selected native type %r",
-                    configured,
-                    native_tool_type,
-                )
-                self._cross_dialect_override_notices.add(notice)
-
-        if selected_dialect is not ANTHROPIC:
-            if self._tool_version != native_tool_type:
-                self._tool_version = native_tool_type
-            return
-
-        anthro_configured = (
-            configured
-            if configured and dialect_for_tool_type(configured) is ANTHROPIC
-            else None
-        )
-        anthro_previous = (
-            self._tool_version
-            if dialect_for_tool_type(self._tool_version) is ANTHROPIC
-            else None
-        )
-        resolved, corrected = resolve_tool_version(
-            model, anthro_configured, previous=anthro_previous
-        )
-        if dialect_for_tool_type(resolved) is not ANTHROPIC:
-            resolved, corrected = resolve_tool_version(
-                None, anthro_configured, previous=anthro_previous
+        """Only cached local facts; never discover geometry or inspect a model."""
+        binding = self._binding
+        unavailable = {}
+        if not self._enable_zoom:
+            unavailable["zoom"] = "zoom disabled by local configuration"
+        if binding.read_only:
+            unavailable.update(
+                {
+                    action: "target is read_only"
+                    for action in MUTATING
+                    if action in COMPUTER_OPERATIONS
+                }
             )
-        if corrected:
-            logger.info(
-                "computer-use: model %r requires tool_version %r; correcting "
-                "from %r to avoid the API rejecting every request with this pairing "
-                "(see tool_versions.py)",
-                model,
-                resolved,
-                self._tool_version,
-            )
-        if self._tool_version != resolved:
-            self._tool_version = resolved
-
-    def note_model(self, model: str | None) -> None:
-        """Legacy model-only correction path for tools without provider dialect selection.
-
-        `hook-computer-use` prefers `select_provider_native_tool_type()` so the
-        provider-selected dialect is authoritative. This remains for legacy
-        hooks and fake tools that only supply the model.
-
-        Never raises: a mid-session exception here would take down the whole
-        request.
-        """
-        resolved, corrected = resolve_tool_version(
-            model, self._configured_tool_version, previous=self._tool_version
-        )
-        if corrected:
-            logger.info(
-                "computer-use: model %r requires tool_version %r; correcting "
-                "from %r to avoid the API rejecting every request with this "
-                "pairing (see tool_versions.py)",
-                model,
-                resolved,
-                self._tool_version,
-            )
-        self._tool_version = resolved
+        intent: dict[str, Any] = {
+            "version": 1,
+            "operations": [
+                action for action in COMPUTER_OPERATIONS if action not in unavailable
+            ],
+            "unavailable_operations": unavailable,
+        }
+        if binding.display is not None:
+            intent["image_space"] = {
+                "width": binding.display.model_width,
+                "height": binding.display.model_height,
+                "unit": "pixel",
+            }
+        return {"type": "function", "computer_use": intent}
 
     # -- coexistence guard wiring for every mutating action ----------------------
     @contextmanager
@@ -2118,7 +1961,7 @@ class ComputerTool:
         *,
         binding: _Binding | None = None,
     ) -> tuple[str, str | None]:
-        """Run one Anthropic computer-tool action against a backend.
+        """Run one canonical computer action against a backend.
 
         Returns (text_summary, base64_png_or_None). Mirrors the dispatch logic that
         used to live inside `WindowsBridge.execute` - now backend-agnostic: it only
@@ -2351,7 +2194,7 @@ class ComputerTool:
             # tightly-timed composite \u00a78.4 says must complete, not tear.
             # `coord=end` (not `start`): the exclusion-zone check (\u00a77.5)
             # cares about where the drag's synthetic input actually lands.
-            with self._guard_write(coord=end):
+            with self._guard_write(coord=end, binding=binding):
                 backend.drag(start, end)
             logger.info(
                 "computer-use audit: op=left_click_drag start=%s end=%s", start, end
@@ -2363,9 +2206,10 @@ class ComputerTool:
             direction = params.get("scroll_direction") or params.get("direction")
             if not direction:
                 raise ValueError("action 'scroll' requires 'scroll_direction'")
-            amount = int(params.get("scroll_amount") or params.get("amount") or 3)
+            amount = int(params.get("scroll_amount", params.get("amount", 3)))
             with self._guard_write(
-                coord=(x, y) if x is not None and y is not None else None
+                coord=(x, y) if x is not None and y is not None else None,
+                binding=binding,
             ):
                 backend.scroll(x, y, str(direction), amount)
             return f"scrolled {direction} x{amount}", None
@@ -2373,11 +2217,11 @@ class ComputerTool:
         if action in {"key", "hold_key"}:
             if not text:
                 raise ValueError(f"action {action!r} requires 'text'")
-            with self._guard_write():
+            with self._guard_write(binding=binding):
                 if action == "key":
                     backend.key(str(text))
                 else:
-                    backend.hold_key(str(text), float(params.get("duration") or 1.0))
+                    backend.hold_key(str(text), float(params.get("duration", 1.0)))
             # Combos (e.g. "ctrl+s") are short, symbolic, and not free-form
             # secret text the way typed prose or a clipboard payload can be -
             # logged directly, unlike \u00a73's digest-not-plaintext rule for
@@ -2479,44 +2323,361 @@ class ComputerTool:
 
         raise ValueError(f"unsupported action {action!r}")
 
-    async def execute(self, input: dict[str, Any]) -> ToolResult:
-        """Run one tool call, in whichever provider dialect it arrived in.
-
-        The two live wire forms disagree about shape and cardinality -
-        Anthropic sends one `{"action": ..., "coordinate": [...]}` per call;
-        OpenAI batches N `{"type": ..., "x": ..., ...}` entries under `actions`
-        and expects ONE result for the whole batch (`providers.py` has the full
-        comparison). `providers.read_call` is the only place that knows the
-        difference: it identifies the dialect from the payload's actual shape -
-        never by asking which provider is mounted - and yields this tool's own
-        `(action, params)` vocabulary. Everything after that line is shared, and
-        was already shared before this seam existed: one `ACTIONS` check, one
-        `read_only`/`MUTATING` gate, one `_run()`, one set of error handlers.
-        There is no second, parallel dispatcher per vendor and there must never
-        be one.
-
-        Cardinality is not special-cased either: a single Anthropic action is a
-        one-element batch, and the loop below is identical for both. The one
-        genuine per-dialect difference is what a result must carry -
-        `result_must_carry_screenshot`.
-
-        The very first thing this does - before parsing the call, before
-        anything else - is `_ensure_announced()` (see that method): the
-        session-start disclosure gate, moved here from `mount()` so a
-        throwaway protocol-compliance probe can never trigger it.
-        """
-        try:
+    def _prepare_calls(
+        self, input: dict[str, Any], binding: _Binding
+    ) -> tuple[list[tuple[str, dict[str, Any]]], bool, bool]:
+        """Copy canonical input and validate the ENTIRE v1 batch before input."""
+        if not isinstance(input, dict):
+            raise ValueError("computer input must be an object")
+        batch = "actions" in input or "version" in input or "capture_after" in input
+        if not batch:
             _preflight_key_repeat(input)
+            action = input.get("action")
+            action = action.strip() if isinstance(action, str) else action
+            if action not in ACTIONS:
+                raise ValueError(
+                    f"unknown action {action!r}; expected one of {', '.join(ACTIONS)}"
+                )
+            prepared = copy.deepcopy(input)
+            prepared["action"] = action
+            self._validate_batch_action(prepared, binding.display, flat=True)
+            return [(action, prepared)], False, False
+        if set(input) != {"version", "actions", "capture_after"}:
+            raise ValueError(
+                "v1 batch requires only version, actions and capture_after"
+            )
+        if type(input["version"]) is not int or input["version"] != 1:
+            raise ValueError("unsupported computer batch version; expected integer 1")
+        if type(input["capture_after"]) is not bool:
+            raise ValueError("capture_after must be a boolean")
+        actions = input["actions"]
+        if not isinstance(actions, list) or not actions:
+            raise ValueError("actions must be a nonempty list")
+        if binding.display is None:
+            raise ValueError(
+                "display geometry not resolved; cannot execute a canonical batch"
+            )
+        calls = []
+        for index, raw in enumerate(copy.deepcopy(actions)):
+            try:
+                self._validate_batch_action(raw, binding.display)
+            except ValueError as exc:
+                raise ValueError(f"actions[{index}]: {exc}") from exc
+            calls.append((raw["action"], raw))
+        return calls, True, input["capture_after"]
+
+    def _validate_batch_action(
+        self, params: Any, display: Display | None, *, flat: bool = False
+    ) -> None:
+        if not isinstance(params, dict):
+            raise ValueError("action must be an object")
+        if any(not isinstance(key, str) for key in params):
+            raise ValueError("action parameter names must be strings")
+        action = params.get("action")
+        if not isinstance(action, str) or action not in ACTIONS:
+            raise ValueError(f"unknown canonical action {action!r}")
+        allowed = {"action"}
+        if action in _CLICK_ACTIONS or action in {
+            "mouse_move",
+            "left_mouse_down",
+            "left_mouse_up",
+            "left_click_drag",
+            "scroll",
+        }:
+            allowed.add("coordinate")
+        if action == "left_click_drag":
+            allowed.add("start_coordinate")
+        if action == "zoom":
+            allowed.update({"coordinate", "region", "start_coordinate"})
+            if not self._enable_zoom:
+                raise ValueError("zoom disabled by local configuration")
+        if action in {"key", "hold_key", "type"}:
+            allowed.update({"text", "key"})
+        if action == "key":
+            allowed.add("repeat")
+            _key_repeat(params)
+        if action in {"wait", "hold_key"}:
+            allowed.add("duration")
+        if action == "scroll":
+            allowed.update({"scroll_direction", "direction", "scroll_amount", "amount"})
+        if action == "focus_window":
+            allowed.add("handle")
+        extras = set(params) - allowed
+        if extras and not flat:
+            raise ValueError(f"unsupported parameters for {action!r}: {sorted(extras)}")
+
+        def point(value: Any, size: int, label: str) -> None:
+            if not isinstance(value, (list, tuple)) or len(value) != size:
+                raise ValueError(
+                    f"{label} requires {size} screenshot-pixel coordinates"
+                )
+            try:
+                finite = all(
+                    type(v) in (int, float) and math.isfinite(v) for v in value
+                )
+            except OverflowError:
+                finite = False
+            if not finite:
+                raise ValueError(f"{label} must contain finite numbers")
+            if display is None:
+                raise ValueError("display geometry not resolved")
+            for offset in range(0, size, 2):
+                display.to_screen(value[offset], value[offset + 1])
+
+        for key in ("coordinate", "start_coordinate", "region"):
+            if flat and key not in allowed:
+                continue
+            if key in params:
+                raw = params[key]
+                size = (
+                    4
+                    if key == "region"
+                    or (
+                        key == "coordinate"
+                        and action == "zoom"
+                        and isinstance(raw, (list, tuple))
+                        and len(raw) == 4
+                    )
+                    else 2
+                )
+                point(params[key], size, key)
+        if action in {"mouse_move", "left_click_drag"} and "coordinate" not in params:
+            raise ValueError(f"{action!r} requires coordinate")
+        if action == "zoom":
+            raw = params.get("coordinate") or params.get("region")
+            if (not isinstance(raw, (list, tuple)) or len(raw) != 4) and (
+                "start_coordinate" not in params or "coordinate" not in params
+            ):
+                raise ValueError(
+                    "zoom requires a 4-element region or start/end coordinates"
+                )
+        if action in {"key", "hold_key", "type"}:
+            text = params.get("text") or params.get("key")
+            if not isinstance(text, str) or not text:
+                raise ValueError(f"action {action!r} requires nonempty text")
+        if action == "focus_window" and (
+            not isinstance(params.get("handle"), str) or not params["handle"]
+        ):
+            raise ValueError("focus_window requires a nonempty handle")
+        if "duration" in allowed and "duration" in params:
+            duration = params["duration"]
+            if (
+                type(duration) not in (int, float)
+                or not 0 <= duration <= MAX_BATCH_DURATION_SECONDS
+            ):
+                raise ValueError(
+                    f"batch duration must be finite seconds in 0..{MAX_BATCH_DURATION_SECONDS:g}"
+                )
+        if action == "scroll":
+            direction = params.get("scroll_direction") or params.get("direction")
+            if not isinstance(direction, str) or direction not in {
+                "up",
+                "down",
+                "left",
+                "right",
+            }:
+                raise ValueError("scroll requires up, down, left or right direction")
+            for key in ("scroll_amount", "amount"):
+                if key in params and (type(params[key]) is not int or params[key] < 0):
+                    raise ValueError(
+                        "scroll amount must be nonnegative integer wheel notches"
+                    )
+
+    def _batch_result(
+        self,
+        summaries: list[str],
+        total: int,
+        *,
+        error: dict[str, Any] | None = None,
+        uncertain: int | None = None,
+        image: str | None = None,
+        presses_completed: int = 0,
+        display: Display | None = None,
+        captures: list | None = None,
+    ) -> ToolResult:
+        text = "; ".join(summaries) or "no actions completed"
+        if error:
+            text += f"; stopped: {error['message']}"
+        payload = {MARKER: 1, "text": text, "images": []}
+        if image is not None:
+            packaged = self._screenshot_tool_result(
+                text, image, display=display, captures=captures
+            )
+            if packaged.success:
+                payload = json.loads(packaged.output)
+            else:
+                error = packaged.error
+                payload["text"] += f"; stopped: {error['message']}"
+        payload["progress"] = {
+            "completed": len(summaries),
+            "total": total,
+            "uncertain_in_flight": uncertain,
+        }
+        if presses_completed:
+            payload["progress"]["completed_key_presses_in_stopped_action"] = (
+                presses_completed
+            )
+        return ToolResult(
+            success=error is None, output=json.dumps(payload), error=error
+        )
+
+    def _submit_batch_thread(self, function, *args):
+        # Submit synchronously before any cancellation point. Cancelling an
+        # awaiting coroutine must not cancel the cleanup-owning worker task
+        # before it even enters its finally. Preserve to_thread's context.
+        future = asyncio.get_running_loop().run_in_executor(
+            None, contextvars.copy_context().run, function, *args
+        )
+        future.add_done_callback(
+            lambda done: None if done.cancelled() else done.exception()
+        )
+        return future
+
+    async def _acquire_batch_band(self):
+        """Acquire once; a cancelled waiter releases even a late worker token."""
+        state = {"lock": threading.Lock(), "cancelled": False, "token": None}
+
+        def acquire():
+            token = self._band_enter()
+            with state["lock"]:
+                state["token"] = token
+                cancelled = state["cancelled"]
+            if cancelled:
+                self._band_exit(token)
+            return token
+
+        task = self._submit_batch_thread(acquire)
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            with state["lock"]:
+                state["cancelled"] = True
+                token = state["token"]
+            if token is not None:
+                await asyncio.shield(self._submit_batch_thread(self._band_exit, token))
+            raise
+
+    def _disclosed_binding(self, binding: _Binding) -> _Binding:
+        """Accept only first-use announcement lifecycle changes, not new policy."""
+        current = self._binding
+        lifecycle_changed = (
+            current.announcement is not binding.announcement
+            or current.announced != binding.announced
+        )
+        if (
+            (current is not binding and not lifecycle_changed)
+            or current.backend is not binding.backend
+            or current.display is not binding.display
+            or current.current_monitor is not binding.current_monitor
+            or current.coexistence_guard is not binding.coexistence_guard
+            or current
+            != replace(
+                binding, announcement=current.announcement, announced=current.announced
+            )
+        ):
+            raise BackendError("request stopped: target or policy changed")
+        return current
+
+    async def _approve_write(
+        self, prepared: dict[str, Any], binding: _Binding, mutating: bool
+    ) -> Callable | None:
+        if not mutating:
+            return None
+        if binding.read_only:
+            raise PermissionError("write blocked: computer-use is mounted read_only")
+        if not binding.gate_writes:
+            return None
+        approve = self._write_approval
+        if approve is None:
+            raise PermissionError(
+                "gate_writes requires confirmation and no hook-computer-use approval "
+                "callback is installed. The write was NOT sent. Mount the hook with "
+                "interactive approval, or explicitly configure unattended_writes_ok: "
+                "true, or gate_writes: false. See docs/designs/remote-transport.md §10.4."
+            )
+        # Give the callback a separate copy: even the approval transport cannot
+        # rewrite the validated request that will actually execute.
+        allowed = await approve(copy.deepcopy(prepared), binding)
+        if self._write_approval is not approve:
+            raise PermissionError("write stopped: approval policy changed")
+        self._disclosed_binding(binding)
+        if allowed is not True:
+            raise PermissionError("gate_writes approval denied; the write was NOT sent")
+        return approve
+
+    async def execute(self, input: dict[str, Any]) -> ToolResult:
+        """Run a flat canonical call or one fully prevalidated v1 batch."""
+        binding = self._binding
+        try:
+            calls, batch, capture_after = self._prepare_calls(input, binding)
         except ValueError as exc:
             return ToolResult(
                 success=False, error={"message": str(exc), "type": "ValueError"}
             )
+        prepared = (
+            {
+                "version": 1,
+                "actions": [p for _, p in calls],
+                "capture_after": capture_after,
+            }
+            if batch
+            else calls[0][1]
+        )
+        try:
+            approved = await self._approve_write(
+                prepared, binding, any(a in MUTATING for a, _ in calls)
+            )
+            binding = self._disclosed_binding(binding)
+        except asyncio.CancelledError:
+            if not batch:
+                raise
+            return self._batch_result(
+                [],
+                len(calls),
+                error={
+                    "message": "batch cancelled during approval; no input scheduled",
+                    "type": "CancelledError",
+                },
+            )
+        except Exception as exc:
+            error = {"message": str(exc), "type": type(exc).__name__}
+            return (
+                self._batch_result([], len(calls), error=error)
+                if batch
+                else ToolResult(success=False, error=error)
+            )
         try:
             await asyncio.to_thread(self._ensure_announced)
+        except asyncio.CancelledError:
+            if not batch:
+                raise
+            return self._batch_result(
+                [],
+                len(calls),
+                error={
+                    "message": "batch cancelled during disclosure; no input scheduled",
+                    "type": "CancelledError",
+                },
+            )
         except AnnouncementRefused as exc:
+            if batch:
+                return self._batch_result(
+                    [],
+                    len(calls),
+                    error={"message": str(exc), "type": "AnnouncementRefused"},
+                )
             return ToolResult(
                 success=False,
                 error={"message": str(exc), "type": "AnnouncementRefused"},
+            )
+        try:
+            binding = self._disclosed_binding(binding)
+        except BackendError as exc:
+            error = {"message": str(exc), "type": "BackendError"}
+            return (
+                self._batch_result([], len(calls), error=error)
+                if batch
+                else ToolResult(success=False, error=error)
             )
         # Band lifetime (docs/designs/band-lifetime.md, Alt A): one raise for
         # the WHOLE call (a batch of N actions is one execute()), lowered in
@@ -2524,19 +2685,107 @@ class ComputerTool:
         # execute() against the channel. A re-raise failure with a human
         # detected present is the SAME refusal shape as the first raise.
         try:
-            band_token = await asyncio.to_thread(self._band_enter)
+            band_token = (
+                await self._acquire_batch_band()
+                if batch
+                else await asyncio.to_thread(self._band_enter)
+            )
+        except asyncio.CancelledError:
+            if not batch:
+                raise
+            return self._batch_result(
+                [],
+                len(calls),
+                error={
+                    "message": "batch cancelled during band acquisition; no input scheduled",
+                    "type": "CancelledError",
+                },
+            )
         except AnnouncementRefused as exc:
+            if batch:
+                return self._batch_result(
+                    [],
+                    len(calls),
+                    error={"message": str(exc), "type": "AnnouncementRefused"},
+                )
             return ToolResult(
                 success=False,
                 error={"message": str(exc), "type": "AnnouncementRefused"},
             )
+        # The worker may still be injecting input after cancellation. Never lower
+        # its band merely because the awaiting coroutine returned. Its own finally
+        # releases the existing band token when that uncertain step actually ends.
+        flight: dict[str, Any] = {
+            "lock": threading.Lock(),
+            "running": False,
+            "cleanup": None,
+        }
+        result = None
+        captures: list = []
         try:
-            return await self._execute_calls(input)
+            result = await self._execute_calls(
+                calls,
+                batch=batch,
+                capture_after=capture_after,
+                binding=binding,
+                approved=approved,
+                flight=flight,
+                captures=captures,
+            )
         finally:
-            await asyncio.to_thread(self._band_exit, band_token)
+            with flight["lock"]:
+                deferred = flight["running"]
+                if deferred:
+                    flight["cleanup"] = lambda: self._band_exit(band_token)
+            if not deferred:
+                if not batch:
+                    await asyncio.to_thread(self._band_exit, band_token)
+                else:
+                    try:
+                        await asyncio.shield(
+                            self._submit_batch_thread(self._band_exit, band_token)
+                        )
+                    except asyncio.CancelledError:
+                        if result is None:
+                            raise
+                        # Actions have settled; retain their known progress and
+                        # any original failure while cleanup continues once.
+                        previous = result.error
+                        result.success = False
+                        result.error = {
+                            "message": "batch cancelled during band cleanup; release continues, no input scheduled",
+                            "type": "CancelledError",
+                        }
+                        if previous:
+                            result.error["previous_error"] = previous
+                        payload = json.loads(result.output)
+                        payload["text"] += "; " + result.error["message"]
+                        result.output = json.dumps(payload)
+        # Cleanup can change success (notably cancellation). Register only the
+        # final emitted result, never an intermediate screenshot or failed batch.
+        if result.success and captures:
+            self._issued_capture_results.append(
+                (copy.deepcopy(result.model_dump()), captures)
+            )
+        return result
+
+    def _take_issued_capture_result(self, result: Any) -> list | None:
+        """Consume an exact issued result at the actual coordinator tool:post seam."""
+        if not isinstance(result, dict) or result.get("success") is not True:
+            return None
+        for record in self._issued_capture_results:
+            if record[0] == result:
+                self._issued_capture_results.remove(record)
+                return record[1]
+        return None
 
     def _run_key_press(
-        self, params: dict[str, Any], binding: _Binding, index: int, repeat: int
+        self,
+        params: dict[str, Any],
+        binding: _Binding,
+        index: int,
+        repeat: int,
+        approved: Callable | None = None,
     ) -> tuple[str, str | None]:
         """Synchronously check and issue one press against a pinned binding.
 
@@ -2554,10 +2803,15 @@ class ComputerTool:
                 raise BackendError(
                     "action 'key' blocked: computer-use is mounted read_only"
                 )
+            self._check_write("key", binding, approved)
             return self._run("key", params, binding=binding)
 
     async def _run_key_repeat(
-        self, params: dict[str, Any], binding: _Binding, repeat: int
+        self,
+        params: dict[str, Any],
+        binding: _Binding,
+        repeat: int,
+        approved: Callable | None = None,
     ) -> tuple[str, str | None]:
         """Dispatch a logical key repeat one guarded press at a time.
 
@@ -2573,7 +2827,7 @@ class ComputerTool:
         last_image_b64: str | None = None
         for index in range(repeat):
             last_summary, last_image_b64 = await asyncio.to_thread(
-                self._run_key_press, params, binding, index, repeat
+                self._run_key_press, params, binding, index, repeat, approved
             )
             if index + 1 < repeat:
                 # Do not issue the next press in the same event-loop turn:
@@ -2583,122 +2837,239 @@ class ComputerTool:
             last_summary = f"{last_summary} ({repeat} times)"
         return last_summary, last_image_b64
 
-    async def _execute_calls(self, input: dict[str, Any]) -> ToolResult:
-        """The dialect-read + per-action dispatch loop, unchanged from
-        before band-lifetime tracking existed - split out of `execute()`
-        only so that method's own `try/finally` around `_band_enter`/
-        `_band_exit` does not have to re-indent this whole body.
+    def _run_flat_step(
+        self,
+        action: str,
+        params: dict[str, Any],
+        binding: _Binding,
+        approved: Callable | None,
+    ) -> tuple[str, str | None]:
+        if not binding.gate_writes:
+            # Preserve ungated local dispatch against its already checked,
+            # pinned backend. It cannot redirect input onto a new binding.
+            return self._run(action, params, binding=binding)
+        with self._announce_lock:
+            self._check_write(action, binding, approved)
+            return self._run(action, params, binding=binding)
 
-        Single-snapshot discipline (the fix for a six-lens council's
-        verified policy-bypass race, reproduced against unmodified
-        production code): `binding = self._binding` is read ONCE per
-        action, BEFORE the `read_only`/`MUTATING` check, and that SAME
-        object is passed into `_run` for the actual dispatch - never a
-        second, later `self._binding` read (via `self._read_only`/
-        `self._backend`/...) that a concurrent `retarget()` could have
-        already swapped. See `_run`'s own docstring for the full rationale
-        and the exact repro this closes.
-        """
-        dialect, calls = read_call(input, self.image_space)
+    def _check_write(
+        self, action: str, binding: _Binding, approved: Callable | None
+    ) -> None:
+        if self._binding is not binding:
+            raise BackendError("request stopped: target or policy changed")
+        if action in MUTATING or action in MUTATING_DESKTOP:
+            if binding.read_only:
+                raise BackendError("write blocked: computer-use is mounted read_only")
+            if binding.gate_writes and (
+                approved is None or self._write_approval is not approved
+            ):
+                raise BackendError(
+                    "write requires approval for this exact request and target"
+                )
 
+    def _run_batch_step(
+        self,
+        action: str,
+        params: dict[str, Any],
+        binding: _Binding,
+        approved: Callable | None,
+        flight: dict[str, Any],
+    ) -> tuple[str, str | None]:
+        try:
+            with self._announce_lock:
+                self._check_write(action, binding, approved)
+                outcome = self._run(action, params, binding=binding)
+                with flight["lock"]:
+                    flight["outcome"] = outcome
+                return outcome
+        except HaltedError as exc:
+            # A cancelled waiter can abandon its shielded worker. Record the
+            # halt here, exactly once, against the worker's pinned target before
+            # its exception is drained by the completion callback.
+            self._record_halt_result(action, exc, binding=binding)
+            raise
+        finally:
+            with flight["lock"]:
+                flight["running"] = False
+                cleanup = flight["cleanup"]
+            if cleanup is not None:
+                cleanup()
+
+    async def _execute_calls(
+        self,
+        calls: list[tuple[str, dict[str, Any]]],
+        *,
+        batch: bool,
+        capture_after: bool,
+        binding: _Binding,
+        approved: Callable | None,
+        flight: dict[str, Any],
+        captures: list,
+    ) -> ToolResult:
+        """Ordered execution with one pinned batch binding and no rollback/replay."""
+        summaries: list[str] = []
         last_summary = ""
         last_image_b64: str | None = None
-        try:
-            # The iterable may be lazy and may raise while being pulled (see
-            # `providers._normalize_openai_batch`), so iteration happens INSIDE
-            # this handler: a malformed entry halfway through a batch fails
-            # after the good actions before it have already run, exactly as the
-            # per-item loop did before. Every ValueError raised by `_run` is
-            # caught below and returned, so the only thing reaching this
-            # handler is a dialect read failure.
-            for action, params in calls:
-                if action not in ACTIONS:
-                    return ToolResult(
-                        success=False,
-                        error={
-                            "message": f"unknown action {action!r}; expected one of {', '.join(ACTIONS)}"
-                        },
-                    )
-                try:
-                    repeat = _key_repeat(params) if action == "key" else 1
-                except ValueError as exc:
-                    return ToolResult(
-                        success=False, error={"message": str(exc), "type": "ValueError"}
-                    )
-                # ONE binding read covering BOTH the policy check below AND
-                # the dispatch (`_run(..., binding=binding)`) - see this
-                # method's own docstring and `_run`'s.
-                binding = self._binding
-                if binding.read_only and action in MUTATING:
-                    return ToolResult(
-                        success=False,
-                        error={
-                            "message": f"action {action!r} blocked: computer-use is mounted read_only"
-                        },
-                    )
-                try:
-                    if action == "key":
-                        summary, image_b64 = await self._run_key_repeat(
-                            params, binding, repeat
-                        )
-                    else:
-                        # C4: `Backend` stays synchronous (local paths and all existing
-                        # tests untouched), but a remote action can block on a network
-                        # round trip for hundreds of milliseconds. Running it in a
-                        # thread keeps the event loop live so cancellation can actually
-                        # be serviced during that wait, instead of stalling behind a
-                        # screenshot transfer. Cheap locally too - `asyncio.to_thread`
-                        # on a microsecond-scale X11/Quartz call costs a thread-pool
-                        # round trip, not a network one.
-                        summary, image_b64 = await asyncio.to_thread(
-                            self._run, action, params, binding=binding
-                        )
-                except HaltedError as exc:
-                    return self._record_halt_result(action, exc)
-                except (BackendError, ValueError) as exc:
-                    return ToolResult(
-                        success=False,
-                        error={"message": str(exc), "type": type(exc).__name__},
-                    )
-                except Exception as exc:
-                    logger.exception("computer action %s failed", action)
-                    return ToolResult(
-                        success=False,
-                        error={"message": str(exc), "type": type(exc).__name__},
-                    )
-                last_summary = summary
-                if image_b64 is not None:
-                    last_image_b64 = image_b64
-        except ValueError as exc:
-            return ToolResult(
-                success=False, error={"message": str(exc), "type": "ValueError"}
-            )
+        terminal_full = False
 
-        if last_image_b64 is None:
-            if not dialect.result_must_carry_screenshot:
-                return ToolResult(success=True, output=last_summary)
-            # OpenAI's `computer_call_output` is invalid without an image, so
-            # take one more if the batch's own actions produced none - the
-            # model always sees the result of what it just did. A read
-            # (never gated by `read_only`), so a fresh binding read here
-            # (no check to keep in sync with) is fine.
-            try:
-                last_summary, last_image_b64 = await asyncio.to_thread(
-                    self._run, "screenshot", {}
+        async def batch_step(action: str, params: dict[str, Any]):
+            with flight["lock"]:
+                flight["running"] = True
+                flight["outcome"] = None
+            task = self._submit_batch_thread(
+                self._run_batch_step, action, params, binding, approved, flight
+            )
+            return await asyncio.shield(task)
+
+        for index, (action, params) in enumerate(calls):
+            presses_completed = 0
+            awaiting_step = False
+            error = None
+            if self._binding is not binding:
+                error = {
+                    "message": "batch stopped: target or policy changed",
+                    "type": "BackendError",
+                }
+            elif binding.read_only and action in MUTATING:
+                error = {
+                    "message": f"action {action!r} blocked: computer-use is mounted read_only"
+                }
+            elif binding.gate_writes and action in MUTATING and not approved:
+                error = {
+                    "message": "batch write requires approval for this exact batch and target"
+                }
+            if error:
+                return (
+                    self._batch_result(summaries, len(calls), error=error)
+                    if batch
+                    else ToolResult(success=False, error=error)
                 )
-            except (BackendError, ValueError) as exc:
-                return ToolResult(
-                    success=False,
+            try:
+                repeat = _key_repeat(params) if action == "key" else 1
+                if batch:
+                    for press in range(repeat):
+                        awaiting_step = True
+                        summary, image_b64 = await batch_step(action, params)
+                        awaiting_step = False
+                        if action == "key":
+                            presses_completed += 1
+                        if press + 1 < repeat:
+                            await asyncio.sleep(0)
+                    if repeat > 1:
+                        summary += f" ({repeat} times)"
+                elif action == "key":
+                    summary, image_b64 = await self._run_key_repeat(
+                        params, binding, repeat, approved
+                    )
+                else:
+                    summary, image_b64 = await asyncio.to_thread(
+                        self._run_flat_step, action, params, binding, approved
+                    )
+            except asyncio.CancelledError:
+                if not batch:
+                    raise
+                with flight["lock"]:
+                    running = flight["running"]
+                    outcome = flight.get("outcome")
+                # The worker may have finished while cancellation won the race
+                # to resume this await. Preserve that observed completion rather
+                # than call it uncertain or silently omit its input.
+                if awaiting_step and outcome is not None:
+                    summary, _ = outcome
+                    if action == "key":
+                        presses_completed += 1
+                    if action != "key" or presses_completed == repeat:
+                        summaries.append(
+                            f"{summary} ({repeat} times)" if repeat > 1 else summary
+                        )
+                        presses_completed = 0
+                return self._batch_result(
+                    summaries,
+                    len(calls),
+                    error={
+                        "message": "batch cancelled; in-flight input may still finish; no later action scheduled",
+                        "type": "CancelledError",
+                    },
+                    uncertain=index if running and outcome is None else None,
+                    presses_completed=presses_completed,
+                )
+            except Exception as exc:
+                if isinstance(exc, HaltedError):
+                    error = (
+                        {"message": str(exc), "type": type(exc).__name__}
+                        if batch
+                        else self._record_halt_result(action, exc).error
+                    )
+                else:
+                    logger.exception("computer action %s failed", action)
+                    error = {"message": str(exc), "type": type(exc).__name__}
+                return (
+                    self._batch_result(
+                        summaries,
+                        len(calls),
+                        error=error,
+                        uncertain=index,
+                        presses_completed=presses_completed,
+                    )
+                    if batch
+                    else ToolResult(success=False, error=error)
+                )
+            summaries.append(summary)
+            last_summary = summary
+            terminal_full = action == "screenshot" and image_b64 is not None
+            if image_b64 is not None:
+                last_image_b64 = image_b64
+            if batch and self._binding is not binding:
+                return self._batch_result(
+                    summaries,
+                    len(calls),
+                    error={
+                        "message": "batch stopped: target or policy changed",
+                        "type": "BackendError",
+                    },
+                )
+
+        if batch and capture_after and not terminal_full:
+            try:
+                _, last_image_b64 = await batch_step("screenshot", {})
+                if self._binding is not binding:
+                    raise BackendError(
+                        "batch final capture stopped: target or policy changed"
+                    )
+            except asyncio.CancelledError:
+                return self._batch_result(
+                    summaries,
+                    len(calls),
+                    error={
+                        "message": "batch final capture cancelled",
+                        "type": "CancelledError",
+                    },
+                )
+            except Exception as exc:
+                return self._batch_result(
+                    summaries,
+                    len(calls),
                     error={"message": str(exc), "type": type(exc).__name__},
                 )
-        # `_run("screenshot", ...)` always returns image bytes (never None) -
-        # see its own branch - so this is a real invariant, not a defensive guess.
-        assert last_image_b64 is not None
-        return self._screenshot_tool_result(last_summary, last_image_b64)
+        if batch:
+            return self._batch_result(
+                summaries,
+                len(calls),
+                image=last_image_b64,
+                display=binding.display,
+                captures=captures,
+            )
+        if last_image_b64 is None:
+            return ToolResult(success=True, output=last_summary)
+        return self._screenshot_tool_result(
+            last_summary, last_image_b64, captures=captures
+        )
 
-    def _record_halt_result(self, action: str, exc: HaltedError) -> ToolResult:
+    def _record_halt_result(
+        self, action: str, exc: HaltedError, *, binding: _Binding | None = None
+    ) -> ToolResult:
         """Shared halt bookkeeping for both `execute()`'s single-action path
-        and `_execute_openai_action_batch()`'s per-item loop - see
+        and the canonical batch loop - see
         `execute()`'s original inline comment (Defect 1 + defect 2,
         docs/designs/coexistence.md \u00a76.0/\u00a713 D3) for the full rationale;
         moved here unchanged so both callers hit the exact same recording
@@ -2722,17 +3093,26 @@ class ComputerTool:
         # Bug-hunt defect A fix: `_halt_key(self._backend)`, not the bare
         # `backend.name` - see that function's docstring for why the bare
         # composite name is not unique per remote host.
-        backend_name = _halt_key(self._backend)
+        backend_name = _halt_key(
+            binding.backend if binding is not None else self._backend
+        )
         record_halt(backend_name, exc.snapshot, reason=str(exc))
         return ToolResult(
             success=False, error={"message": str(exc), "type": type(exc).__name__}
         )
 
-    def _screenshot_tool_result(self, summary: str, image_b64: str) -> ToolResult:
+    def _screenshot_tool_result(
+        self,
+        summary: str,
+        image_b64: str,
+        *,
+        display: Display | None = None,
+        captures: list | None = None,
+    ) -> ToolResult:
         """Package a successful `_run()` outcome that produced an image into
         the marker `ToolResult` `hook-computer-use` looks for - unchanged
-        logic, extracted out of `execute()` so `_execute_openai_action_batch()`
-        can reuse it instead of re-implementing screenshot persistence.
+        logic shared by flat calls and canonical batches instead of
+        re-implementing screenshot persistence.
 
         Screenshots live on disk; only a path travels in the transcript. The hook
         inlines the bytes at request time, so the transcript never carries base64.
@@ -2748,6 +3128,29 @@ class ComputerTool:
         at creation time, it is not itself a guarantee, so this is what
         actually enforces owner-only access regardless of umask.
         """
+        try:
+            return self._persist_screenshot_result(
+                summary, image_b64, display=display, captures=captures
+            )
+        except (OSError, ValueError) as exc:
+            # Expected persistence/base64 packaging errors are observations, not
+            # uncertain input. Never recapture or relocate to disguise failure.
+            return ToolResult(
+                success=False,
+                error={
+                    "message": f"screenshot persistence failed: {exc}",
+                    "type": type(exc).__name__,
+                },
+            )
+
+    def _persist_screenshot_result(
+        self,
+        summary: str,
+        image_b64: str,
+        *,
+        display: Display | None,
+        captures: list | None,
+    ) -> ToolResult:
         SHOT_DIR.mkdir(parents=True, exist_ok=True)
         os.chmod(SHOT_DIR, _PRIVATE_DIR_MODE)
         # Prune BEFORE creating this call's own session directory - not
@@ -2762,9 +3165,29 @@ class ComputerTool:
         os.chmod(session_dir, _PRIVATE_DIR_MODE)
 
         path = session_dir / f"{uuid.uuid4().hex}.png"
-        path.write_bytes(base64.standard_b64decode(image_b64))
-        os.chmod(path, _PRIVATE_FILE_MODE)
-        disp = self.display
+        # Identity comes from the descriptor we actually wrote, not a later
+        # reopening of a path supplied in text. Exclusive creation rejects links.
+        with path.open("xb") as shot:
+            shot.write(base64.standard_b64decode(image_b64))
+            shot.flush()
+            os.fchmod(shot.fileno(), _PRIVATE_FILE_MODE)
+            status = os.fstat(shot.fileno())
+        if captures is not None:
+            captures.append(
+                (
+                    str(path),
+                    str(path.resolve()),
+                    (
+                        status.st_dev,
+                        status.st_ino,
+                        status.st_mode,
+                        status.st_size,
+                        status.st_mtime_ns,
+                        status.st_ctime_ns,
+                    ),
+                )
+            )
+        disp = display if display is not None else self.display
         return ToolResult(
             success=True,
             output=json.dumps(
@@ -2868,9 +3291,8 @@ _SCREEN_RECORDING_GATED_ACTIONS = {"screenshot", "zoom"}
 class DesktopTool:
     """Window and clipboard helpers that the native `computer` tool cannot express.
 
-    Once `computer` is promoted to Anthropic's server-side tool type, the model only
-    knows that tool's fixed action list - so window management and clipboard access
-    have to live somewhere else. This is that somewhere.
+    Native computer intent describes screenshot/input operations; window management,
+    clipboard access and target administration remain ordinary helper functions.
     """
 
     def __init__(self, computer: ComputerTool) -> None:
@@ -2950,6 +3372,34 @@ class DesktopTool:
         }
 
     async def execute(self, input: dict[str, Any]) -> ToolResult:
+        if not isinstance(input, dict):
+            return ToolResult(
+                success=False, error={"message": "desktop input must be an object"}
+            )
+        input = copy.deepcopy(input)
+        action = input.get("action")
+        action = action.strip() if isinstance(action, str) else action
+        if action not in DESKTOP_ACTIONS:
+            return ToolResult(
+                success=False, error={"message": f"unknown action {action!r}"}
+            )
+        input["action"] = action
+        binding = self._computer._binding
+        try:
+            if action == "focus_window" and (
+                not isinstance(input.get("handle"), str) or not input["handle"]
+            ):
+                raise ValueError("focus_window requires a nonempty handle")
+            if action == "set_clipboard" and not isinstance(input.get("text"), str):
+                raise ValueError("set_clipboard requires text")
+            approved = await self._computer._approve_write(
+                input, binding, action in MUTATING_DESKTOP
+            )
+            binding = self._computer._disclosed_binding(binding)
+        except Exception as exc:
+            return ToolResult(
+                success=False, error={"message": str(exc), "type": type(exc).__name__}
+            )
         # M3 disclosure-gate exemption (docs/designs/capability-awareness.md
         # \u00a75.4) - dispatched BEFORE `_ensure_announced`, deliberately, and
         # this is the one place in the whole module that is. `doctor` is the
@@ -3010,6 +3460,12 @@ class DesktopTool:
                 success=False,
                 error={"message": str(exc), "type": "AnnouncementRefused"},
             )
+        try:
+            binding = self._computer._disclosed_binding(binding)
+        except BackendError as exc:
+            return ToolResult(
+                success=False, error={"message": str(exc), "type": "BackendError"}
+            )
         # Band lifetime (docs/designs/band-lifetime.md, Alt A): `desktop`
         # shares `computer`'s ComputerTool instance (and therefore its
         # channel), so this participates in the SAME depth counter - a
@@ -3024,11 +3480,13 @@ class DesktopTool:
                 error={"message": str(exc), "type": "AnnouncementRefused"},
             )
         try:
-            return await self._execute_action(input)
+            return await self._execute_action(input, binding=binding, approved=approved)
         finally:
             await asyncio.to_thread(self._computer._band_exit, band_token)
 
-    async def _execute_action(self, input: dict[str, Any]) -> ToolResult:
+    async def _execute_action(
+        self, input: dict[str, Any], *, binding: _Binding, approved: Callable | None
+    ) -> ToolResult:
         """The actual per-action dispatch, unchanged from before band-
         lifetime tracking existed - split out of `execute()` only so that
         method's own `try/finally` around `_band_enter`/`_band_exit` does
@@ -3041,7 +3499,6 @@ class DesktopTool:
                     "message": f"unknown action {action!r}; expected one of {', '.join(DESKTOP_ACTIONS)}"
                 },
             )
-        binding = self._computer._binding
         if binding.read_only and action in _READ_ONLY_BLOCKED:
             return ToolResult(
                 success=False,
@@ -3085,14 +3542,20 @@ class DesktopTool:
                     )
                 return ToolResult(success=True, output=output)
             if action == "set_clipboard":
-                body = str(input.get("text") or "")
+                body = input["text"]
+
                 # Same guard discipline every other mutating action in
                 # `ComputerTool._run` now gets (§2) - `set_clipboard` mutates
                 # target state but is dispatched here, not through `_run`,
                 # so it needs its own explicit wiring rather than inheriting
                 # `_guard_write` for free.
-                with self._computer._guard_write(binding=binding):
-                    await asyncio.to_thread(backend.set_clipboard, body)
+                def set_clipboard():
+                    with self._computer._announce_lock:
+                        self._computer._check_write(action, binding, approved)
+                        with self._computer._guard_write(binding=binding):
+                            backend.set_clipboard(body)
+
+                await asyncio.to_thread(set_clipboard)
                 # §3 audit hardening: digest, never plaintext - the same
                 # discipline `type` uses, since clipboard content is exactly
                 # the kind of thing that "frequently includes credentials."
@@ -3130,50 +3593,8 @@ class DesktopTool:
                         f"{disp.model_width}x{disp.model_height}"
                     ),
                 )
-            if (
-                binding.gate_writes
-                and action in MUTATING_DESKTOP
-                and not self._computer._unattended_writes_ok
-                and not self._computer._interactive_write_approved
-            ):
-                # Fail-safe of last resort: reached only when NOTHING already
-                # granted this write - no gate hook synced
-                # `unattended_writes_ok=True` (the explicit unattended
-                # config opt-in), no gate hook synced
-                # `interactive_write_approved=True` (a human granting THIS
-                # call via `ask_user`), and `gate_writes` was not explicitly
-                # turned off. Every remedy is named here, not just pointed
-                # at - a doc pointer alone has already shipped as an
-                # unreachable-in-the-moment reference three times in this
-                # repo.
-                return ToolResult(
-                    success=False,
-                    error={
-                        "message": (
-                            f"action {action!r} requires confirmation "
-                            "(gate_writes) and nothing granted it: no gate "
-                            "hook is registered (or none has run yet), "
-                            "'unattended_writes_ok' is not set, and "
-                            "'gate_writes' was not explicitly disabled. The "
-                            "write was NOT sent. To proceed, do ONE of: (1) "
-                            "mount hook-computer-use so its 'tool:pre' gate "
-                            "hook can grant approval (interactively via "
-                            "'ask_user', or unattended - see (2)); (2) set "
-                            "hook-computer-use config "
-                            "'unattended_writes_ok: true' to allow writes on "
-                            "this target with no human confirmation - a "
-                            "deliberate, logged opt-in, never a default; or "
-                            "(3) set tool-computer-use config "
-                            "'gate_writes: false' to disable the gate "
-                            "entirely for this target - a deliberate, "
-                            "logged opt-out. See "
-                            "docs/designs/remote-transport.md \u00a710.4 for "
-                            "the policy rationale."
-                        )
-                    },
-                )
             summary, _ = await asyncio.to_thread(
-                self._computer._run, action, input, binding=binding
+                self._computer._run_flat_step, action, input, binding, approved
             )
             return ToolResult(success=True, output=summary)
         except (BackendError, ValueError) as exc:
@@ -3369,7 +3790,6 @@ def _action_surface(computer: ComputerTool) -> dict[str, Any]:
             action in MUTATING_DESKTOP
             and computer._gate_writes
             and not computer._unattended_writes_ok
-            and not computer._interactive_write_approved
         ):
             return (
                 "blocked: gate_writes is on and nothing has approved this "
@@ -4687,15 +5107,14 @@ async def _mount_backend(coordinator: Any, cfg: dict[str, Any]) -> dict[str, Any
     await coordinator.mount("tools", desktop, name=desktop.name)
     backend_name = computer._backend.name
     logger.info(
-        "tool-computer-use mounted: 'computer' (%s, backend=%s) + 'desktop'",
-        computer._tool_version,
+        "tool-computer-use mounted: 'computer' (neutral v1, backend=%s) + 'desktop'",
         backend_name,
     )
     return {
         "name": "tool-computer-use",
         "version": __version__,
         "provides": ["computer", "desktop"],
-        "description": f"Anthropic native computer-use via backend={backend_name}",
+        "description": f"Neutral v1 canonical computer execution via backend={backend_name}",
     }
 
 

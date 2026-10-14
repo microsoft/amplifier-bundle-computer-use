@@ -1,7 +1,7 @@
 [project]
 name = "amplifier-module-tool-computer-use"
 version = "0.1.0"
-description = "Anthropic native computer-use against the Windows desktop, from WSL2"
+description = "Provider-neutral canonical computer execution against local or SSH desktops"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }

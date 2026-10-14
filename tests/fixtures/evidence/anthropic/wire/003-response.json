@@ -1,0 +1,37 @@
+{
+  "container": null,
+  "content": [
+    {
+      "signature": "CAQStgUKEAgSGAI4AUIIdGhpbmtpbmcSDC8P4YOLVCYGJNVcihoM7r1KgQABsRCHavMyIjBrSCp9Q3I/j8AP8w+DxPnfKQYmhUPKrSclDzvQhyekqu2BI1Vupx7+WVzUiMmdLssq0wSa4p01GlLoLxWTQ/qJvyOFNbFWebc7owffZLmCjataX0e9/N4yLJrRHwdojd10pjijdmtNF+mhfM28m1nQKcgm/LgveX9QJZ+SuECcNBu5a/DAjtxgcszXXrhQvd+S08gHyvKnfCncxpWqsNL9cMaDh2NuHJvvOh+ZB0IWuDbVn1LbcOiSQnkxxyahP9wGdgO68JYlhmVyviZoLxQIFMC8QguCNCNZnm7pVjh815NlC9P/2g/T4rCWz5MTcSgCnGbS9yJ4uSfZ1K7tbObHGIhhTBIasGs00OTK3LA4m3vwbU4ZXqV8gUKeA+X+xLUPuM593JCBcfiWe0EHwtBPJFLGLDpEzhjezKfZxlMNS1qGc9ahIw3jG9HRVL2nDY6wie7BhK6nYwvq8bHDzHabgLWsVdhbFBo8GueTOGDBBGA5K1WBumvuv9sgh8SPPYYV1gvtJ2Ay0dxr5RWUCBYfIhAr1UFHPaAqwMlrzpCp4VZX4ZrRMnZqmYgRUaCr/EcUPuXvBFANCpCMqL4Rpa9RbBqsUwQr8nXey9hjLW8yfkbV0bBVcEoIlf7dzKBTYgtUkl17nUzLZ37gcn4x7jUQD9wYaD2lwo043Ml64rilxdt0OKLBqPU43ApWowKombwVbwT8EnTifj0BsaNTMZ2cjXvaVMZgGyZ03O1CYKCuT52olJXQfB4+w86gBAd+Mh6ZCGemYxgwxUtxKfWpflzssdoNhXt6Eh97FjB2s1VrGH8WFWeyks4nMl7NqLdDkwIjXD42O2CG1Su1pa9bshG7lDSAwX52GAE=",
+      "thinking": "",
+      "type": "thinking"
+    },
+    {
+      "text": "The receipt code in the screenshot is **BE65647C**. It appears under the heading \"OWNED TEST DESKTOP\". The text is small, so I could be misreading a character, such as B versus 8 or C versus G.",
+      "type": "text"
+    }
+  ],
+  "diagnostics": null,
+  "id": "public-service-006",
+  "model": "claude-sonnet-5-5",
+  "role": "assistant",
+  "stop_details": null,
+  "stop_reason": "end_turn",
+  "stop_sequence": null,
+  "type": "message",
+  "usage": {
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 0,
+      "ephemeral_5m_input_tokens": 2622
+    },
+    "cache_creation_input_tokens": 2622,
+    "cache_read_input_tokens": 0,
+    "inference_geo": "global",
+    "input_tokens": 2,
+    "output_tokens": 103,
+    "output_tokens_details": {
+      "thinking_tokens": 30
+    },
+    "service_tier": "standard"
+  }
+}

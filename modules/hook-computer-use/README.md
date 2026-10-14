@@ -1,55 +1,42 @@
 # hook-computer-use
 
-The `provider:request` handler prepares native computer integration only when
-the real `computer` tool is mounted. A headless session with only
-`computer_use_unavailable`, or a child session without computer access, skips
-provider lookup and probing. This prevents an irrelevant native-passthrough
-warning during ordinary file/function work.
+Projects `__amplifier_computer_use__` markers into generic copied text/image histories
+before both `request_budget()` and `complete()`. The caller's tools/messages stay
+unchanged, sync or awaitable budgets and named request options are preserved, and older
+screenshots collapse to text under `max_inline_screenshots`. Full error/progress/reference
+text is retained; no vendor image-only projection or extra user-reference turn is created.
 
-Tool presence is checked again each turn, not cached: activating a desktop later
-in the same session enables the normal probe on the next request. A failed tool
-lookup still warns and proceeds with the existing provider compatibility checks;
-it is not treated as confirmed absence.
+Local image reads additionally require a successful capture genuinely emitted by the
+mounted tool, transferred once through the coordinator's `tool:post` call/result
+association. Role/name/call-id/marker text and arbitrary paths grant no authority.
+Projection reuses that memory-only association for budget and completion, checking
+the original file identity before reading; replaced files and symlinks fail closed.
+After restart or bounded association eviction, marker history remains text, not new
+file-read authority. The association window retains at least the configured inline
+image window. Capture issuance awaiting `tool:post` is bounded to 64 image results.
 
-When `computer` is present, the existing native capability probes, compatibility
-checks, and unsupported-provider warnings remain unchanged. Skipping a probe
-does not assert that a provider supports native computer use.
+Native declarations, models/endpoints, vendor envelopes, safety requirements and replay
+provenance belong to providers. The hook neither probes private provider methods nor
+observes the effective model. Explicit v1 intent is detected independently of local
+aliases; ordinary `computer`/`screenshot` name collisions do not imply intent.
+The known orchestrator builder is checked for actual ToolSpec-extra preservation.
+A public `stream()` path this hook cannot project is refused loudly before wrapping.
 
-Screenshot expansion runs on independent request copies before both
-`request_budget()` (when present) and `complete()`. Budget preflight may serialize
-the full request before completion, so wrapping completion alone is too late.
-The wrapper preserves synchronous or awaitable budget results and named request
-options. Canonical messages and the caller's request remain unchanged.
-
-When the capability probe selects the exact bare `computer` dialect, its native
-call output requires one image. An explicit successful ToolResult containing the
-known single-screenshot marker becomes a single image block. The full original
-result, including appended text, accompanies it as labelled untrusted tool
-reference data with the call ID and `ephemeral` metadata. It is a request-only
-user-content carrier, not a system/developer instruction or a new user turn.
-Errors, ambiguous envelopes, missing files, multiple images and already mixed
-text/image results are left unchanged for the provider to validate or reject.
-The provider's existing image-byte validation is not changed or bypassed.
-
-Every retained native computer call requires its screenshot output. For this
-exact dialect, `max_inline_images` therefore does not replace older screenshots
-with text. This can increase request size and image-token cost; ordinary context
-limits still apply, and missing older image files fail closed. Other supported
-dialects retain the existing screenshot recency policy. This hook does not invent
-images, recapture screenshots, replay tools or clear a safety halt.
-
-`tests/test_native_screenshot_preflight.py` includes retained screenshot-result
-fixtures and offline regressions for both root and delegated results, unchanged
-history, repeated budget/dispatch calls and more than three screenshots. Optional
-provider integration cases run when `amplifier_module_provider_openai` is on the
-test import path; use the intended provider revision explicitly when qualifying
-a runtime combination. They stop before transport and do not establish live
-endpoint, model, desktop, or physical-device acceptance.
+The write gate inspects nested canonical batch actions, so a top-level batch cannot
+hide writes. Interactive approval is default-deny and bound to the exact batch payload
+and target/policy; the executor consumes that approval once. Explicit
+`unattended_writes_ok` remains a logged opt-out, never inferred. The existing ephemeral
+halt notice continues to require acknowledgment of interrupted work.
 
 Interactive applications with piped runtime stdin may register the boolean
-coordinator capability `approval.interactive` before module initialization.
-`True` means the app can deliver the standard `ask_user` approval to a person;
-it does not approve any action. `False` explicitly disables interactive prompting.
-Missing capability retains the legacy stdin-TTY check; malformed values or lookup
-failure fail closed. The gate still defaults to deny and never infers unattended
-write permission. This separates approval transport from write authorization.
+`approval.interactive` coordinator capability. `True` indicates that the host can
+deliver `ask_user`, not that any action is approved. `False` disables prompting.
+Missing capability uses the legacy stdin-TTY check; malformed values and lookup failures
+fail closed.
+
+Headless tests retain historical screenshot bytes and exercise real qualified provider
+SDKs through intercepted HTTP, without optional skips or private provenance seeding.
+This is offline composition evidence, not endpoint or desktop acceptance.
+Fresh live provider wire qualification is represented separately by the bounded
+neutral qualification fixtures and their active expiry/package-binding checks.
+The live native cases are screenshot-only, not general-operation or platform proof.

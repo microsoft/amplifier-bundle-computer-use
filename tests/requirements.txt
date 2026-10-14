@@ -1,0 +1,12 @@
+# Mandatory headless test/composition dependencies; SDK pins live in the CI matrix.
+amplifier-core
+pytest
+pytest-asyncio
+httpx
+httpx2
+jsonschema
+# Public Session initialization requires these exact merged test-only modules.
+git+https://github.com/microsoft/amplifier-module-loop-streaming@dd916499344671e0209d4951bc025777e3e891fd
+git+https://github.com/microsoft/amplifier-module-context-simple@db641363013ff906b656f49498a87ab01f5c506f
+git+https://github.com/microsoft/amplifier-module-provider-anthropic@9f9c50c040a2d5f4f24e2f7b9d196d30bf54608b
+git+https://github.com/microsoft/amplifier-module-provider-openai@38fee172673d196ba54b5e99e434490b86290c5d

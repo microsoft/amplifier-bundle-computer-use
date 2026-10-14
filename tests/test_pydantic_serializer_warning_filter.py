@@ -182,13 +182,9 @@ def test_mount_logs_error_when_self_check_fails(monkeypatch, caplog):
         warnings.catch_warnings(),
         caplog.at_level("ERROR", logger=hook_mod.__name__),
     ):
-        # `asyncio.get_event_loop().run_until_complete(...)`, not
-        # `asyncio.run(...)` - matches this repo's own convention
-        # (`test_screenshot_permissions.py`, `test_announce_first_use.py`).
-        # `asyncio.run()` explicitly clears the thread's current event loop
-        # on exit, which poisons every *later* pytest test in this process
-        # that relies on `get_event_loop()`'s implicit auto-create fallback.
-        result = asyncio.get_event_loop().run_until_complete(hook_mod.mount(coord, {}))
+        # Own this invocation's loop; earlier tests may have cleared the
+        # thread's default loop with asyncio.run().
+        result = asyncio.run(hook_mod.mount(coord, {}))
     assert result["name"] == "hook-computer-use"  # mount still succeeded
     errors = [r for r in caplog.records if r.levelname == "ERROR"]
     assert errors, "self-check failure must be logged at ERROR"
@@ -203,6 +199,6 @@ def test_mount_does_not_log_error_when_self_check_passes(caplog):
         warnings.catch_warnings(),
         caplog.at_level("ERROR", logger=hook_mod.__name__),
     ):
-        asyncio.get_event_loop().run_until_complete(hook_mod.mount(coord, {}))
+        asyncio.run(hook_mod.mount(coord, {}))
     errors = [r for r in caplog.records if r.levelname == "ERROR"]
     assert not errors

@@ -1,261 +1,162 @@
-"""Unit tests for the write-confirmation gate hook (`_make_gate_handler` in
-hook-computer-use) - `docs/designs/remote-transport.md` \u00a710.4: "gate every
-WRITE, or gate none". No real coordinator, no real backend, no network.
+"""Gate policy is installed by pre; actual public executor owns each decision.
+
+Former ask_user/pre-grant assertions now observe ApprovalSystem requests and
+zero/allowed backend input instead: a pre result is not approval evidence.
 """
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "modules" / "tool-computer-use"))
-sys.path.insert(0, str(ROOT / "modules" / "hook-computer-use"))
-
 import asyncio
+import copy
 
-import amplifier_module_hook_computer_use as hook_mod
-
-
-class _FakeBackend:
-    name = "remote-ssh:macos"
-
-
-class _FakeComputerTool:
-    def __init__(self, gate_writes: bool) -> None:
-        self._gate_writes = gate_writes
-        self._backend = _FakeBackend()
+import pytest
+from amplifier_core.approval import ApprovalTimeoutError
+from test_neutral_computer import Backend, Coordinator, cu, run
+from test_neutral_computer import hook as hook_mod
 
 
-class _FakeCoordinator:
-    def __init__(self, tools: dict) -> None:
-        self._tools = tools
+class Decisions:
+    def __init__(self, selected="Allow"):
+        self.selected = selected
+        self.requests = []
 
-    def get(self, mount_point, name=None):
-        if mount_point != "tools":
-            return None
-        return self._tools.get(name) if name else self._tools
+    async def request_approval(self, prompt, options, timeout, default):
+        self.requests.append((prompt, options, timeout, default))
+        if isinstance(self.selected, Exception):
+            raise self.selected
+        return self.selected
 
 
-def _run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+def setup_gate(monkeypatch, *, interactive=True, unattended=False, gate=True):
+    monkeypatch.setattr(hook_mod, "_interactive_approval_possible", lambda: interactive)
+    computer = cu.ComputerTool(Backend(), {"gate_writes": gate, "max_edge": 800})
+    computer.resolve_display()
+    coordinator = Coordinator(computer, interactive)
+    coordinator.tools["computer"] = computer
+    coordinator.approval_system = Decisions()
+    handler = hook_mod._make_gate_handler(coordinator, unattended_writes_ok=unattended)
+    return computer, coordinator, handler
+
+
+def install(handler, name="computer", payload=None):
+    result = run(handler("tool:pre", {"tool_name": name, "tool_input": payload or {}}))
+    assert result.action == "continue"
+    return result
 
 
 def test_gate_asks_user_for_a_mutating_action_when_gate_writes_is_on(monkeypatch):
-    """Only reaches `ask_user` when an interactive approval session is actually
-    possible - see the EOF-avoidance tests below for the non-interactive path."""
-    monkeypatch.setattr(hook_mod, "_interactive_approval_possible", lambda: True)
-    coord = _FakeCoordinator({"computer": _FakeComputerTool(gate_writes=True)})
-    handler = hook_mod._make_gate_handler(coord)
-
-    result = _run(
-        handler(
-            "tool:pre",
-            {"tool_name": "computer", "tool_input": {"action": "left_click"}},
-        )
-    )
-
-    assert result.action == "ask_user"
-    assert result.approval_default == "deny"
+    computer, coord, handler = setup_gate(monkeypatch)
+    payload = {"action": "left_click", "coordinate": [20, 30]}
+    install(handler, payload=payload)
+    assert coord.approval_system.requests == []
+    assert run(computer.execute(payload)).success
+    prompt, options, timeout, default = coord.approval_system.requests[0]
+    assert "left_click" in prompt and "neutral-fake" in prompt
+    assert options == ["Allow", "Deny"]
+    assert timeout == 300.0 and default == "deny"
+    assert len(computer._backend.calls) == 1
 
 
-def test_gate_passes_through_reads_even_when_gate_writes_is_on():
-    coord = _FakeCoordinator({"computer": _FakeComputerTool(gate_writes=True)})
-    handler = hook_mod._make_gate_handler(coord)
-
-    result = _run(
-        handler(
-            "tool:pre",
-            {"tool_name": "computer", "tool_input": {"action": "screenshot"}},
-        )
-    )
-
-    assert result.action == "continue"
+def test_gate_passes_through_reads_even_when_gate_writes_is_on(monkeypatch):
+    computer, coord, handler = setup_gate(monkeypatch)
+    install(handler)
+    assert run(computer.execute({"action": "cursor_position"})).success is False
+    # This fake intentionally lacks cursor_position; it still never asks approval.
+    assert coord.approval_system.requests == []
 
 
-def test_gate_off_never_asks():
-    coord = _FakeCoordinator({"computer": _FakeComputerTool(gate_writes=False)})
-    handler = hook_mod._make_gate_handler(coord)
-
-    result = _run(
-        handler(
-            "tool:pre",
-            {"tool_name": "computer", "tool_input": {"action": "left_click"}},
-        )
-    )
-
-    assert result.action == "continue"
+def test_gate_off_never_asks(monkeypatch):
+    computer, coord, handler = setup_gate(monkeypatch, gate=False)
+    install(handler)
+    assert run(computer.execute({"action": "key", "text": "enter"})).success
+    assert coord.approval_system.requests == []
 
 
-def test_gate_ignores_unrelated_tools():
-    coord = _FakeCoordinator({"computer": _FakeComputerTool(gate_writes=True)})
-    handler = hook_mod._make_gate_handler(coord)
-
-    result = _run(
-        handler(
-            "tool:pre",
-            {"tool_name": "read_file", "tool_input": {"action": "left_click"}},
-        )
-    )
-
-    assert result.action == "continue"
+def test_gate_ignores_unrelated_tools(monkeypatch):
+    computer, _, handler = setup_gate(monkeypatch)
+    install(handler, "read_file")
+    assert computer._write_approval is None
 
 
-def test_gate_handles_missing_tool_gracefully():
-    coord = _FakeCoordinator({})
-    handler = hook_mod._make_gate_handler(coord)
-
-    result = _run(
-        handler(
-            "tool:pre",
-            {"tool_name": "computer", "tool_input": {"action": "left_click"}},
-        )
-    )
-
-    assert result.action == "continue"
+def test_gate_handles_missing_tool_gracefully(monkeypatch):
+    _, coord, handler = setup_gate(monkeypatch)
+    coord.tools.clear()
+    install(handler)
 
 
 def test_gate_applies_to_desktop_tool_mutating_actions_too(monkeypatch):
-    monkeypatch.setattr(hook_mod, "_interactive_approval_possible", lambda: True)
-    computer = _FakeComputerTool(gate_writes=True)
-
-    class _FakeDesktopTool:
-        _computer = computer
-
-    coord = _FakeCoordinator({"computer": computer, "desktop": _FakeDesktopTool()})
-    handler = hook_mod._make_gate_handler(coord)
-
-    result = _run(
-        handler(
-            "tool:pre",
-            {"tool_name": "desktop", "tool_input": {"action": "focus_window"}},
-        )
-    )
-
-    assert result.action == "ask_user"
-
-
-# -- EOF-avoidance (D-gate-EOF): no interactive session available ---------------
-#
-# Real incident this closes: `ask_user`'s approval prompt is answered by an
-# app-layer ApprovalSystem this bundle does not own. On a backgrounded run with
-# no TTY, that system's own `input()` hits immediate EOF and raises EOFError,
-# which used to propagate uncaught all the way to the operator as
-# "Tool computer failed: EOF when reading a line" - a message that names
-# nothing. These tests prove the gate now decides BEFORE ever reaching that
-# broken path, using `_interactive_approval_possible` as the seam (mocked here
-# rather than actually manipulating sys.stdin).
+    computer, coord, handler = setup_gate(monkeypatch)
+    desktop = cu.DesktopTool(computer)
+    coord.tools["desktop"] = desktop
+    focused = []
+    computer._backend.focus_window = focused.append
+    computer._backend.list_windows = lambda: []
+    install(handler, "desktop")
+    assert run(desktop.execute({"action": "focus_window", "handle": "abc"})).success
+    assert focused == ["abc"]
+    assert len(coord.approval_system.requests) == 1
 
 
 def test_gate_denies_with_actionable_reason_when_no_interactive_session(monkeypatch):
-    """The core EOF fix: no TTY -> a real `deny` with a real reason, never
-    `ask_user` (which would crash into EOFError in the app-layer approval
-    system this hook does not control)."""
-    monkeypatch.setattr(hook_mod, "_interactive_approval_possible", lambda: False)
-    coord = _FakeCoordinator({"computer": _FakeComputerTool(gate_writes=True)})
-    handler = hook_mod._make_gate_handler(coord)
-
-    result = _run(
-        handler(
-            "tool:pre",
-            {"tool_name": "computer", "tool_input": {"action": "left_click"}},
-        )
+    computer, coord, handler = setup_gate(monkeypatch, interactive=False)
+    install(handler)
+    result = run(computer.execute({"action": "key", "text": "enter"}))
+    assert not result.success
+    assert all(
+        word in result.error["message"]
+        for word in ("approval", "interactive", "unattended_writes_ok")
     )
-
-    assert result.action == "deny"
-    assert result.reason is not None
-    # An agent/operator must be able to tell "needs approval" apart from
-    # "no interactive session" apart from "how to proceed" without a human
-    # debugging session - all three facts must be present in one string.
-    assert "approval" in result.reason.lower()
-    assert "interactive" in result.reason.lower() or "tty" in result.reason.lower()
-    assert "unattended_writes_ok" in result.reason
+    assert not computer._backend.calls and not coord.approval_system.requests
 
 
-def test_gate_unattended_writes_ok_allows_with_no_interactive_session(monkeypatch):
-    """The explicit, logged opt-in: with unattended_writes_ok=True AND no TTY,
-    the write proceeds - but ONLY because of the explicit config, never by
-    default and never inferred."""
-    monkeypatch.setattr(hook_mod, "_interactive_approval_possible", lambda: False)
-    coord = _FakeCoordinator({"computer": _FakeComputerTool(gate_writes=True)})
-    handler = hook_mod._make_gate_handler(coord, unattended_writes_ok=True)
-
-    result = _run(
-        handler(
-            "tool:pre",
-            {"tool_name": "computer", "tool_input": {"action": "left_click"}},
-        )
+def test_gate_unattended_writes_ok_allows_with_no_interactive_session(
+    monkeypatch, caplog
+):
+    computer, coord, handler = setup_gate(
+        monkeypatch, interactive=False, unattended=True
     )
-
-    assert result.action == "continue"
+    install(handler)
+    assert run(computer.execute({"action": "key", "text": "enter"})).success
+    assert computer._backend.calls == [("key", "enter")]
+    assert not coord.approval_system.requests
+    assert "NO human confirmation" in caplog.text
 
 
 def test_gate_unattended_writes_ok_defaults_false(monkeypatch):
-    """Never a default: constructing the handler with no explicit opt-in must
-    still deny (not silently allow) when there is no interactive session."""
-    monkeypatch.setattr(hook_mod, "_interactive_approval_possible", lambda: False)
-    coord = _FakeCoordinator({"computer": _FakeComputerTool(gate_writes=True)})
-    handler = hook_mod._make_gate_handler(coord)  # no unattended_writes_ok kwarg
-
-    result = _run(
-        handler(
-            "tool:pre",
-            {"tool_name": "computer", "tool_input": {"action": "left_click"}},
-        )
-    )
-
-    assert result.action == "deny"
+    test_gate_denies_with_actionable_reason_when_no_interactive_session(monkeypatch)
 
 
 def test_interactive_approval_possible_reflects_stdin_isatty(monkeypatch):
-    """The real (non-mocked) seam: a TTY reports True, a non-TTY reports
-    False - both directions, so the heuristic itself is proven, not just its
-    call sites."""
     monkeypatch.setattr(hook_mod.sys.stdin, "isatty", lambda: True)
     assert hook_mod._interactive_approval_possible() is True
-
     monkeypatch.setattr(hook_mod.sys.stdin, "isatty", lambda: False)
     assert hook_mod._interactive_approval_possible() is False
 
 
 def test_interactive_approval_possible_false_when_isatty_raises(monkeypatch):
-    """A closed/replaced stdin (some harnesses) must degrade to False, never
-    optimistically to True."""
+    def boom():
+        raise ValueError("closed")
 
-    def _boom():
-        raise ValueError("I/O operation on closed file")
-
-    monkeypatch.setattr(hook_mod.sys.stdin, "isatty", _boom)
+    monkeypatch.setattr(hook_mod.sys.stdin, "isatty", boom)
     assert hook_mod._interactive_approval_possible() is False
 
 
 def test_host_approval_capability_reaches_ask_user_without_a_terminal(monkeypatch):
+    computer, coord, handler = setup_gate(monkeypatch)
     monkeypatch.setattr(hook_mod, "_interactive_approval_possible", lambda: False)
-    computer = _FakeComputerTool(gate_writes=True)
-    coord = _FakeCoordinator({"computer": computer})
-    coord.get_capability = lambda name: True if name == "approval.interactive" else None
-    result = _run(
-        hook_mod._make_gate_handler(coord)(
-            "tool:pre",
-            {"tool_name": "computer", "tool_input": {"action": "left_click"}},
-        )
-    )
-    assert result.action == "ask_user"
-    assert result.approval_default == "deny"
+    install(handler)
+    assert run(computer.execute({"action": "key", "text": "enter"})).success
+    assert coord.approval_system.requests[0][3] == "deny"
     assert computer._unattended_writes_ok is False
 
 
 def test_unavailable_or_malformed_host_transport_never_uses_tty_fallback(monkeypatch):
-    monkeypatch.setattr(hook_mod, "_interactive_approval_possible", lambda: True)
-    coord = _FakeCoordinator({"computer": _FakeComputerTool(gate_writes=True)})
+    computer, coord, handler = setup_gate(monkeypatch)
+    install(handler)
     for value in (False, "true", 1, {}, lambda: True):
         coord.get_capability = lambda _name, value=value: value
-        result = _run(
-            hook_mod._make_gate_handler(coord)(
-                "tool:pre", {"tool_name": "computer", "tool_input": {"action": "type"}}
-            )
-        )
-        assert result.action == "deny"
+        assert not run(computer.execute({"action": "key", "text": "enter"})).success
+    assert not computer._backend.calls and not coord.approval_system.requests
 
     def unavailable(_name):
         raise RuntimeError("transport unavailable")
@@ -264,3 +165,146 @@ def test_unavailable_or_malformed_host_transport_never_uses_tty_fallback(monkeyp
     assert hook_mod._host_approval_possible(coord) is False
     coord.get_capability = lambda _name: None
     assert hook_mod._host_approval_possible(coord) is True
+
+
+@pytest.mark.parametrize(
+    "selected",
+    [
+        "Deny",
+        "deny",
+        "unknown",
+        "",
+        None,
+        True,
+        EOFError("EOF"),
+        TimeoutError("timeout"),
+        ApprovalTimeoutError("public approval timeout"),
+    ],
+)
+def test_denial_default_unknown_error_and_timeout_are_zero_input(monkeypatch, selected):
+    computer, coord, handler = setup_gate(monkeypatch)
+    coord.approval_system.selected = selected
+    install(handler)
+    disclosed = []
+    computer._ensure_announced = lambda: disclosed.append(True)
+    assert not run(computer.execute({"action": "key", "text": "enter"})).success
+    assert not computer._backend.calls and not disclosed
+    coord.approval_system.selected = "Allow"
+    assert run(computer.execute({"action": "key", "text": "later"})).success
+    assert computer._backend.calls == [("key", "later")]
+
+
+def test_missing_public_approval_system_fails_closed(monkeypatch):
+    computer, coord, handler = setup_gate(monkeypatch)
+    del coord.approval_system
+    install(handler)
+    assert not run(computer.execute({"action": "key", "text": "enter"})).success
+    assert not computer._backend.calls
+
+
+@pytest.mark.parametrize("shape", ["flat", "batch"])
+@pytest.mark.parametrize("same", [False, True])
+@pytest.mark.parametrize("opposite", [False, True])
+def test_overlapping_calls_have_independent_decisions(
+    monkeypatch, shape, same, opposite
+):
+    computer, coord, handler = setup_gate(monkeypatch)
+
+    async def scenario():
+        started = asyncio.Event()
+        releases = [asyncio.Future(), asyncio.Future()]
+        requests = []
+
+        class Pending:
+            async def request_approval(self, prompt, options, timeout, default):
+                index = len(requests)
+                requests.append(prompt)
+                if len(requests) == 2:
+                    started.set()
+                return await releases[index]
+
+        coord.approval_system = Pending()
+        a = {"action": "key", "text": "A"}
+        b = {"action": "key", "text": "A" if same else "B"}
+        if shape == "batch":
+            a = {"version": 1, "actions": [a], "capture_after": False}
+            b = {"version": 1, "actions": [b], "capture_after": False}
+        originals = copy.deepcopy([a, b])
+        install_data = {"tool_name": "computer", "tool_input": a}
+        await handler("tool:pre", install_data)
+        task_a = asyncio.create_task(computer.execute(a))
+        await handler("tool:pre", {**install_data, "tool_input": b})
+        task_b = asyncio.create_task(computer.execute(b))
+        await asyncio.wait_for(started.wait(), 2)
+        assert not computer._backend.calls
+        if opposite:
+            releases[1].set_result("Deny")
+            assert not (await task_b).success
+            releases[0].set_result("Allow")
+        else:
+            releases[0].set_result("Allow")
+            assert (await task_a).success
+            releases[1].set_result("Deny")
+        ra, rb = await asyncio.gather(task_a, task_b)
+        assert ra.success and not rb.success
+        assert computer._backend.calls == [("key", "A")]
+        assert [a, b] == originals
+
+    run(scenario())
+
+
+@pytest.mark.parametrize("shape", ["flat", "batch"])
+@pytest.mark.parametrize("same", [False, True])
+def test_cancelled_overlap_never_steals_allowed_call(monkeypatch, shape, same):
+    computer, coord, handler = setup_gate(monkeypatch)
+
+    async def scenario():
+        ready = asyncio.Event()
+        futures = [asyncio.Future(), asyncio.Future()]
+        prompts = []
+
+        class Pending:
+            async def request_approval(self, prompt, options, timeout, default):
+                index = len(prompts)
+                prompts.append(prompt)
+                if len(prompts) == 2:
+                    ready.set()
+                return await futures[index]
+
+        coord.approval_system = Pending()
+        await handler("tool:pre", {"tool_name": "computer"})
+        a = {"action": "key", "text": "A"}
+        b = {"action": "key", "text": "A" if same else "B"}
+        if shape == "batch":
+            a = {"version": 1, "actions": [a], "capture_after": False}
+            b = {"version": 1, "actions": [b], "capture_after": False}
+        task_a = asyncio.create_task(computer.execute(a))
+        task_b = asyncio.create_task(computer.execute(b))
+        await asyncio.wait_for(ready.wait(), 2)
+        task_b.cancel()
+        if shape == "flat":
+            with pytest.raises(asyncio.CancelledError):
+                await task_b
+        else:
+            result = await task_b
+            assert not result.success and result.error["type"] == "CancelledError"
+        assert not computer._backend.calls
+        futures[0].set_result("Allow")
+        assert (await task_a).success
+        assert computer._backend.calls == [("key", "A")]
+        coord.approval_system = Decisions("Deny")
+        assert not (await computer.execute(a)).success
+        assert computer._backend.calls == [("key", "A")]
+
+    run(scenario())
+
+
+@pytest.mark.parametrize("shape", ["flat", "batch"])
+def test_no_hook_computer_write_fails_closed(monkeypatch, shape):
+    computer, _, _ = setup_gate(monkeypatch)
+    payload = {"action": "key", "text": "enter"}
+    if shape == "batch":
+        payload = {"version": 1, "actions": [payload], "capture_after": False}
+    result = run(computer.execute(payload))
+    assert not result.success and "gate_writes" in result.error["message"]
+    assert not computer._backend.calls

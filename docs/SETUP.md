@@ -70,14 +70,14 @@ Stated plainly so you can pick a path you can actually finish.
 
 | Path | Status |
 |---|---|
-| Anthropic provider driving a real desktop | **Proven live.** `claude-sonnet-4-5` / `claude-sonnet-5` / `claude-opus-5` verified against the real API (`providers.py` `ANTHROPIC.models`) |
-| OpenAI provider driving a real desktop | **Proven live.** `gpt-5.5` verified end-to-end through this bundle against a real remote desktop, 2026-08-03 (`providers.py` `OPENAI.models`) |
+| Anthropic provider driving a real desktop | **Historical live evidence.** `claude-sonnet-4-5` / `claude-sonnet-5` / `claude-opus-5` captures retained; not neutral-v1 acceptance |
+| OpenAI provider driving a real desktop | **Historical live evidence.** `gpt-5.5` against a real remote desktop, 2026-08-03; not neutral-v1 acceptance |
 | Windows target (WSL2 interop, local) | **Proven.** Capture and input both verified end to end — see `BACKLOG.md` |
 | macOS target — capture, `key`, `focus_window` | **Proven** on real hardware |
 | macOS target — `type_text` | **Proven** on real hardware. Was broken (keycode-0 events); fixed in `ccf0913`, re-verified 2026-09-15 on macOS 26.6.2 |
 | Linux/X11 target (local) | Backend implemented; presence guard measured (`GUARD_MEASURED["linux-x11"] = True`) |
 | Remote target over SSH | Full action set is implemented and dispatched, including `left_mouse_down`/`up`, `left_click_drag`, `scroll`, `hold_key`, and all four `desktop` window/clipboard actions — see [Remote action coverage](#remote-action-coverage) |
-| Gemini | A dialect record exists in `providers.py` (`gemini-2.5-computer-use` → `computer_use`), built from captured traffic. **No live end-to-end run through this bundle is claimed.** |
+| Gemini | Historical captured traffic retained. Bundle-owned dialect code is retired; **no live end-to-end run through this bundle is claimed.** |
 
 A whole-session, end-to-end run with the hook, native tool promotion, screenshot
 rewriting and the write gate all executing *together* is still listed as not done in
@@ -88,93 +88,60 @@ is not product-level proof.
 
 ## 1. Upstream module version floor
 
-Three Amplifier modules must carry recent changes, or this bundle either refuses to
-mount or quietly degrades. **You do not need to check this up front** — see below.
+The orchestrator must preserve `native_tool_spec` extras through Core `ToolSpec`
+construction. The hook exercises the known loop-streaming builder using neutral
+`computer_use.version=1` intent, not a vendor tool type. A negative result raises
+`ComputerUseNativeToolPassthroughUnsupportedError`; use loop-streaming at least
+`f8004e0` (PR #36), or another builder proven to preserve extras.
 
-**The package version numbers are useless as a floor.** All three still declare
-`version = "1.0.0"` in their `pyproject.toml` and did not bump for these changes, so
-this bundle does not ask you to pin anything by commit before you start. Instead:
-
-**How the bundle checks.** It does *not* trust a version string — manifests can lie and a
-shallow clone may not have one. `hook-computer-use` drives the actually-installed code
-with throwaway probes and reads the real output:
-
-- `_provider_derives_native_tool_betas` — calls the provider's own
-  `_derive_native_tool_betas([{"type": "computer_20251124", "name": "computer"}])`
-  and checks the returned betas mention computer-use. (Anthropic convention.)
-- `_provider_recognizes_bare_computer_tool` — first calls OpenAI's pure,
-  argument-free `get_native_computer_tool_spec()` seam and accepts only an
-  exact `{"type": "computer"}` result. For a legacy provider without a usable
-  seam, it calls `_convert_tools_from_request(...)` only when that provider
-  explicitly reports `tool_search_mode == "off"`; namespaced conversion is
-  stateful and is never probed. (OpenAI convention.)
-- `_orchestrator_preserves_native_tool_spec` — drives loop-streaming's own
-  `_build_tool_spec()` against a stub and checks the native `type` survives.
-
-If the orchestrator check fails, mount raises
-`ComputerUseNativeToolPassthroughUnsupportedError` and names the commits above. If the
-*provider* check fails, the hook wraps nothing and logs which integration points it
-tried — it does not raise, because a failed provider probe cannot distinguish "this
-build predates the fix" from "this provider was never meant to support computer-use."
-
-**Honest limitation, from the code's own docstring:** those two cases look identical from
-outside. If your provider probe fails, check the commit — the probe cannot tell you which
-it is.
+Providers must consume neutral v1 intent during actual request assembly. This bundle
+does not inspect their private conversion methods or observe models. Qualify the
+installed provider combination separately; version strings alone do not establish
+native support. The hook projects generic copied histories before budget and completion,
+and loudly refuses an unsupported public `stream()` path.
 
 ---
 
 ## 2. The endpoint must support native computer use
 
-The hook verifies only wire plumbing, not endpoint availability. It selects Anthropic's
-dated tool dialect when beta derivation recognizes its canonical probe and OpenAI's bare
-`computer` dialect when conversion preserves its canonical probe. No alias or version
-table is a capability gate; the server remains authoritative for acceptance.
+Native model/endpoint capabilities, declarations, headers, vendor units and replay are
+**provider-owned**. This bundle exports local screenshot/input operations and real cached
+screenshot-pixel dimensions, never guessed geometry. Unknown dimensions permit ordinary
+fallback or precise native-required refusal. Native intent is explicit, not a tool-name
+heuristic. Unsupported semantics must retain ordinary function support or refuse safely.
 
-### OpenAI
+Do not configure `model` or `tool_version` on this tool: those retired hints no longer
+select a dialect. Configure model/native requirements on the provider. In particular
+the current qualified OpenAI provider retains ordinary fallback for the full operation
+set when it cannot losslessly translate every native operation; a narrower supported
+request intent can select its native path. Fallback is not native acceptance.
 
-The converter's successful bare `computer` probe selects the dialect for every alias or
-future model identifier. It does not predict which identifiers the server will accept.
+Canonical calls are either flat actions or exact v1 batches:
 
-### Anthropic
-
-Anthropic's tool type is versioned per model generation, and a model paired with the wrong
-type is rejected with an HTTP 400 on *every* turn. `provider-anthropic` resolves it:
-
-| Family | Version | `computer_use_tool_type` |
-|---|---|---|
-| opus | 4.6+ | `computer_20251124` |
-| opus | 4.1 – 4.5 | `computer_20250124` |
-| opus | below 4.1 | `None` — unsupported |
-| sonnet | 4.6+ | `computer_20251124` |
-| sonnet | 4.5 | `computer_20250124` |
-| sonnet | below 4.5 | `None` — unsupported |
-| haiku | 4.5+ | `computer_20250124` |
-| haiku | below 4.5 | `None` — unsupported |
-
-This bundle keeps its own independently-verified table in
-`modules/tool-computer-use/.../providers.py`, keyed on the *undated* generation prefix:
-
-```
-claude-sonnet-4-5  -> computer_20250124
-claude-sonnet-5    -> computer_20251124
-claude-opus-5      -> computer_20251124
-gpt-5.5            -> computer
+```json
+{"version": 1, "actions": [{"action": "key", "text": "ctrl+s", "repeat": 1}], "capture_after": true}
 ```
 
-A model **absent** from that table is *unverified*, not unsupported. The bundle never
-invents a compatibility guess for it. Consequences at mount time
-(`tool_versions.require_static_pairing`):
+The whole batch is validated before input. Coordinates are screenshot pixels, scroll
+amounts wheel notches, and batch durations 0–60 seconds. Read-only, approval, disclosure,
+coexistence, halt and target-binding guards still apply. Failures/cancellation retain
+completed and uncertain progress without rollback/replay. A successful final observation
+requires a full terminal screenshot or one new full capture; earlier/zoom images do not
+satisfy it. Errors are not concealed by recapture.
 
-- You set `config.model` to a **known** model and a *conflicting* `tool_version` →
-  `ToolVersionError`, mount fails loud with the correct value in the message.
-- You set `config.model` to an **unverified** model with no `tool_version` →
-  `ToolVersionError`. Set `tool_version` explicitly to unblock.
-- You set neither → falls back to `computer_20251124`, then self-corrects at request
-  time from the live model (`resolve_tool_version`, never raises).
-
-**Recommendation: set neither `model` nor `tool_version`.** Request-time resolution reads
-the model actually about to receive the request and always wins over stale config — which
-also covers `provider-anthropic`'s own mid-session model fallback.
+Fresh qualification is a separate pre-release check:
+`.venv/bin/python -m pytest release_checks/ -q` checks current checkout/script and
+actually loaded package bindings, deep artifact integrity and a real-time 30-day
+freshness window, on both SDK rows (see `CONTRIBUTING.md`). Ordinary PR/main CI checks
+archived neutral evidence **AS RECORDED**, not current bindings or freshness.
+Historical captures and
+`tests/fixtures/wire-check.json` dates/results are retained, not refreshed;
+`scripts/wire_check.py` is historical bundle-dialect tooling, not a neutral-v1 ship gate.
+The current native live cases are screenshot-only on owned Linux X11. Approved input
+policy is qualified with exact alphanumeric input, not general text fidelity or other
+platforms. Providers supply native evidence; the independent release verifier checks
+combined installed-package and hardware evidence. Offline SDK composition alone is
+not release proof.
 
 ---
 
@@ -406,8 +373,7 @@ aspirations. `behaviors/computer-use.yaml` ships a minimal subset.
 | `enable_zoom` | `true` | Advertise the `zoom` action in the native spec |
 | `read_only` | `false` local / **`true` remote** | Enforced in code — every mutating action is rejected before anything reaches the desktop. Screenshots still work |
 | `gate_writes` | `is_remote and not read_only` | Per-action human approval for mutating actions |
-| `tool_version` | *(auto)* | Native tool type override. Leave unset — see §2 |
-| `model` | *(unset)* | Static model hint used to validate `tool_version` at mount |
+| `tool_version` / `model` | *(retired)* | Ignored by this tool; native/model configuration belongs to providers — see §2 |
 | `target_monitor` | `"primary"` | A monitor id, `"primary"`, or `monitors.VIRTUAL_DESKTOP` for the whole bounding box |
 | `clipboard_read_policy` | `allow` local / `redact` remote | `allow` \| `redact` \| `block` |
 | `type_pacing_ms` | *(auto)* | Inter-character delay. Auto = wide enough to keep the presence guard unmasked when one is active; `0` forces full speed (logged at WARNING) |
@@ -820,7 +786,7 @@ locked-screen artifact, on a re-test that never compared pixel content.
 | `Tool computer failed: EOF when reading a line` | *(fixed)* Approval prompt with no TTY | Run interactively, or set `unattended_writes_ok: true` |
 | PowerShell banner text where JSON was expected | `bridge.ps1` missing from the deployed payload | Should not occur — it is in `PAYLOAD_MODULES`. File an issue |
 | `SESSION_LOCKED` / `this macOS session is LOCKED` | Target is locked | Unlock it. §8 |
-| `ToolVersionError` at mount | `model` / `tool_version` conflict, or an unverified model with no override | §2 |
+| Provider native refusal or ordinary fallback | Provider cannot safely represent the declared neutral operations/model/endpoint | Read the provider's diagnostic; §2. This hook does not probe its capabilities |
 
 ### Trace
 

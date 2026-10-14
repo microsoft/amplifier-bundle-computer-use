@@ -1,0 +1,38 @@
+{
+  "container": null,
+  "content": [
+    {
+      "caller": {
+        "type": "direct"
+      },
+      "id": "public-service-018",
+      "input": {},
+      "name": "screenshot",
+      "toolset_name": "computer",
+      "type": "tool_use"
+    }
+  ],
+  "diagnostics": null,
+  "id": "public-service-007",
+  "model": "claude-sonnet-5-5",
+  "role": "assistant",
+  "stop_details": null,
+  "stop_reason": "tool_use",
+  "stop_sequence": null,
+  "type": "message",
+  "usage": {
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 0,
+      "ephemeral_5m_input_tokens": 165
+    },
+    "cache_creation_input_tokens": 165,
+    "cache_read_input_tokens": 2622,
+    "inference_geo": "global",
+    "input_tokens": 4,
+    "output_tokens": 47,
+    "output_tokens_details": {
+      "thinking_tokens": 0
+    },
+    "service_tier": "standard"
+  }
+}

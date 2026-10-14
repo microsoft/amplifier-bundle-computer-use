@@ -2,7 +2,8 @@
 
 Give an Amplifier session real control of a **desktop** — Windows (**via WSL2**), macOS,
 or Linux (**X11**) — on this machine or another one across your private network, using the
-LLM provider's **native computer-use tool**, not a homegrown imitation of it.
+**provider-neutral computer intent and canonical actions**. Providers decide whether
+to compile that intent into a supported native tool or keep ordinary function support.
 
 If a human could do it by looking at the screen and clicking, this can do it. No API, no
 CLI, no browser extension required.
@@ -60,35 +61,30 @@ support, a reachable target machine, and (for remote targets) SSH.
 
 ---
 
-## What makes this the native thing
+## The neutral ownership boundary
 
-Both Anthropic and OpenAI post-train their models on a **specific server-side tool
-definition**. Sending a lookalike function tool instead gets you noticeably worse
-targeting — or, on OpenAI, a hard 400. This bundle sends the real one, per vendor:
+`ComputerTool.native_tool_spec` carries explicit `computer_use.version=1` intent
+through existing `ToolSpec` extras. Its operations describe the local screenshot/input
+executor; cached `image_space` dimensions are screenshot pixels, never physical monitor
+pixels or a guessed display size. Unknown dimensions are omitted without discovery.
+Window/geometry helpers remain ordinary functions, also available through `desktop`.
 
-```jsonc
-// Anthropic — versioned type, dimensions REQUIRED
-{"type": "computer_20251124", "name": "computer",
- "display_width_px": 1280, "display_height_px": 720, "enable_zoom": true}
+**Providers own models, endpoint support, native declarations, headers, vendor units,
+safety requirements and replay.** This bundle has no model tables, vendor action readers,
+or provider-private capability probes. A tool named `computer` or `screenshot` without
+intent is ordinary; intent works under a local alias. Unsupported native semantics
+must fall back to ordinary functions or refuse a native-required request.
 
-// OpenAI — bare type, every extra field is a 400
-{"type": "computer"}
-```
-
-Anthropic additionally needs the `computer-use-2025-11-24` beta header (derived by the
-provider itself). Screenshots come back as genuine base64 **image** content blocks
-inside the tool result, exactly as each vendor's own loop does.
-
-**Both providers have driven a real desktop through this bundle.** Anthropic:
-`claude-sonnet-4-5`, `claude-sonnet-5`, `claude-opus-5`. OpenAI: `gpt-5.5`, verified
-end-to-end against a real remote desktop. A Gemini dialect record exists
-(`gemini-2.5-computer-use`), transcribed from captured traffic — no live end-to-end run
-through this bundle is claimed for it.
-
-The hook selects the provider's native declaration by behavior: Anthropic's beta
-derivation selects its canonical dated type; OpenAI's conversion selects bare
-`computer`. This is dialect plumbing, not a model capability verdict: the server remains
-the authority on whether an endpoint accepts computer use.
+Historical real desktop captures are retained in `tests/fixtures/captures/`; they
+do not qualify this new boundary. Independently checked evidence lives in
+`tests/fixtures/neutral-qualification.json` with its expected package bindings and
+hashed receipts. Ordinary PR/main CI checks its archived **AS RECORDED** integrity,
+not current bindings or freshness. The separate pre-release command
+`.venv/bin/python -m pytest release_checks/ -q` rejects missing, mismatched, tampered
+or expired evidence (after 30 days) and must pass both SDK rows; see `CONTRIBUTING.md`.
+Native live evidence is restricted to screenshot-only declarations;
+input-policy evidence covers exact approved alphanumeric input on owned Linux X11,
+not general text fidelity, all native operations, or other platforms.
 
 ## The one thing that had to be solved
 
@@ -101,37 +97,53 @@ That is fixed at **one seam** — the provider's `complete()` call — by
 
 - unwraps the orchestrator's `ToolResult` envelope and expands screenshot markers into
   real image blocks,
-- keeps only the **N most recent** screenshots inline so long sessions stay affordable.
+- keeps only the **N most recent** screenshots inline so long sessions stay affordable,
+- preserves complete error/progress/reference text without vendor-specific user turns.
 
 (`ToolSpec` used to be built from `name`/`description`/`parameters` only, so a tool
 couldn't declare itself a server-side tool type either — `hook-computer-use` used to
 promote it and inject the beta header itself. That is now handled upstream:
 `loop-streaming` preserves a tool's `native_tool_spec` through its own `ToolSpec`
-construction, and `provider-anthropic` derives the required `anthropic-beta` header
-itself. `hook-computer-use` now only verifies that support is present and refuses to
-mount if it isn't — see `_fail_if_orchestrator_native_tool_spec_unsupported`, and
-`docs/SETUP.md` §1 for the exact commits you need.)
+construction. Providers consume the neutral intent during request assembly;
+`hook-computer-use` checks the known orchestrator's extra preservation, not provider
+capabilities. It refuses an unsupported public `stream()` path loudly.)
 
-Remove the hook and the tool degrades cleanly to an ordinary function tool. Nothing is
-monkey-patched on disk; nothing rots when the orchestrator changes.
+Without the hook, marker paths are not expanded into image history. Native declarations
+remain the provider's responsibility. Nothing is monkey-patched on disk.
 
 ## Components
 
 | Piece | Role |
 |---|---|
-| `modules/tool-computer-use` | `computer` (native action set) + `desktop` (windows, clipboard) |
-| `modules/hook-computer-use` | The wire-format seam described above |
+| `modules/tool-computer-use` | Neutral intent, canonical execution, scaling and desktop safety |
+| `modules/hook-computer-use` | Generic copied image/error history plus write/halt policy |
 | `agents/computer-operator.md` | Operating discipline for driving a live machine |
 | `bridge.ps1` | WSL2 → Windows execution via `powershell.exe` + Win32 |
 
 ### Tools
 
-**`computer`** — the native action set: `screenshot`, `zoom`, `cursor_position`,
+**`computer`** — the canonical action set: `screenshot`, `zoom`, `cursor_position`,
 `mouse_move`, `left_click`, `right_click`, `middle_click`, `double_click`,
 `triple_click`, `left_mouse_down`, `left_mouse_up`, `left_click_drag`, `scroll`, `key`,
 `hold_key`, `type`, `wait`, plus `screen_info`, `list_windows`, `focus_window`. `key` also
 accepts an optional integer `repeat` from 1 to 100 (default 1); each press is independently
 guarded, and a target or policy change stops the remaining presses.
+
+Flat calls remain supported. V1 batches use the same action/parameter vocabulary:
+
+```json
+{"version": 1, "actions": [
+  {"action": "mouse_move", "coordinate": [426, 87]},
+  {"action": "key", "text": "ctrl+s", "repeat": 1}
+], "capture_after": true}
+```
+
+The entire batch is validated before disclosure/input. Batch durations are bounded
+to 0–60 seconds; scroll amounts are wheel notches. Nested writes cannot evade approval.
+Execution stops on denial, failure, cancellation, halt or binding/policy change.
+Progress reports completed actions and uncertain in-flight input; no rollback or replay
+is implied. `capture_after` takes one full final screenshot unless the terminal action
+already produced one. Earlier screenshots and cropped zooms never satisfy it.
 
 **`desktop`** — what the native schema cannot express: `list_windows`, `focus_window`,
 `screen_info`, `get_clipboard`, `set_clipboard`, `list_monitors`, `select_monitor`.
@@ -167,7 +179,7 @@ tools:
       max_edge: 1280              # long edge of the image the model sees
       enable_zoom: true
       read_only: false            # true = screenshots only, all input blocked
-      # tool_version: auto-resolved from the live model — leave unset
+      # Model/native wire settings belong in the provider, not this module.
 
 hooks:
   - module: hook-computer-use
@@ -190,16 +202,12 @@ you are not looking at:
 **See [`docs/SETUP.md`](docs/SETUP.md) — this is the part that is more involved than a
 typical bundle.** In brief:
 
-- **Recent-enough upstream modules** — `loop-streaming`, and `provider-anthropic` and/or
-  `provider-openai`, need changes not yet reflected in their package version (all three
-  still declare `1.0.0`, so there is no version floor to check up front). You do not need
-  to pin anything by commit before you start: the bundle probes the actually-installed
-  code at mount time rather than trusting a version string, and refuses to mount (naming
-  the exact commit to upgrade to) if the orchestrator cannot carry the native tool form.
-  See `docs/SETUP.md` §1 for how the probe works.
-- **An endpoint that accepts native computer use** — the hook proves provider wire
-  plumbing, not model availability; the server remains authoritative. §2 of the setup
-  doc explains the boundary.
+- **An orchestrator preserving ToolSpec extras** — the hook checks the known
+  loop-streaming builder rather than trusting its version string, and refuses when
+  it drops explicit neutral intent. See `docs/SETUP.md` §1.
+- **A provider that consumes neutral v1 intent** — native model/endpoint support,
+  fallback, wire translation and replay are provider-owned. The hook does not probe
+  them. §2 of the setup doc explains the boundary.
 - **A target machine** — local or remote over SSH — meeting its platform's **hard**
   prerequisites. These are not optional, and two of the three are not caught at mount:
   - **Windows: WSL2 is required.** There is no native-Windows code path. `windows.py` is a
@@ -306,24 +314,20 @@ complete: markers=1 messages_with_blocks=3
 No `markers=` line → screenshots are not reaching the model. A mount-time
 `ComputerUseNativeToolPassthroughUnsupportedError` means the installed `loop-streaming`
 does not yet carry `computer`'s native tool form to the wire on its own — see that
-error's message for the exact commit to upgrade to. A provider that fails its wire
-probe does **not** raise; the hook logs which integration points it tried
-(`_derive_native_tool_betas` for Anthropic's dated types,
-`get_native_computer_tool_spec` for OpenAI's pure bare-`computer` seam, and
-legacy `_convert_tools_from_request` only when `tool_search_mode == "off"`) and
-wraps nothing.
+error's message for the orchestrator upgrade. Provider-native refusal/fallback diagnostics
+come from the provider; this hook performs no wire capability probes.
 
 ## Tests
 
 ```bash
-python tests/test_wire_format.py
+python -m pytest tests/test_neutral_computer.py tests/test_native_screenshot_preflight.py tests/test_provider_neutral_composition.py -q
 ```
 
 Asserts the real bytes: screenshot markers expanded to image blocks that survive
 `model_dump()` without an API-rejected `visibility` key, recency window enforced, and
-graceful degradation when a screenshot file is gone. (Native tool-spec passthrough is no
-longer done by this hook — it's verified at mount time instead; see
-`tests/test_native_tool_passthrough_guard.py`.)
+graceful degradation when a screenshot file is gone. Composition tests require the
+qualified provider wheels and their real SDKs; HTTP is intercepted and no live requests
+are made. They test native subsets and ordinary fallback, not release acceptance.
 
 ---
 
