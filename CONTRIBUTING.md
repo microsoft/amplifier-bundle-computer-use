@@ -60,6 +60,11 @@ route around per-contribution.
 .venv/bin/python -m pytest tests/ -q
 ```
 
+Ordinary PR/main CI checks archived neutral evidence **AS RECORDED** against its
+independently established expectations, including deep hashed artifact references.
+That integrity check is neither real-time freshness nor a match to today's checkout
+or installed packages; it does not grant current release qualification.
+
 **Tests must pass on Linux with no desktop present.** This project targets CI on
 `ubuntu-latest` with no X server, no Xvfb, no display of any kind — the suite is
 designed for that and stubs/fakes the platform layer rather than driving a real screen.
@@ -133,14 +138,28 @@ ANTHROPIC_API_KEY=... OPENAI_API_KEY=... .venv/bin/python scripts/wire_check.py
 ```
 
 `tests/fixtures/wire-check.json` and historical captures remain unchanged and are
-checked as history, not current qualification. The active release consumer requires
+checked as history, not current qualification. The separate pre-release consumer requires
 `tests/fixtures/neutral-qualification.json` and independently established
 `neutral-qualification-expected.json`, with safe relative receipts/captures under
 that evidence root. Missing, failed, future, older-than-30-day, tampered, wrong-profile
 or unbound evidence fails; historical HTTP 200 is never a fallback.
-The committed qualification is a bounded observation, not a permanent release grant:
-run the active consumer against its expected bindings and refresh genuinely expired
-or changed-package evidence. Native live cases are screenshot-only; the owned Linux
+The committed qualification is a bounded observation, not a permanent release grant.
+Before making a release claim, this strict command must pass on **both SDK rows**
+listed above; it checks current checkout/script manifests, actually loaded packages,
+the real-time 30-day window and deep artifact integrity:
+
+```bash
+.venv/bin/python -m pytest release_checks/ -q
+```
+
+After merge, use **Actions → CI → Run workflow** for that two-row check.
+`workflow_dispatch` becomes available when this workflow is on the default branch.
+Ordinary PR/main runs execute `tests/` only. Dispatch checks existing evidence offline;
+it does not regenerate evidence or enforce release publication, tags or branch
+protection. Paid provider calls and an owned display are needed only for actual fresh
+live regeneration, not these checks. Refresh genuinely expired or changed-binding
+evidence through independent qualification, never by editing dates or prior verdicts.
+Native live cases are screenshot-only; the owned Linux
 X11 approval-policy case verifies byte-exact alphanumeric input, not general text
 fidelity or other platforms. A successful later check never relabels an earlier failure.
 Provider owners supply native declaration/result/replay and actual wire settings,
@@ -182,6 +201,10 @@ value. Import and `--help` are offline and never provision a display.
 .venv/bin/python scripts/neutral_qualification.py validate neutral-qualification.json \
   qualification-expected.json --evidence-root qualification-evidence
 ```
+
+The `neutral_qualification.py validate` CLI checks the supplied expectations, not
+their agreement with the current checkout or installed packages. Use the
+`release_checks/` command above for those current-binding checks and deep integrity.
 
 The producer records observed public `complete`/`request_budget`/`estimate` invocation
 counts (absent public methods have zero observations), **not physical HTTP counts**.
@@ -228,8 +251,8 @@ removal. No foreign process sweep, persistent display, or host installation is n
 Unit controls in `tests/test_neutral_qualification.py` are explicitly synthetic,
 created only in temporary test directories, and rejected by the default release
 validator. They prove consumer/controller behavior, not actual wire/GUI acceptance.
-The implementation-only focused tests may pass while the whole freshness gate is
-RED pending The independent verifier's genuine qualification; do not skip/weaken that release gate.
+The ordinary suite may PASS while the separate pre-release check is RED pending
+the independent verifier's genuine qualification; do not skip or weaken that release gate.
 
 Focused headless composition requires real qualified provider wheels and SDKs with HTTP
 intercepted, never optional SDK skips or private provenance injection:

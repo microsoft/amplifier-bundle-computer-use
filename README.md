@@ -76,10 +76,13 @@ intent is ordinary; intent works under a local alias. Unsupported native semanti
 must fall back to ordinary functions or refuse a native-required request.
 
 Historical real desktop captures are retained in `tests/fixtures/captures/`; they
-do not qualify this new boundary. Fresh, independently checked evidence lives in
+do not qualify this new boundary. Independently checked evidence lives in
 `tests/fixtures/neutral-qualification.json` with its expected package bindings and
-hashed receipts. The active consumer rejects missing, mismatched or expired evidence
-(after 30 days). Native live evidence is restricted to screenshot-only declarations;
+hashed receipts. Ordinary PR/main CI checks its archived **AS RECORDED** integrity,
+not current bindings or freshness. The separate pre-release command
+`.venv/bin/python -m pytest release_checks/ -q` rejects missing, mismatched, tampered
+or expired evidence (after 30 days) and must pass both SDK rows; see `CONTRIBUTING.md`.
+Native live evidence is restricted to screenshot-only declarations;
 input-policy evidence covers exact approved alphanumeric input on owned Linux X11,
 not general text fidelity, all native operations, or other platforms.
 

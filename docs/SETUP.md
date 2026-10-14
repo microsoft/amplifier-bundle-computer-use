@@ -129,8 +129,12 @@ completed and uncertain progress without rollback/replay. A successful final obs
 requires a full terminal screenshot or one new full capture; earlier/zoom images do not
 satisfy it. Errors are not concealed by recapture.
 
-Fresh qualification is checked by the active neutral fixture consumer against exact
-package bindings and a 30-day freshness window. Historical captures and
+Fresh qualification is a separate pre-release check:
+`.venv/bin/python -m pytest release_checks/ -q` checks current checkout/script and
+actually loaded package bindings, deep artifact integrity and a real-time 30-day
+freshness window, on both SDK rows (see `CONTRIBUTING.md`). Ordinary PR/main CI checks
+archived neutral evidence **AS RECORDED**, not current bindings or freshness.
+Historical captures and
 `tests/fixtures/wire-check.json` dates/results are retained, not refreshed;
 `scripts/wire_check.py` is historical bundle-dialect tooling, not a neutral-v1 ship gate.
 The current native live cases are screenshot-only on owned Linux X11. Approved input

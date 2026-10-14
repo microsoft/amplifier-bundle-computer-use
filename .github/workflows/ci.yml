@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 # Cancel superseded runs on the same ref.
 concurrency:
@@ -52,6 +53,10 @@ jobs:
 
       - name: Run tests
         run: .venv/bin/python -m pytest tests/ -q
+
+      - name: Verify release qualification
+        if: github.event_name == 'workflow_dispatch'
+        run: .venv/bin/python -m pytest release_checks/ -q
 
 
   lint:
