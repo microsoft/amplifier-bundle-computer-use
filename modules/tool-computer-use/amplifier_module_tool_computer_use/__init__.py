@@ -403,6 +403,7 @@ class ComputerTool:
         # session previously wrote into together. See `execute()` and
         # `_prune_shots()`.
         self._session_id: str = uuid.uuid4().hex
+        self._observed_control = None
         # One-shot handoff to the hook's real tool:post call association. Only
         # successful image results emitted by this instance enter this queue.
         # It is bounded, memory-only, and cannot be reconstructed from history.
@@ -1123,6 +1124,9 @@ class ComputerTool:
         batch_item["properties"]["duration"].update(
             minimum=0, maximum=MAX_BATCH_DURATION_SECONDS
         )
+        if self._observed_control is not None:
+            flat["properties"]["action"] = {"type": "string", "enum": [*ACTIONS, "observe", "act"]}
+            flat["properties"].update(revision={"type": "string"}, candidate={"type": "string"})
         return {
             "type": "object",
             "description": (
@@ -1215,6 +1219,9 @@ class ComputerTool:
         binding = binding if binding is not None else self._binding
         guard = binding.coexistence_guard
         if guard is None:
+            if self._observed_control is not None:
+                from .observed_control import check_observed_proof
+                check_observed_proof(binding)
             yield
             return
         if binding.is_remote and binding.announcement is not None:
@@ -1223,6 +1230,9 @@ class ComputerTool:
         guard.bind_target()
         guard.before_event(coord=coord)
         try:
+            if self._observed_control is not None:
+                from .observed_control import check_observed_proof
+                check_observed_proof(binding)
             yield
         finally:
             guard.after_event()
@@ -2607,6 +2617,8 @@ class ComputerTool:
 
     async def execute(self, input: dict[str, Any]) -> ToolResult:
         """Run a flat canonical call or one fully prevalidated v1 batch."""
+        if self._observed_control is not None and isinstance(input, dict) and input.get("action") in {"observe", "act"}:
+            return await self._observed_control.execute(input)
         binding = self._binding
         try:
             calls, batch, capture_after = self._prepare_calls(input, binding)
@@ -5098,6 +5110,9 @@ async def _mount_backend(coordinator: Any, cfg: dict[str, Any]) -> dict[str, Any
     (`mount()`) or a `ToolResult` (`_activate`).
     """
     computer = await asyncio.to_thread(_select_and_build, cfg)
+    if cfg.get("observed_control") is True:
+        from .observed_control import ObservedControl
+        computer._observed_control = ObservedControl(computer)
     # Session-start disclosure (docs/designs/coexistence.md §7) is
     # deliberately NOT built here - see `ComputerTool._ensure_announced` for
     # why it fires on first real action instead (a validation-probe mount()
