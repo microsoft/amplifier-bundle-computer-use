@@ -93,3 +93,14 @@ def test_extension_is_absent_by_default():
     tool=ComputerTool(Backend(),{})
     assert 'observe' not in tool.input_schema['properties']['action']['enum']
     assert tool._observed_control is None
+
+
+@pytest.mark.asyncio
+async def test_approval_reading_time_keeps_exact_unchanged_target():
+    tool,backend=setup()
+    async def approve(prepared,binding):
+        tool._observed_control.observations['proof']['observation']['created_at']-=20
+        return True
+    tool._write_approval=approve
+    assert (await act(tool)).output['status']=='completed'
+    assert backend.calls==[('click',60,35,'left',1)]

@@ -56,7 +56,9 @@ class ObservedControl:
 
     def observe(self, binding):
         raw, digest, width, height = self.capture(binding)
-        output = subprocess.run(["tesseract", "stdin", "stdout", "--psm", "11", "tsv"],
+        # Automatic segmentation retains colored button labels that sparse-text
+        # segmentation can discard as graphics. Targets remain observed regions.
+        output = subprocess.run(["tesseract", "stdin", "stdout", "--psm", "3", "tsv"],
             input=raw, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=5, check=True).stdout.decode()
         groups = {}
         for row in csv.DictReader(io.StringIO(output), delimiter="\t"):
@@ -88,10 +90,13 @@ class ObservedControl:
         saved = proof["saved"]
         if not proof["active"] or binding is not saved["binding"] or self.computer._binding is not binding:
             raise StaleObservation("Observed action revoked or target changed")
-        if time.monotonic()-saved["observation"]["created_at"]>15:
+        if not proof.get("validated") and time.monotonic()-saved["observation"]["created_at"]>15:
             raise StaleObservation("Observation expired")
         if self.capture(binding)[1] != saved["digest"]:
             raise StaleObservation("Screen changed since selection")
+        # Subsequent checks surround an exact-action approval wait. Always
+        # recapture and compare pixels; do not expire solely while a human reads.
+        proof["validated"] = True
 
     async def execute(self, arguments):
         async with self.lock:
