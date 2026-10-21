@@ -1,6 +1,6 @@
 """Opt-in local OCR observations for bounded selectors; execution stays in computer.
 
-Only CLICK and WAIT are exposed in this first desktop lane. OCR regions are not
+OCR clicks, typing into current focus, bounded key presses and scrolling are exposed. OCR regions are not
 accessibility controls. The pixel fingerprint is deliberately conservative: any
 screen change, expired observation, retarget, or revoked proof stops dispatch.
 """
@@ -76,6 +76,11 @@ class ObservedControl:
             identity = "ocr-"+str(len(elements))
             elements.append({"id":identity,"name":name,"rect":[left,top,right-left,bottom-top],"source":"ocr-region"})
             candidates.append({"id":identity+":click","operation":"CLICK","name":name,"target":identity})
+        candidates.append({"id":"focused:type", "operation":"TYPE_TEXT", "name":"Type into the currently focused field; first focus the intended field"})
+        candidates.extend({"id":"key:"+key,"operation":"KEY","name":"Press "+key,"key":key}
+                          for key in ("Tab","Return","Escape","ctrl+a","ctrl+s","BackSpace","Down","Up"))
+        candidates.extend({"id":"scroll:"+direction,"operation":"SCROLL","name":"Scroll "+direction,"direction":direction}
+                          for direction in ("up","down"))
         candidates.extend({"id":x.lower(),"operation":x} for x in ("WAIT","DONE","BLOCKED"))
         state = {"text":"\n".join(e["name"] for e in elements), "elements":elements,
             "width":width,"height":height,"source":"local-x11-ocr","pixel_sha256":digest}
@@ -107,12 +112,18 @@ class ObservedControl:
                     binding = self.computer._binding
                     observed = await asyncio.to_thread(self.observe, binding)
                     return ToolResult(success=True, output=observed)
-                if set(arguments)-{"action","revision","candidate"}:
+                if set(arguments)-{"action","revision","candidate","text"}:
                     raise ValueError("Observed desktop actions accept only revision and candidate")
                 saved = self.observations.get(arguments.get("revision"))
                 candidate = next((c for c in saved["observation"]["candidates"] if c["id"]==arguments.get("candidate")),None) if saved else None
                 if candidate is None: raise StaleObservation("Candidate was not observed")
                 if candidate["operation"] == "WAIT": canonical={"action":"wait","duration":.2}
+                elif candidate["operation"] == "TYPE_TEXT":
+                    text = arguments.get("text")
+                    if not isinstance(text,str) or len(text)>10000: raise ValueError("Invalid text")
+                    canonical={"action":"type","text":text}
+                elif candidate["operation"] == "KEY": canonical={"action":"key","text":candidate["key"]}
+                elif candidate["operation"] == "SCROLL": canonical={"action":"scroll","scroll_direction":candidate["direction"],"scroll_amount":3}
                 elif candidate["operation"] == "CLICK":
                     target=next(e for e in saved["observation"]["state"]["elements"] if e["id"]==candidate["target"])
                     x,y,w,h=target["rect"]

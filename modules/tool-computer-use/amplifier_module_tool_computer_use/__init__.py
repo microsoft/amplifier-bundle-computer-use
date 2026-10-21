@@ -1142,9 +1142,17 @@ class ComputerTool:
         }
 
     # -- explicit neutral intent (transported by ToolSpec extras) ---------------
+    # Screenshot issuance is independent of provider-native action selection.
+    computer_use_screenshots = True
+
     @property
     def native_tool_spec(self) -> dict[str, Any]:
         """Only cached local facts; never discover geometry or inspect a model."""
+        # Observed candidate actions are an ordinary function contract, not
+        # vendor-native computer actions. Keep the canonical ordinary interface
+        # intact for recovery (including screenshots and bounded batches).
+        if self._observed_control is not None:
+            return {"type": "function"}
         binding = self._binding
         unavailable = {}
         if not self._enable_zoom:

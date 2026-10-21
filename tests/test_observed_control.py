@@ -104,3 +104,18 @@ async def test_approval_reading_time_keeps_exact_unchanged_target():
     tool._write_approval=approve
     assert (await act(tool)).output['status']=='completed'
     assert backend.calls==[('click',60,35,'left',1)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('candidate,canonical', [
+    ({'id':'key','operation':'KEY','key':'Tab'}, {'action':'key','text':'Tab'}),
+    ({'id':'text','operation':'TYPE_TEXT'}, {'action':'type','text':'Example'}),
+    ({'id':'scroll','operation':'SCROLL','direction':'down'}, {'action':'scroll','scroll_direction':'down','scroll_amount':3}),
+])
+async def test_observed_keyboard_and_scroll_keep_canonical_approval(candidate,canonical):
+    tool,backend=setup();seen=[]
+    tool._observed_control.observations['proof']['observation']['candidates']=[candidate]
+    async def deny(prepared,binding):seen.append(prepared);return False
+    tool._write_approval=deny
+    result=await tool.execute({'action':'act','revision':'proof','candidate':candidate['id'],'text':'Example'})
+    assert result.output['status']=='denied' and seen==[canonical] and not backend.calls
