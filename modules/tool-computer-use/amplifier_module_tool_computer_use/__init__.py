@@ -2318,16 +2318,25 @@ class ComputerTool:
                 guard.check_start_permission()
                 guard.bind_target()
                 try:
+                    typing_guard = guard
+                    if self._observed_control is not None:
+                        from .observed_control import observed_typing_guard
+
+                        typing_guard = observed_typing_guard(guard, binding)
                     if pacing_ms > 0:
                         pacing_seconds = pacing_ms / 1000.0
                         for ch in body:
-                            backend.type_text(ch, guard=guard)
+                            backend.type_text(ch, guard=typing_guard)
                             time.sleep(pacing_seconds)
                     else:
-                        backend.type_text(body, guard=guard)
+                        backend.type_text(body, guard=typing_guard)
                 finally:
                     guard.release_target()
             else:
+                if self._observed_control is not None:
+                    from .observed_control import check_observed_proof
+
+                    check_observed_proof(binding)
                 backend.type_text(body)
             # §3 audit hardening: a digest, never the plaintext - typed
             # content frequently includes credentials (the same rationale

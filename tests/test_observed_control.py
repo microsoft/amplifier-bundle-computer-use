@@ -1,11 +1,16 @@
 """Observed selection keeps canonical approval, freshness, and read-only gates."""
 
+import asyncio
 import io
 import time
+from types import SimpleNamespace
 
 import pytest
 from amplifier_module_tool_computer_use import ComputerTool
-from amplifier_module_tool_computer_use.observed_control import ObservedControl
+from amplifier_module_tool_computer_use.observed_control import (
+    CURRENT_PROOF,
+    ObservedControl,
+)
 from PIL import Image
 from test_computer_tool_coexistence import _FakeBackend
 
@@ -21,8 +26,8 @@ class Backend(_FakeBackend):
         return buf.getvalue()
 
 
-def setup(config=None):
-    backend = Backend()
+def setup(config=None, *, backend=None):
+    backend = backend or Backend()
     tool = ComputerTool(backend, {"gate_writes": True, **(config or {})})
     tool.resolve_display()
     tool._ensure_announced()
@@ -201,3 +206,162 @@ async def test_observed_keyboard_and_scroll_keep_canonical_approval(
         and seen == [canonical]
         and not backend.calls
     )
+
+
+class TypingBackend(Backend):
+    """Fake only input, retaining the local backend's per-character guard order."""
+
+    def type_text(self, text, guard=None):
+        for char in text:
+            if guard is not None:
+                guard.before_event()
+            self.calls.append(("character", char))
+            # Successful input changes the captured screen, as a real field does.
+            self.color = "black"
+            if guard is not None:
+                guard.after_event()
+
+
+class TypingGuard:
+    def __init__(self):
+        self.events = []
+        self.on_before = lambda: None
+        self.presence = SimpleNamespace(guard_ms=10)
+
+    def check_start_permission(self):
+        self.events.append("start")
+
+    def bind_target(self):
+        self.events.append("bind")
+
+    def before_event(self, **kwargs):
+        self.events.append("before")
+        self.on_before()
+
+    def after_event(self):
+        self.events.append("after")
+
+    def release_target(self):
+        self.events.append("release")
+
+
+def setup_typing(*, guarded, pacing=1):
+    tool, backend = setup({"type_pacing_ms": pacing}, backend=TypingBackend())
+    guard = TypingGuard() if guarded else None
+    tool._coexistence_guard = guard
+    saved = tool._observed_control.observations["proof"]
+    saved["binding"] = tool._binding
+    saved["observation"]["candidates"] = [{"id": "text", "operation": "TYPE_TEXT"}]
+    return tool, backend, guard
+
+
+async def type_observed(tool):
+    return await tool.execute(
+        {"action": "act", "revision": "proof", "candidate": "text", "text": "Ada"}
+    )
+
+
+def change_typing_authority(change, tool, backend):
+    if change == "screen":
+        backend.color = "black"
+    elif change == "revoked":
+        CURRENT_PROOF.get()["active"] = False
+    elif change == "retarget":
+        tool._backend = TypingBackend()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("guarded", [False, True])
+@pytest.mark.parametrize("change", ["screen", "revoked", "retarget", "unchanged"])
+async def test_observed_typing_rechecks_after_delayed_approval(guarded, change):
+    tool, backend, guard = setup_typing(guarded=guarded)
+    waiting, resume = asyncio.Event(), asyncio.Event()
+    seen = []
+
+    async def approve(prepared, binding):
+        seen.append(prepared)
+        waiting.set()
+        await resume.wait()
+        # An initially fresh observation may survive a long human reading pause.
+        tool._observed_control.observations["proof"]["observation"]["created_at"] -= 20
+        change_typing_authority(change, tool, backend)
+        return True
+
+    tool._write_approval = approve
+    task = asyncio.create_task(type_observed(tool))
+    await asyncio.wait_for(waiting.wait(), timeout=2)
+    assert not backend.calls and not task.done()
+    resume.set()
+    result = await asyncio.wait_for(task, timeout=2)
+    assert seen == [{"action": "type", "text": "Ada"}]
+    if change == "unchanged":
+        assert result.output["status"] == "completed"
+        assert backend.calls == [("character", char) for char in "Ada"]
+        if guarded:
+            assert guard.events == ["start", "bind"] + ["before", "after"] * 3 + [
+                "release"
+            ]
+    else:
+        assert result.output["status"] == (
+            "unknown" if change == "retarget" else "stale"
+        )
+        assert not backend.calls and not tool._backend.calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["screen", "revoked", "retarget"])
+async def test_observed_typing_rechecks_after_first_presence_wait(change):
+    tool, backend, guard = setup_typing(guarded=True)
+    guard.on_before = lambda: change_typing_authority(change, tool, backend)
+
+    async def approve(prepared, binding):
+        return True
+
+    tool._write_approval = approve
+    result = await type_observed(tool)
+    assert result.output["status"] == "stale"
+    assert not backend.calls and not tool._backend.calls
+    assert guard.events == ["start", "bind", "before", "release"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pacing", [0, 1])
+async def test_observed_typing_allows_its_own_screen_changes(pacing):
+    tool, backend, guard = setup_typing(guarded=True, pacing=pacing)
+
+    async def approve(prepared, binding):
+        return True
+
+    tool._write_approval = approve
+    result = await type_observed(tool)
+    assert result.output["status"] == "completed"
+    assert backend.calls == [("character", char) for char in "Ada"]
+    assert guard.events == ["start", "bind"] + ["before", "after"] * 3 + ["release"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["revoked", "retarget", "presence"])
+@pytest.mark.parametrize("pacing", [0, 1])
+async def test_observed_typing_stops_between_characters_without_replaying(
+    change, pacing
+):
+    tool, backend, guard = setup_typing(guarded=True, pacing=pacing)
+
+    def interrupt_after_first_character():
+        if backend.calls:
+            if change == "presence":
+                raise RuntimeError("human presence interrupted typing")
+            change_typing_authority(change, tool, backend)
+
+    guard.on_before = interrupt_after_first_character
+
+    async def approve(prepared, binding):
+        return True
+
+    tool._write_approval = approve
+    result = await type_observed(tool)
+    assert result.output["status"] == "unknown"
+    assert backend.calls == [("character", "A")]
+    assert guard.events == ["start", "bind", "before", "after", "before", "release"]
+    if change == "retarget":
+        assert not tool._backend.calls

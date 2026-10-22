@@ -1,8 +1,9 @@
 """Opt-in local OCR observations for bounded selectors; execution stays in computer.
 
-OCR clicks, typing into current focus, bounded key presses and scrolling are exposed. OCR regions are not
-accessibility controls. The pixel fingerprint is deliberately conservative: any
-screen change, expired observation, retarget, or revoked proof stops dispatch.
+OCR clicks, typing into current focus, bounded key presses and scrolling are exposed.
+OCR regions are not accessibility controls. Before input starts, the pixel
+fingerprint conservatively rejects screen changes. Typing's own changes are
+allowed after that check; authority and coexistence guards remain per-keystroke.
 """
 
 from __future__ import annotations
@@ -33,6 +34,42 @@ def check_observed_proof(binding):
     proof = CURRENT_PROOF.get()
     if proof is not None:
         proof["owner"].validate(proof, binding)
+
+
+def observed_typing_guard(guard, binding):
+    """Wrap only observed typing, preserving the ordinary guard unchanged."""
+    proof = CURRENT_PROOF.get()
+    if proof is None:
+        return guard
+    return _ObservedTypingGuard(guard, binding, proof)
+
+
+class _ObservedTypingGuard:
+    def __init__(self, guard, binding, proof):
+        self.guard = guard
+        self.binding = binding
+        self.proof = proof
+        self.started = False
+
+    def before_event(self, **kwargs):
+        # The canonical guard may wait for human presence or target availability.
+        # Validate only AFTER it returns and immediately before backend input.
+        self.guard.before_event(**kwargs)
+        if not self.started:
+            self.proof["owner"].validate(self.proof, self.binding)
+        else:
+            try:
+                self.proof["owner"].validate_authority(self.proof, self.binding)
+            except StaleObservation as exc:
+                # A prefix may already have landed: report unknown, never stale
+                # (which could invite a retry of the entire string).
+                raise RuntimeError(
+                    "Observed typing interrupted after input began"
+                ) from exc
+        self.started = True
+
+    def after_event(self):
+        self.guard.after_event()
 
 
 class ObservedControl:
@@ -172,14 +209,17 @@ class ObservedControl:
             self.observations.pop(next(iter(self.observations)))
         return copy.deepcopy(observed)
 
-    def validate(self, proof, binding):
-        saved = proof["saved"]
+    def validate_authority(self, proof, binding):
         if (
             not proof["active"]
-            or binding is not saved["binding"]
+            or binding is not proof["saved"]["binding"]
             or self.computer._binding is not binding
         ):
             raise StaleObservation("Observed action revoked or target changed")
+
+    def validate(self, proof, binding):
+        self.validate_authority(proof, binding)
+        saved = proof["saved"]
         if (
             not proof.get("validated")
             and time.monotonic() - saved["observation"]["created_at"] > 15
