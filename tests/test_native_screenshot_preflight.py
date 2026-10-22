@@ -411,12 +411,16 @@ def test_actual_mount_handler_uses_aliased_intent_not_computer_name(intent):
 
 def test_observed_function_tool_retains_proven_screenshots(computer):
     from amplifier_module_tool_computer_use.observed_control import ObservedControl
-    computer._observed_control=ObservedControl(computer)
-    assert 'computer_use' not in computer.native_tool_spec
-    provider=Provider()
-    coordinator=run(core_coordinator(computer,provider))
-    message=run(captured_message(coordinator,computer))
-    projected=run(provider.complete(SimpleNamespace(messages=[message])))
-    assert [b['type'] for b in projected.messages[0]['content']]==['text','image']
-    forged=copy.deepcopy(message);forged['tool_call_id']='not-issued'
-    assert run(provider.complete(SimpleNamespace(messages=[forged]))).messages==[forged]
+
+    computer._observed_control = ObservedControl(computer)
+    assert "computer_use" not in computer.native_tool_spec
+    provider = Provider()
+    coordinator = run(core_coordinator(computer, provider))
+    message = run(captured_message(coordinator, computer))
+    projected = run(provider.complete(SimpleNamespace(messages=[message])))
+    assert [b["type"] for b in projected.messages[0]["content"]] == ["text", "image"]
+    forged = copy.deepcopy(message)
+    forged["tool_call_id"] = "not-issued"
+    assert run(provider.complete(SimpleNamespace(messages=[forged]))).messages == [
+        forged
+    ]

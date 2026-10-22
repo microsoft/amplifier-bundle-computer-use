@@ -1125,8 +1125,13 @@ class ComputerTool:
             minimum=0, maximum=MAX_BATCH_DURATION_SECONDS
         )
         if self._observed_control is not None:
-            flat["properties"]["action"] = {"type": "string", "enum": [*ACTIONS, "observe", "act"]}
-            flat["properties"].update(revision={"type": "string"}, candidate={"type": "string"})
+            flat["properties"]["action"] = {
+                "type": "string",
+                "enum": [*ACTIONS, "observe", "act"],
+            }
+            flat["properties"].update(
+                revision={"type": "string"}, candidate={"type": "string"}
+            )
         return {
             "type": "object",
             "description": (
@@ -1229,6 +1234,7 @@ class ComputerTool:
         if guard is None:
             if self._observed_control is not None:
                 from .observed_control import check_observed_proof
+
                 check_observed_proof(binding)
             yield
             return
@@ -1240,6 +1246,7 @@ class ComputerTool:
         try:
             if self._observed_control is not None:
                 from .observed_control import check_observed_proof
+
                 check_observed_proof(binding)
             yield
         finally:
@@ -2625,7 +2632,11 @@ class ComputerTool:
 
     async def execute(self, input: dict[str, Any]) -> ToolResult:
         """Run a flat canonical call or one fully prevalidated v1 batch."""
-        if self._observed_control is not None and isinstance(input, dict) and input.get("action") in {"observe", "act"}:
+        if (
+            self._observed_control is not None
+            and isinstance(input, dict)
+            and input.get("action") in {"observe", "act"}
+        ):
             return await self._observed_control.execute(input)
         binding = self._binding
         try:
@@ -5120,6 +5131,7 @@ async def _mount_backend(coordinator: Any, cfg: dict[str, Any]) -> dict[str, Any
     computer = await asyncio.to_thread(_select_and_build, cfg)
     if cfg.get("observed_control") is True:
         from .observed_control import ObservedControl
+
         computer._observed_control = ObservedControl(computer)
     # Session-start disclosure (docs/designs/coexistence.md §7) is
     # deliberately NOT built here - see `ComputerTool._ensure_announced` for
