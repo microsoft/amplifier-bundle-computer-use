@@ -9,6 +9,15 @@ mobile, CLI, API, or code/file workflow when it can complete the task. Do not la
 explore desktop applications speculatively, or route merely because a request says “open,”
 “check,” or “navigate.”
 
+**When UI-use is available.** For an authorized desktop task, first use `ui_use`
+for a bounded, observable subgoal, omitting `mode` to honor the configured action
+selector. Initial screenshots and inspection may use `computer` directly. The
+presence of `computer-use:computer-operator` is not a reason to skip configured
+UI-use selection. Delegate to that operator or use individual computer actions
+when UI-use reports unavailable/unsupported controls, unstable observations, or
+needs recovery. If `ui_use` is absent, the ordinary computer operator remains the
+first-class path. Verify current state before recovery; never replay unknown input.
+
 **Targeting.** `config.target` selects the mount target (unset is this machine;
 `ssh://user@host` is another). `desktop(action="retarget")` re-points an already-mounted
 session; `computer_use_unavailable(action="activate")` mounts tools when none are mounted.

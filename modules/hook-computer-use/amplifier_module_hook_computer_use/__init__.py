@@ -216,7 +216,7 @@ def _make_capture_authority(coordinator: Any, max_inline: int):
             return HookResult(action="continue")
         tool = coordinator.get("tools", name)
         take = getattr(tool, "_take_issued_capture_result", None)
-        if not _has_neutral_intent(tool) or not callable(take):
+        if not _has_capture_authority(tool) or not callable(take):
             return HookResult(action="continue")
         result = data.get("result")
         captures = take(result)
@@ -346,6 +346,15 @@ def _has_neutral_intent(tool: Any) -> bool:
         isinstance(intent, dict)
         and type(intent.get("version")) is int
         and intent["version"] == 1
+    )
+
+
+def _has_capture_authority(tool: Any) -> bool:
+    # A canonical ordinary tool still issues screenshots. The explicit opt-in
+    # does not add native action intent or trust image paths from tool text.
+    return _has_neutral_intent(tool) or (
+        getattr(tool, "computer_use_screenshots", False) is True
+        and callable(getattr(tool, "_take_issued_capture_result", None))
     )
 
 
@@ -598,7 +607,7 @@ async def mount(
         try:
             tools = coordinator.get("tools")
             if not isinstance(tools, dict) or not any(
-                _has_neutral_intent(tool) for tool in tools.values()
+                _has_capture_authority(tool) for tool in tools.values()
             ):
                 return HookResult(action="continue")
         except Exception:
