@@ -168,6 +168,7 @@ class WindowsBackend:
     """Executes computer-use actions against a real Windows desktop via PowerShell."""
 
     name = "windows-wsl2"
+    type_text_guarded = True
 
     def __init__(self, config: dict[str, Any] | None = None) -> None:
         cfg = config or {}
@@ -486,20 +487,21 @@ class WindowsBackend:
             raise BackendError(res.get("error", "hold_key failed"))
 
     def type_text(self, text: str, guard: Any = None) -> None:
-        """See `Backend.type_text` for the `guard` parameter's contract.
-        Accepted for protocol conformance but not yet used: \u00a75.5 of
-        `docs/designs/coexistence.md` explains why intra-`type_text` human
-        detection is not viable on Windows today (`GetLastInputInfo`
-        quantisation exceeds any usable guard band) - Windows presence
-        detection ships at op granularity only, one layer up
-        (`ComputerTool._run`), not inside this loop.
+        """Check and account around one bridge invocation.
+
+        The controller supplies one character per guarded call, including
+        zero pacing. Callback support does not qualify hardware detection
+        timing inside PowerShell. No guard threshold is changed here.
         """
-        del guard
+        if guard is not None:
+            guard.before_event()
         res = self.raw(
             "type", text=text, timeout=max(self._timeout, 10 + len(text) * 0.05)
         )
         if not res.get("ok"):
             raise BackendError(res.get("error", "type failed"))
+        if guard is not None:
+            guard.after_event()
 
     def list_windows(self) -> WindowList:
         res = self.raw("list_windows")

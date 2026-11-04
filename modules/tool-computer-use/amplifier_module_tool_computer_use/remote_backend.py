@@ -67,6 +67,7 @@ class RemoteBackend:
     """
 
     is_remote = True
+    type_text_guarded = True
 
     def __init__(self, config: dict[str, Any] | None = None) -> None:
         cfg = config or {}
@@ -380,13 +381,19 @@ class RemoteBackend:
         self._call("hold_key", combo=combo, duration=duration)
 
     def type_text(self, text: str, guard: Any = None) -> None:
-        """See `Backend.type_text` for the `guard` parameter's contract.
-        Accepted for protocol conformance but not used: the remote agent
-        runs its own copy of a platform backend on the target (\u00a75 of
-        `docs/designs/remote-transport.md`), so any intra-op presence
-        detection belongs on that side, not here."""
-        del guard
+        """Guard and account for this invocation in the controller's clock.
+
+        The guard is not serializable and the remote agent does not own it.
+        Paced typing arrives one character per call. Record only acknowledged
+        success, after the response; a lost response is never retried or
+        relabelled as successful input. Transport latency remains reported by
+        presence sampling, never added to the detector's guard threshold.
+        """
+        if guard is not None:
+            guard.before_event()
         self._call("type_text", text=text)
+        if guard is not None:
+            guard.after_event()
 
     def list_windows(self) -> WindowList:
         result = self._call("list_windows")

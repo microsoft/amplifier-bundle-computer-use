@@ -147,8 +147,8 @@ def test_explicit_zero_pacing_with_guard_active_types_full_speed_and_warns(
     with caplog.at_level("WARNING"):
         computer._run("type", {"text": "hello"})
 
-    # Whole string in one call - full speed, exactly like no guard at all.
-    assert backend.calls == [("type_text", "hello")]
+    # Full speed removes sleeps, never the per-character guard boundary.
+    assert backend.calls == [("type_text", char) for char in "hello"]
     assert sleeps == []
     assert any("type_pacing_ms=0" in rec.message for rec in caplog.records)
 
