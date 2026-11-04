@@ -457,7 +457,9 @@ try {
         ($injection -isnot [int] -and $injection -isnot [long]) -or $injection -lt 0)) {
       throw "Malformed Windows target-clock injection"
     }
-    if (($condition.guard_ms -isnot [double] -and $condition.guard_ms -isnot [int] -and
+    # Windows PowerShell 5.1 ConvertFrom-Json represents JSON 20.0 as Decimal.
+    # Accept numeric Decimal, never strings/bools; Configure validates finiteness.
+    if (($condition.guard_ms -isnot [double] -and $condition.guard_ms -isnot [decimal] -and $condition.guard_ms -isnot [int] -and
          $condition.guard_ms -isnot [long]) -or $condition.guard_ms -lt 0) {
       throw "Malformed Windows target-clock guard"
     }
