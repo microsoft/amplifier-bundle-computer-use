@@ -87,7 +87,7 @@ apply safe auto-fixes, before committing.
 ### The ship gate
 
 `scripts/verify_coexistence.py` defaults to **conditional Linux boundary qualification**
-under policy `coexistence-boundary-v1` (2026-11-04), not a universal physical-input
+under policy `coexistence-boundary-v2` (2026-11-04), not a universal physical-input
 safety claim. Read `docs/designs/coexistence.md` §11.1 before interpreting it.
 Focused headless tests exercise the maintained classifier/guard and harness logic:
 
@@ -111,17 +111,36 @@ nominal 8/15/55 ms outside; and a forced post-sample/pre-write barrier. Allow ro
 not built-in production pacing. One independent XTEST child acknowledges readiness
 and each event, with matching IDs and send-before/sync-after monotonic intervals.
 Each case needs a fresh finite `QUIET`/high-confidence baseline above the quiet floor.
-Counter registration, actual sample and own-write intervals qualify placement;
-sleep requests do not. Every acknowledged own unit needs a separate raw idle
-query (not a monitor sample). Both raw queries and guard samples use symmetric
-±1 ms uncertainty: the integer idle counter is the difference of two quantised
-timestamps, not a rounded elapsed duration. The inferred last-input interval is
-`[query_entry − (idle+1)ms, query_return − max(0,idle−1)ms]`.
-It must intersect the independent send/sync bracket. Advancement must be proved
-from the **unclipped** counter intervals, including any preceding child read;
-clipping to an assumed successful emission cannot establish advancement.
-This checks input-counter registration, not typed text or display semantics.
-Unresolvable advancement, including at the artificial barrier, is `INVALID`.
+An independent Xlib connection owns a mapped window at (0,0), covering the child
+motion coordinates, and keyboard focus. Structural setup emits no warmup input.
+The existing keymap must map `a` at unshifted level 0; otherwise qualification
+refuses before input. Before each batch the receiver queue must be empty. Each
+own acknowledgement requires exactly the matching native key press/release pair;
+each child acknowledgement requires exactly its matching motion. Window, detail,
+coordinates, `SendEvent=False` and strictly advancing receiver ordinals are checked.
+Stale, missing, extra or replayed input invalidates the case. The receiver is also
+checked after every attempted backend call, including refusals: ordinary native
+input after activity/halt is **FAIL**, even without a logged emission callback.
+
+Delivery alone does not establish **counter registration**. A harness-private
+read-only SYNC 3.1 binding discovers `SERVERTIME`. On the backend's same Xlib
+connection it queries `S0`, the actual MIT-SCREEN-SAVER idle value, then `S1`.
+This brackets last input in server milliseconds as `[S0 − idle, S1 − idle]`,
+including the idle query **inside each actual production monitor sample**.
+Every acknowledged own unit also needs a separate bracketed raw idle query,
+without sampling/updating the monitor. The last delivered event's server timestamp
+must lie in this bracket, which must be later than preceding competing input; same-tick
+or otherwise ambiguous attribution is `INVALID`. Low-32-bit event timestamps are
+unwrapped relative to the 64-bit server counter, never Python time. Regressing,
+broken, noninteger, missing or wrap-ambiguous evidence refuses qualification;
+there is no clock fallback or extra quantisation allowance.
+
+Send/sync and completed-sample **monotonic intervals** establish placement against
+the production injection anchor; sleep requests and server-to-Python inversion do
+not. This checks delivery plus idle-counter registration, not typed text, physical
+origin or general display semantics. Extra queries add harness overhead, not
+production changes. Proven outside-band quiet responses remain **FAIL**, even if
+later own registration fails. Unresolvable barrier advancement stays `INVALID`.
 No retry, delay adjustment or latency fallback rescues an unplaceable 2 ms control.
 
 Quiet timing starts at the first acknowledged emission, not the first call's
@@ -147,7 +166,9 @@ or general safety. A generic `PASS` is not a valid successful top-level verdict.
 Exit 2 / `UNQUALIFIED` does not qualify them.
 An external interruption can leave `INCOMPLETE` or a partial/unreadable final
 receipt; neither qualifies or authorizes automatic replay. Native child/connection
-cleanup is owned by the harness's finally paths; the external supervisor must
+cleanup is owned by independent finally paths: child close/reap, restore saved
+valid focus, destroy the receiver window, close its connection, and close the
+backend. Missing or failed cleanup cannot qualify. The external supervisor must
 also reconcile an interrupted process.
 Release **callback invocation** is not proof of real held-ledger release or current
 mounted permissions/Stop. Main owns native review/current evidence/adoption; Windows
@@ -159,6 +180,14 @@ owned display). Its 89/100, 11 misses, zero false positives result remains **FAI
 under that source's AND rule. Do not rerun until green or reinterpret it under the
 new policy. The paired comparison did not establish a diagnostic timing regression;
 production diagnostics remain unchanged.
+
+Separately, Main's **single** native attempt at PR37 `c76b98e` remains
+**UNQUALIFIED**: quiet unit 49/101 after 5.75 s, before the other five controls.
+An idle value of 2 ms returned 0.065–0.292 ms after own acknowledgement made the
+old ±1 ms inverse interval end 0.432571 ms before emission. This invalidates
+that registration assumption, not production safety. The installed Xvfb clock
+choice was not traced. Policy v2 does not relabel this attempt or the 89/100.
+See §11.1 for pinned Xorg semantics and the headless numeric regression.
 
 Optional **offline analysis only**, with a new receipt:
 

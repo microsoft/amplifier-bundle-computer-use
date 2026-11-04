@@ -11,6 +11,7 @@ import io
 import json
 import math
 import os
+import struct
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -51,14 +52,19 @@ class Backend:
         self.last = 0
         self.writes = []
         self.closed = False
-        # >2ms separates symmetric counter intervals at this fake barrier.
-        # Separate continuous and integer-tick controls retain ambiguity.
+        # This synthetic unit spans one step of the independent 2ms clock.
+        # Separate sub-tick controls below must retain barrier ambiguity.
         self.unit_s = 0.0021
         self.first_delay_s = 0
         self.register = True
+        self.receiver = Receiver()
+
+    def server_now(self):
+        # A step clock, deliberately not Python monotonic rounded +/-1ms.
+        return self.clock.ns // 2_000_000 * 2
 
     def presence_idle_ms(self):
-        return (self.clock.ns - self.last) / 1e6
+        return float(self.server_now() - self.last)
 
     def type_text(self, text, guard=None):
         for _ in text:
@@ -68,7 +74,9 @@ class Backend:
             self.writes.append(self.clock.ns)
             self.clock.advance(self.unit_s)
             if self.register:
-                self.last = self.clock.ns
+                self.last = self.server_now()
+            self.receiver.add(2, self.server_now(), detail=38)
+            self.receiver.add(3, self.server_now(), detail=38)
             guard.after_event()
 
     def probe(self):
@@ -79,14 +87,59 @@ class Backend:
 
 
 class IntegerTickBackend(Backend):
-    """X-style difference of quantised timestamps, not rounded elapsed time."""
+    """One-ms server clock, independent from monotonic send/receive brackets."""
 
     query_s = 0.0
 
     def presence_idle_ms(self):
-        idle = self.clock.ns // 1_000_000 - self.last // 1_000_000
+        idle = self.server_now() - self.last
         self.clock.advance(self.query_s)
         return float(idle)
+
+    def server_now(self):
+        return self.clock.ns // 1_000_000
+
+
+class Receiver(verify.EventReceiver):
+    def __init__(self):
+        self.queue = []
+        self.ordinal = 0
+        self.armed = False
+        self.keycode = 38
+        self.window = SimpleNamespace(id=99)
+        self.cleanup = {}
+
+    def add(self, kind, timestamp, detail=0, x=0, y=0):
+        self.ordinal += 1
+        self.queue.append(
+            {
+                "ordinal": self.ordinal,
+                "type": kind,
+                "window": 99,
+                "detail": detail,
+                "x": x,
+                "y": y,
+                "server_ms": timestamp % 2**32,
+                "send_event": False,
+                "received_ns": verify.time.monotonic_ns(),
+            }
+        )
+
+    def _drain(self):
+        batch, self.queue = self.queue, []
+        return batch
+
+    def close(self):
+        self.cleanup = {"closed": True, "errors": []}
+
+
+class Oracle(verify.RegistrationOracle):
+    def __init__(self, backend, receiver=None):
+        self.backend = backend
+        self.receiver = receiver or backend.receiver
+        self.clock = SimpleNamespace(read=backend.server_now, identity={"fake": True})
+        self.previous = None
+        self.last_ordinal = 0
 
 
 class Child:
@@ -99,8 +152,13 @@ class Child:
         self.calls += 1
         before = self.backend.clock.ns
         self.backend.clock.advance(0.00001)
-        self.backend.last = self.backend.clock.ns
-        return {"send_before_ns": before, "sync_after_ns": self.backend.clock.ns}
+        self.backend.last = self.backend.server_now()
+        self.backend.receiver.add(6, self.backend.last, x=7 + self.calls, y=7)
+        return {
+            "id": self.calls,
+            "send_before_ns": before,
+            "sync_after_ns": self.backend.clock.ns,
+        }
 
     def ready(self):
         pass
@@ -116,69 +174,90 @@ def rig(monkeypatch):
     monkeypatch.setattr(verify.time, "monotonic_ns", lambda: clock.ns)
     monkeypatch.setattr(verify.time, "sleep", clock.advance)
     backend = Backend(clock)
+    native_case = verify._run_case
+    monkeypatch.setattr(
+        verify,
+        "_run_case",
+        lambda case, backend, child, oracle=None: native_case(
+            case, backend, child, oracle or Oracle(backend)
+        ),
+    )
+    monkeypatch.setattr(verify, "EventReceiver", lambda _display: backend.receiver)
+    monkeypatch.setattr(verify, "RegistrationOracle", Oracle)
     return clock, backend, Child(backend)
 
 
 @pytest.mark.parametrize(
-    "entry_ms,end_ms,idle", [(100.960, 100.990, 0), (101.050, 101.100, 1)]
+    "fault",
+    [
+        None,
+        "missing",
+        "foreign-window",
+        "wrong-key",
+        "SendEvent",
+        "extra",
+        "replay",
+        "same-counter",
+    ],
 )
-def test_integer_tick_counter_and_sample_intervals_cover_same_and_crossed_tick(
-    rig, entry_ms, end_ms, idle
+def test_main_exact_native_pattern_requires_delivery_and_server_counter(
+    rig,
+    monkeypatch,
+    fault,
 ):
-    clock, _, _ = rig
-    backend = IntegerTickBackend(clock)
-    backend.last = 100_920_000
-    clock.ns = round(entry_ms * 1e6)
-    backend.query_s = (end_ms - entry_ms) / 1000
-    counter = {}
-    raw_interval = verify._counter_read(backend, counter)
-    sample_interval = verify._sample_counter_interval(
-        {
-            "sample_entry_ns": counter["entry_ns"],
-            "sample_return_ns": counter["return_ns"],
-            "snapshot": {"last_human_input_ago_ms": counter["idle_ms"]},
-        }
-    )
-    assert counter["idle_ms"] == idle
-    assert raw_interval == sample_interval
-    assert raw_interval == (
-        counter["entry_ns"] - (idle + 1) * 1e6,
-        counter["return_ns"] - max(0, idle - 1) * 1e6,
-    )
-    assert raw_interval[0] <= backend.last <= raw_interval[1]
-    if idle == 1:
-        # The old one-sided upper bound was 100.100ms: before the valid event.
-        assert counter["return_ns"] - idle * 1e6 < 100_900_000
+    clock, backend, _ = rig
+    # Public numeric pattern only; no private receipt copied into the repository.
+    before, after = 284093613888391, 284093614163353
+    entry, returned, idle = 284093614228186, 284093614455820, 2.0
+    assert before - (returned - (idle - 1) * 1e6) == 432571
+    clock.ns = entry
+    oracle = Oracle(backend)
+    # Server ticks need not share Python's phase/age. This is a synthetic
+    # same-clock witness, NOT evidence of Main's actual Xvfb clock choice.
+    oracle.clock.read = lambda: 100002
+    oracle.previous = 99940 if fault != "same-counter" else 100000
+    oracle.receiver.arm()
+    if fault != "missing":
+        backend.receiver.add(2, 100000, detail=38)
+        backend.receiver.add(3, 100000, detail=38)
+        if fault == "foreign-window":
+            backend.receiver.queue[0]["window"] = 100
+        elif fault == "wrong-key":
+            backend.receiver.queue[0]["detail"] = 39
+        elif fault == "SendEvent":
+            backend.receiver.queue[0]["send_event"] = True
+        elif fault == "extra":
+            backend.receiver.add(3, 100000, detail=38)
+        elif fault == "replay":
+            oracle.last_ordinal = 2
 
+    def read():
+        clock.ns = returned
+        return idle
 
-@pytest.mark.parametrize("query_ms", [100.960, 101.050])
-@pytest.mark.parametrize("kind", ["own", "child"])
-def test_integer_tick_registration_uses_independent_event_bracket(rig, query_ms, kind):
-    clock, _, _ = rig
-    backend = IntegerTickBackend(clock)
-    backend.last = 100_920_000
-    clock.ns = round(query_ms * 1e6)
-    backend.query_s = 0.00005
-    prior = {
-        "sample_entry_ns": 90_050_000,
-        "sample_return_ns": 90_100_000,
-        "snapshot": {"last_human_input_ago_ms": 40},
-        "emit_before_ns": 100_900_000,
-        "emit_after_ns": 100_950_000,
+    monkeypatch.setattr(backend, "presence_idle_ms", read)
+    row = {
+        "emit_before_ns": before,
+        "emit_after_ns": after,
+        "sample_counter": {
+            "server_before_ms": 99940,
+            "server_after_ms": 99940,
+            "idle_ms": 0,
+        },
     }
-    if kind == "own":
-        result = {"timeline": [prior]}
-        verify._confirm_own(backend, result)
-        assert prior["own_counter"]["corroborated"]
-        low, high = prior["own_counter"]["registration_interval_ns"]
-        assert 100_900_000 <= low <= backend.last <= high <= 100_950_000
+    result = {"timeline": [row]}
+    if fault:
+        with pytest.raises(verify.InvalidCase):
+            batch = oracle.consume("own")
+            verify._confirm_own(backend, result, oracle, batch)
     else:
-        result = {
-            "timeline": [{}, {"emit_after_ns": 90_950_000}],
-            "human": {"send_before_ns": 100_900_000, "sync_after_ns": 100_950_000},
-        }
-        verify._confirm_event(backend, result)
-        assert result["event_counter"]["idle_ms"] == (0 if query_ms < 101 else 1)
+        batch = oracle.consume("own")
+        verify._confirm_own(backend, result, oracle, batch)
+        assert row["own_counter"]["corroborated"]
+        assert row["own_counter"]["entry_ns"] == entry
+        assert row["own_counter"]["return_ns"] == returned
+        assert row["own_counter"]["event_server_ms"] == 100000
+        assert "status" not in result  # registration alone never grants gate PASS
 
 
 @pytest.mark.parametrize(
@@ -195,9 +274,8 @@ def test_integer_tick_full_controls_include_registration_and_fresh_sample(rig, c
         assert result["event_counter"]["idle_ms"].is_integer()
         sample = result["timeline"][2]
         assert sample["snapshot"]["last_human_input_ago_ms"].is_integer()
-        low, high = verify._sample_counter_interval(sample)
-        human = result["human"]
-        assert low <= human["sync_after_ns"] and high >= human["send_before_ns"]
+        low, high = verify._server_interval(sample["sample_counter"])
+        assert low <= result["event_counter"]["event_server_ms"] <= high
 
 
 @pytest.mark.parametrize("unit_s", [0.00001, 0.0004])
@@ -233,7 +311,8 @@ def test_integer_tick_child_sync_without_registration_stays_invalid(rig, monkeyp
         child.calls += 1
         before = clock.ns
         clock.advance(0.00001)
-        return {"send_before_ns": before, "sync_after_ns": clock.ns}
+        backend.receiver.add(6, backend.server_now(), x=7 + child.calls, y=7)
+        return {"id": child.calls, "send_before_ns": before, "sync_after_ns": clock.ns}
 
     monkeypatch.setattr(child, "fire", no_registration)
     result = verify._run_case("outside-15ms", backend, child)
@@ -262,29 +341,396 @@ def test_integer_tick_barrier_ineffective_own_write_cannot_borrow_child_registra
     assert child.calls == 1 and len(backend.writes) == 2
 
 
-def test_symmetric_prior_child_upper_bound_retains_ambiguous_own_advance(rig):
-    clock, _, _ = rig
-    backend = IntegerTickBackend(clock)
-    # A new own event is consistent with its bracket, but the raw interval
-    # still overlaps the previous child's symmetric counter uncertainty.
-    clock.ns, backend.last = 101_500_000, 101_400_000
-    row = {
-        "sample_entry_ns": 90_000_000,
-        "sample_return_ns": 90_000_000,
-        "snapshot": {"last_human_input_ago_ms": 40},
-        "emit_before_ns": 101_350_000,
-        "emit_after_ns": 101_450_000,
-    }
-    result = {
-        "timeline": [row],
-        "event_counter": {
-            "entry_ns": 101_050_000,
-            "return_ns": 101_100_000,
-            "idle_ms": 1,
-        },
-    }
+def test_server_bracket_excludes_prior_child_timestamp(rig):
+    _, backend, _ = rig
+    oracle = Oracle(backend)
+    oracle.previous = 100
+    counter = {"server_before_ms": 101, "server_after_ms": 102, "idle_ms": 1}
     with pytest.raises(verify.InvalidCase, match="did not advance"):
-        verify._confirm_own(backend, result)
+        oracle.confirm(counter, [{"server_ms": 101}])
+
+
+def test_sync_wire_layouts_without_server():
+    initialize, counters, query = verify._sync_requests()
+    assert initialize._request.to_binary(opcode=134, major=3, minor=1) == struct.pack(
+        "=BBHBBH", 134, 0, 2, 3, 1, 0
+    )
+    assert counters._request.to_binary(opcode=134) == struct.pack("=BBH", 134, 1, 1)
+    assert query._request.to_binary(opcode=134, counter=0x12345678) == struct.pack(
+        "=BBHI", 134, 5, 2, 0x12345678
+    )
+    version, rest = initialize._reply.parse_binary(
+        struct.pack("=BBHIBB22x", 1, 0, 42, 0, 3, 1),
+        None,
+    )
+    assert (version.major, version.minor, version.length, rest) == (3, 1, 0, b"")
+    payload = _counter_record(77, b"SERVERTIME")
+    listing, rest = counters._reply.parse_binary(
+        struct.pack("=BBHIi20x", 1, 0, 43, len(payload) // 4, 1) + payload,
+        None,
+    )
+    assert listing.payload == payload and listing.count == 1 and rest == b""
+    assert verify._server_counter(listing.count, listing.payload) == (77, 4)
+    for hi, lo, expected in [(1, 7, 2**32 + 7), (-1, 0xFFFFFFFF, -1)]:
+        value, rest = query._reply.parse_binary(
+            struct.pack("=BBHIiI16x", 1, 0, 44, 0, hi, lo),
+            None,
+        )
+        assert (value.hi << 32) + value.lo == expected and rest == b""
+
+
+def _counter_record(counter, name):
+    data = struct.pack("=IiIH", counter, 0, 4, len(name)) + name
+    return data + b"\0" * (-len(data) % 4)
+
+
+@pytest.mark.parametrize(
+    "fault", ["missing", "duplicate", "truncated", "tail", "count"]
+)
+def test_sync_counter_discovery_rejects_missing_or_malformed(fault):
+    payload = _counter_record(2, b"odd") + _counter_record(77, b"SERVERTIME")
+    count = 2
+    assert verify._server_counter(count, payload) == (77, 4)
+    if fault == "missing":
+        payload = _counter_record(2, b"odd")
+        count = 1
+    elif fault == "duplicate":
+        payload = _counter_record(77, b"SERVERTIME") * 2
+    elif fault == "truncated":
+        payload = payload[:-1]
+    elif fault == "tail":
+        payload += b"\0"
+    else:
+        count = 257
+    with pytest.raises(verify.InvalidCase):
+        verify._server_counter(count, payload)
+
+
+def test_server_clock_binding_discovers_only_servertime(monkeypatch):
+    calls = []
+
+    def request(kind, **kw):
+        calls.append((kind, kw))
+        return {
+            "initialize": SimpleNamespace(major=3, minor=1, length=0),
+            "counters": SimpleNamespace(
+                length=6,
+                count=1,
+                payload=_counter_record(77, b"SERVERTIME"),
+            ),
+            "query": SimpleNamespace(hi=1, lo=17, length=0),
+        }[kind]
+
+    monkeypatch.setattr(
+        verify,
+        "_sync_requests",
+        lambda: (
+            lambda **kw: request("initialize", **kw),
+            lambda **kw: request("counters", **kw),
+            lambda **kw: request("query", **kw),
+        ),
+    )
+    connection = SimpleNamespace(
+        display=object(),
+        query_extension=lambda name: SimpleNamespace(present=True, major_opcode=134),
+    )
+    clock = verify.ServerClock(connection)
+    assert clock.read() == 2**32 + 17
+    assert clock.identity["counter"] == 77
+    assert calls[0][1]["major"] == 3 and calls[0][1]["minor"] == 1
+    assert calls[-1][1]["counter"] == 77
+    connection.query_extension = lambda name: None
+    with pytest.raises(verify.InvalidCase, match="SYNC unavailable"):
+        verify.ServerClock(connection)
+
+
+@pytest.mark.parametrize(
+    "values,valid",
+    [
+        ([2**32 - 1, 2**32 + 1], True),
+        ([200, 199], False),
+        ([200, 2**32 + 199], False),  # rollback hidden by Xorg epoch update
+        ([0, 90001], False),
+        ([2**63 - 1, -(2**63)], False),
+    ],
+)
+def test_server_clock_wrap_and_regress_are_conservative(values, valid):
+    replies = iter(values)
+    clock = object.__new__(verify.ServerClock)
+    clock.display, clock.opcode, clock.counter = None, 134, 77
+    clock.first = clock.last = None
+
+    def query(**kw):
+        value = next(replies)
+        return SimpleNamespace(hi=value >> 32, lo=value & 0xFFFFFFFF, length=0)
+
+    clock.query = query
+    assert clock.read() == values[0]
+    if valid:
+        assert clock.read() == values[1]
+    else:
+        with pytest.raises(verify.InvalidCase, match="regressed/wrapped"):
+            clock.read()
+
+
+def test_native_event_low32_unwrap_never_maps_to_python():
+    assert verify._event_time(0xFFFFFFFF, 2**32 + 2) == 2**32 - 1
+    assert verify._event_time(1, 2**32 + 2) == 2**32 + 1
+    for timestamp in [3, 2**31 + 2, -1, 2**32, 1.0, True]:
+        with pytest.raises(verify.InvalidCase):
+            verify._event_time(timestamp, 2**32 + 2)
+
+
+@pytest.mark.parametrize("idle", [math.nan, math.inf, -1, 0.25, 2**31, True, None])
+def test_invalid_raw_counter_is_never_a_registration_witness(rig, monkeypatch, idle):
+    _, backend, _ = rig
+    monkeypatch.setattr(backend, "presence_idle_ms", lambda: idle)
+    with pytest.raises(verify.InvalidCase):
+        verify._counter_read(backend, {}, Oracle(backend).clock)
+
+
+def test_regressing_query_bracket_and_broken_read(rig, monkeypatch):
+    _, backend, _ = rig
+    ticks = iter([3000, 2999])
+    with pytest.raises(verify.InvalidCase, match="regressing"):
+        verify._counter_read(backend, {}, SimpleNamespace(read=lambda: next(ticks)))
+    monkeypatch.setattr(
+        backend,
+        "presence_idle_ms",
+        lambda: (_ for _ in ()).throw(OSError("broken query")),
+    )
+    with pytest.raises(OSError, match="broken query"):
+        verify._counter_read(backend, {}, Oracle(backend).clock)
+
+
+@pytest.mark.parametrize("stale_type", [2, 4, 5])
+def test_receiver_arms_empty_and_consumes_each_batch_only_once(rig, stale_type):
+    _, backend, _ = rig
+    receiver = backend.receiver
+    receiver.add(stale_type, 3000, detail=38)
+    with pytest.raises(verify.UnexpectedInput, match="stale"):
+        receiver.arm()
+    receiver.arm()
+    receiver.add(2, 3000, detail=38)
+    receiver.add(3, 3000, detail=38)
+    assert len(receiver.consume("own")) == 2
+    with pytest.raises(verify.InvalidCase, match="replayed"):
+        receiver.consume("own")
+    receiver.arm()
+    receiver.add(6, 3001, x=8, y=7)
+    receiver.queue[-1]["x"] = 9
+    with pytest.raises(verify.InvalidCase, match="child motion"):
+        receiver.consume("child", 1)
+
+
+@pytest.mark.parametrize("fault", ["repeated", "reversed", "older-than-prior"])
+def test_delivery_identity_and_timestamp_cannot_replay(rig, fault):
+    _, backend, _ = rig
+    oracle = Oracle(backend)
+    oracle.receiver.arm()
+    backend.receiver.add(2, 3001, detail=38)
+    backend.receiver.add(3, 3000, detail=38)
+    if fault == "repeated":
+        backend.receiver.queue[1]["ordinal"] = backend.receiver.queue[0]["ordinal"]
+    elif fault == "older-than-prior":
+        backend.receiver.queue[0]["server_ms"] = 3000
+        oracle.previous = 3001
+    with pytest.raises(verify.InvalidCase):
+        batch = oracle.consume("own")
+        oracle.confirm(
+            {"server_before_ms": 3001, "server_after_ms": 3001, "idle_ms": 1},
+            batch,
+        )
+
+
+@pytest.mark.parametrize("types,detail", [((2, 3), 38), ((4, 5), 1)])
+def test_native_input_after_active_fails_even_without_emit_callback(
+    rig, monkeypatch, types, detail
+):
+    _, backend, child = rig
+    type_text = backend.type_text
+
+    def broken(text, guard):
+        try:
+            type_text(text, guard)
+        except HaltedError:
+            for event_type in types:
+                backend.receiver.add(
+                    event_type, backend.server_now(), detail=detail, x=8, y=7
+                )
+            raise
+
+    monkeypatch.setattr(backend, "type_text", broken)
+    result = verify._run_case("outside-15ms", backend, child)
+    assert result["status"] == "FAIL" and result["forbidden_native_input"]
+    assert "emit_after_ns" not in result["timeline"][2]
+    assert result["timeline"][2]["unexpected_delivery"]["count"] == 2
+    assert [
+        event["type"] for event in result["timeline"][2]["unexpected_delivery"]["batch"]
+    ] == list(types)
+
+
+def test_callbacks_without_native_delivery_cannot_qualify(rig, monkeypatch):
+    _, backend, child = rig
+    monkeypatch.setattr(backend.receiver, "add", lambda *a, **kw: None)
+    result = verify._run_case("quiet", backend, child)
+    assert result["status"] == "INVALID" and "native delivery" in result["reason"]
+    assert len(backend.writes) == 1
+
+
+def test_proven_outside_miss_survives_subsequent_own_counter_error(rig, monkeypatch):
+    _, backend, child = rig
+    classify = PresenceMonitor._classify
+
+    def quiet(self, margin, idle):
+        if margin is not None and margin > self.guard_ms:
+            backend.register = False
+            return PresenceState.QUIET, Confidence.LOW
+        return classify(self, margin, idle)
+
+    monkeypatch.setattr(PresenceMonitor, "_classify", quiet)
+    result = verify._run_case("outside-15ms", backend, child)
+    assert result["status"] == "FAIL"
+    assert "proven outside" in result["reason"]
+
+
+@pytest.mark.parametrize("fault", [None, "keymap", "focus", "restore", "destroy"])
+def test_receiver_structural_setup_and_independent_cleanup(monkeypatch, fault):
+    from Xlib import X
+    from Xlib import display as xlib_display
+
+    calls = []
+    saved_focus = SimpleNamespace(get_attributes=lambda: calls.append("validate-focus"))
+    focus = saved_focus
+
+    def select_focus(*args, **kw):
+        nonlocal focus
+        focus = window
+        calls.append("focus")
+        if fault == "focus":
+            kw["onerror"](OSError("focus error"), None)
+
+    def restore(*args, **kw):
+        calls.append("restore")
+        assert args[0] is saved_focus
+        if fault == "restore":
+            kw["onerror"](OSError("restore error"), None)
+
+    def destroy(**kw):
+        calls.append("destroy")
+        if fault == "destroy":
+            kw["onerror"](OSError("destroy error"), None)
+
+    window = SimpleNamespace(
+        id=99,
+        map=lambda **kw: calls.append("map"),
+        configure=lambda **kw: calls.append("raise"),
+        set_input_focus=select_focus,
+        destroy=destroy,
+    )
+
+    def create(*args, **kw):
+        calls.append("create")
+        assert args[:4] == (0, 0, 64, 64)
+        assert kw["override_redirect"] is True
+        assert kw["event_mask"] & (X.ButtonPressMask | X.ButtonReleaseMask) == (
+            X.ButtonPressMask | X.ButtonReleaseMask
+        )
+        return window
+
+    connection = SimpleNamespace(
+        screen=lambda: SimpleNamespace(root=SimpleNamespace(create_window=create)),
+        get_input_focus=lambda: SimpleNamespace(focus=focus, revert_to=1),
+        keysym_to_keycodes=lambda sym: [(38, 1 if fault == "keymap" else 0)],
+        set_input_focus=restore,
+        pending_events=lambda: 0,
+        sync=lambda: None,
+        close=lambda: calls.append("close"),
+    )
+    monkeypatch.setattr(xlib_display, "Display", lambda name: connection)
+    if fault in ("keymap", "focus"):
+        with pytest.raises(verify.InvalidCase):
+            verify.EventReceiver(":fake-only")
+    else:
+        receiver = verify.EventReceiver(":fake-only")
+        assert calls[:4] == ["create", "map", "raise", "focus"]
+        receiver.close()
+        assert receiver.cleanup["closed"] is (fault is None)
+    assert calls[-1] == "close"
+    if fault != "keymap":
+        assert calls[-3:] == ["restore", "destroy", "close"]
+
+
+def test_real_receiver_drain_has_fixed_batch_bound_without_native_display():
+    receiver = object.__new__(verify.EventReceiver)
+    receiver.ordinal = 0
+    receiver.conn = SimpleNamespace(sync=lambda: None, pending_events=lambda: 4)
+    with pytest.raises(verify.InvalidCase, match="exceeds bound"):
+        receiver._drain()
+
+
+def test_actual_monitor_idle_query_is_between_same_connection_server_reads(
+    rig, monkeypatch
+):
+    _, backend, child = rig
+    oracle = Oracle(backend)
+    calls = []
+    read = backend.presence_idle_ms
+    monkeypatch.setattr(
+        backend, "presence_idle_ms", lambda: calls.append("idle") or read()
+    )
+    oracle.clock.read = lambda: calls.append("server") or backend.server_now()
+    result = {"timeline": [], "releases": []}
+    presence, _, _, _ = verify._instrument(backend, child, result, oracle)
+    snapshot = presence.sample()
+    assert calls == ["server", "idle", "server"]
+    assert result["timeline"][0]["snapshot"] == snapshot.to_dict()
+    assert (
+        result["timeline"][0]["sample_counter"]["idle_ms"]
+        == snapshot.last_human_input_ago_ms
+    )
+
+
+@pytest.mark.parametrize("failure", ["oracle", "child-close", "receiver-close"])
+def test_cleanup_paths_independent_and_cannot_qualify(rig, monkeypatch, failure):
+    from amplifier_module_tool_computer_use import linux_x11
+
+    _, backend, child = rig
+    monkeypatch.setattr(linux_x11, "LinuxX11Backend", lambda config: backend)
+    monkeypatch.setattr(verify, "EventChild", lambda display: child)
+    monkeypatch.setattr(
+        verify,
+        "_run_case",
+        lambda case, *_args: {"case": case, "status": "PASS"},
+    )
+    if failure == "oracle":
+        monkeypatch.setattr(
+            verify,
+            "RegistrationOracle",
+            lambda *a: (_ for _ in ()).throw(verify.InvalidCase("SYNC unavailable")),
+        )
+    elif failure == "child-close":
+        monkeypatch.setattr(
+            child,
+            "close",
+            lambda: (_ for _ in ()).throw(OSError("close failed")),
+        )
+    else:
+        monkeypatch.setattr(
+            backend.receiver,
+            "close",
+            lambda: setattr(backend.receiver, "cleanup", {"closed": False}),
+        )
+    report = {}
+    if failure == "receiver-close":
+        verify._run_boundary(report, ":fake-only")
+        assert report["status"] == "UNQUALIFIED"
+    else:
+        with pytest.raises((OSError, verify.InvalidCase)):
+            verify._run_boundary(report, ":fake-only")
+        assert backend.receiver.cleanup["closed"]
+    assert backend.closed
+    assert report.get("status") != verify.MECHANISM_CONTROLS_PASS
 
 
 @pytest.mark.parametrize("offset,halts", [(-0.001, False), (0, False), (0.001, True)])
@@ -391,12 +837,16 @@ def test_sync_without_counter_registration_invalidates_control(rig, monkeypatch)
     _, backend, child = rig
 
     def no_event():
-        return {"send_before_ns": backend.clock.ns, "sync_after_ns": backend.clock.ns}
+        return {
+            "id": 1,
+            "send_before_ns": backend.clock.ns,
+            "sync_after_ns": backend.clock.ns,
+        }
 
     monkeypatch.setattr(child, "fire", no_event)
     result = verify._run_case("outside-15ms", backend, child)
     assert result["status"] == "INVALID"
-    assert "counter" in result["reason"]
+    assert "native delivery" in result["reason"]
     assert len(backend.writes) == 1
 
 
@@ -481,7 +931,7 @@ def test_changed_counter_before_fresh_sample_is_invalid_not_a_masking_miss(
         reads += 1
         if reads == 5:
             return (
-                (backend.clock.ns - backend.writes[0]) / 1e6
+                backend.server_now() - backend.writes[0] // 2_000_000 * 2 - 2
                 if counter == "older"
                 else 0
             )

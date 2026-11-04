@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Conditional coexistence qualification, policy coexistence-boundary-v1 (2026-11-04).
+"""Conditional coexistence qualification, policy coexistence-boundary-v2 (2026-11-04).
 
 Default `--mode boundary` needs an explicitly owned Linux X11 display. It runs
 six predeclared controls once, using the shipped backend, monitor and guard and
@@ -25,6 +25,7 @@ import json
 import math
 import os
 import select
+import struct
 import subprocess
 import sys
 import time
@@ -34,7 +35,7 @@ from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "modules" / "tool-computer-use"))
-POLICY = "coexistence-boundary-v1"
+POLICY = "coexistence-boundary-v2"
 SCHEMA = "coexistence-qualification-v1"
 CADENCE_S = 0.060  # O5 reference cadence; production type_text has no such pacing.
 WINDOW_S = 6.0
@@ -54,6 +55,362 @@ MAX_MESSAGE = 4096
 
 class InvalidCase(RuntimeError):
     """Missing or unplaceable evidence, not a detection miss."""
+
+
+class UnexpectedInput(InvalidCase):
+    """Positive bounded receiver evidence, distinct from a broken read."""
+
+    def __init__(self, message, batch=(), count=None):
+        super().__init__(message)
+        self.evidence = {
+            "count": len(batch) if count is None else count,
+            "batch": batch,
+        }
+
+
+def _sync_requests():
+    """Private read-only SYNC binding; python-xlib 0.33 has no SYNC module.
+
+    Wire definitions: xorgproto/include/X11/extensions/syncproto.h, opcodes 0/1/5.
+    Xlib uses the client's native byte order, including for the variable payload.
+    No extension registration or production backend mutation.
+    """
+    from Xlib.protocol import rq
+
+    class Initialize(rq.ReplyRequest):
+        _request = rq.Struct(
+            rq.Card8("opcode"),
+            rq.Opcode(0),
+            rq.RequestLength(),
+            rq.Card8("major"),
+            rq.Card8("minor"),
+            rq.Pad(2),
+        )
+        _reply = rq.Struct(
+            rq.Pad(2),
+            rq.Card16("sequence_number"),
+            rq.Card32("length"),
+            rq.Card8("major"),
+            rq.Card8("minor"),
+            rq.Pad(22),
+        )
+
+    class ListCounters(rq.ReplyRequest):
+        _request = rq.Struct(rq.Card8("opcode"), rq.Opcode(1), rq.RequestLength())
+        _reply = rq.Struct(
+            rq.Pad(2),
+            rq.Card16("sequence_number"),
+            rq.Card32("length"),
+            rq.Int32("count"),
+            rq.Pad(20),
+            rq.Binary("payload"),
+        )
+
+    class Query(rq.ReplyRequest):
+        _request = rq.Struct(
+            rq.Card8("opcode"),
+            rq.Opcode(5),
+            rq.RequestLength(),
+            rq.Card32("counter"),
+        )
+        _reply = rq.Struct(
+            rq.Pad(2),
+            rq.Card16("sequence_number"),
+            rq.Card32("length"),
+            rq.Int32("hi"),
+            rq.Card32("lo"),
+            rq.Pad(16),
+        )
+
+    return Initialize, ListCounters, Query
+
+
+def _server_counter(count: int, payload: bytes) -> tuple[int, int]:
+    """Parse 14-byte records, each name AND record padded jointly to four bytes."""
+    if not 0 <= count <= 256 or len(payload) > 65536:
+        raise InvalidCase("invalid SYNC counter list size")
+    found = []
+    offset = 0
+    for _ in range(count):
+        if len(payload) - offset < 14:
+            raise InvalidCase("truncated SYNC counter record")
+        counter, hi, lo, size = struct.unpack_from("=IiIH", payload, offset)
+        end = offset + 14 + size
+        padded = (end + 3) & ~3
+        if padded > len(payload):
+            raise InvalidCase("truncated SYNC counter name")
+        if payload[offset + 14 : end] == b"SERVERTIME":
+            found.append((counter, (hi << 32) + lo))
+        offset = padded
+    if offset != len(payload) or len(found) != 1 or found[0][0] == 0:
+        raise InvalidCase("missing/ambiguous SYNC SERVERTIME")
+    return found[0]
+
+
+class ServerClock:
+    def __init__(self, connection):
+        initialize, counters, self.query = _sync_requests()
+        extension = connection.query_extension("SYNC")
+        if extension is None or not extension.present:
+            raise InvalidCase("SYNC unavailable; no server-clock registration oracle")
+        self.display = connection.display
+        self.opcode = extension.major_opcode
+        version = initialize(display=self.display, opcode=self.opcode, major=3, minor=1)
+        if (version.major, version.minor) != (3, 1) or version.length != 0:
+            raise InvalidCase("requires SYNC 3.1")
+        listing = counters(display=self.display, opcode=self.opcode)
+        if listing.length * 4 != len(listing.payload):
+            raise InvalidCase("invalid SYNC counter payload length")
+        self.counter, resolution = _server_counter(listing.count, listing.payload)
+        if resolution <= 0:
+            raise InvalidCase("invalid SERVERTIME resolution")
+        self.identity = {
+            "extension": "SYNC",
+            "version": [3, 1],
+            "counter": self.counter,
+            "name": "SERVERTIME",
+            "resolution_ms": resolution,
+            "registration": "server-clock-v2",
+        }
+        self.first = self.last = None
+
+    def read(self):
+        reply = self.query(
+            display=self.display,
+            opcode=self.opcode,
+            counter=self.counter,
+        )
+        value = (reply.hi << 32) + reply.lo
+        if (
+            reply.length != 0
+            or value < 0
+            or (
+                self.last is not None
+                and (value < self.last or value - self.first > 90_000)
+            )
+        ):
+            # Includes rollback masquerading as a 32-bit epoch increment and
+            # signed-64 wrap. A genuine 32-bit rollover in a <=90s run is fine.
+            raise InvalidCase("SERVERTIME regressed/wrapped or exceeded 90s bound")
+        if self.first is None:
+            self.first = value
+        self.last = value
+        return value
+
+
+def _event_time(timestamp: int, server_now: int) -> int:
+    if type(timestamp) is not int or not 0 <= timestamp < 2**32:
+        raise InvalidCase("invalid native event timestamp")
+    age = (server_now - timestamp) % 2**32
+    if age >= 2**31:
+        raise InvalidCase("native event future/ambiguous at server-clock wrap")
+    return server_now - age
+
+
+class EventReceiver:
+    """Independent connection and owned window, never a grab or an emitter."""
+
+    def __init__(self, display_name):
+        from Xlib import XK, X
+        from Xlib import display as xlib_display
+
+        self.conn = xlib_display.Display(display_name)
+        self.window = None
+        self.focus = None
+        self.ordinal = 0
+        self.armed = False
+        self.cleanup = {}
+        try:
+            setup_errors = []
+
+            def setup_error(error, _request):
+                setup_errors.append(repr(error))
+                return True
+
+            self.focus = self.conn.get_input_focus()
+            pairs = list(self.conn.keysym_to_keycodes(XK.string_to_keysym("a")))
+            if not pairs or min(pairs, key=lambda p: p[1])[1] != 0:
+                raise InvalidCase("receiver requires existing unshifted 'a' keymap")
+            self.keycode = min(pairs, key=lambda p: p[1])[0]
+            self.window = self.conn.screen().root.create_window(
+                0,
+                0,
+                64,
+                64,
+                0,
+                X.CopyFromParent,
+                X.InputOutput,
+                X.CopyFromParent,
+                override_redirect=True,
+                event_mask=X.KeyPressMask
+                | X.KeyReleaseMask
+                | X.ButtonPressMask
+                | X.ButtonReleaseMask
+                | X.PointerMotionMask,
+            )
+            self.window.map(onerror=setup_error)
+            self.window.configure(stack_mode=X.Above, onerror=setup_error)
+            self.window.set_input_focus(
+                X.RevertToParent,
+                X.CurrentTime,
+                onerror=setup_error,
+            )
+            self.conn.sync()
+            if setup_errors or self.conn.get_input_focus().focus != self.window:
+                raise InvalidCase("receiver focus not established")
+            # Structural setup only. No warmup input or queue-discard fallback.
+            self.empty()
+        except BaseException:
+            self.close()
+            raise
+
+    def _drain(self):
+        self.conn.sync()
+        count = self.conn.pending_events()
+        if count > 3:
+            raise InvalidCase("receiver input batch exceeds bound")
+        batch = []
+        for _ in range(count):
+            event = self.conn.next_event()
+            self.ordinal += 1
+            batch.append(
+                {
+                    "ordinal": self.ordinal,
+                    "type": event.type,
+                    "window": getattr(getattr(event, "window", None), "id", None),
+                    "detail": getattr(event, "detail", None),
+                    "x": getattr(event, "event_x", None),
+                    "y": getattr(event, "event_y", None),
+                    "server_ms": getattr(event, "time", None),
+                    "send_event": getattr(event, "send_event", None),
+                    "received_ns": time.monotonic_ns(),
+                }
+            )
+        return batch
+
+    def empty(self):
+        batch = self._drain()
+        if batch:
+            if any(e["type"] in (2, 3, 4, 5, 6) for e in batch):
+                raise UnexpectedInput(
+                    "stale/unexpected receiver input before arming", batch
+                )
+            raise InvalidCase("unexpected non-input receiver event")
+
+    def arm(self):
+        if self.armed:
+            raise InvalidCase("receiver already armed")
+        self.empty()
+        self.armed = True
+
+    def consume(self, kind, detail=None):
+        if not self.armed:
+            raise InvalidCase("receiver batch not armed/replayed")
+        self.armed = False  # even a rejected batch cannot be replayed
+        batch = self._drain()
+        return _match_batch(batch, kind, self.window.id, self.keycode, detail)
+
+    def close(self):
+        errors = []
+
+        def native_error(error, _request):
+            errors.append(f"receiver cleanup request: {error!r}")
+            return True
+
+        try:
+            if self.focus is not None:
+                try:
+                    from Xlib import X
+
+                    # Restore only the saved valid focus; no guessed window.
+                    focus = self.focus.focus
+                    if hasattr(focus, "get_attributes"):
+                        focus.get_attributes()
+                    self.conn.set_input_focus(
+                        focus,
+                        self.focus.revert_to,
+                        X.CurrentTime,
+                        onerror=native_error,
+                    )
+                    self.conn.sync()
+                except Exception as exc:
+                    errors.append(f"focus restore: {exc!r}")
+        finally:
+            try:
+                if self.window is not None:
+                    self.window.destroy(onerror=native_error)
+                    self.conn.sync()
+            except Exception as exc:
+                errors.append(f"window destroy: {exc!r}")
+            finally:
+                try:
+                    self.conn.close()
+                except Exception as exc:
+                    errors.append(f"receiver close: {exc!r}")
+        self.cleanup = {
+            "closed": not errors,
+            "window_id": getattr(self.window, "id", None),
+            "last_ordinal": self.ordinal,
+            "errors": errors,
+        }
+
+
+def _match_batch(batch, kind, window, keycode, detail=None):
+    expected = {"own": [2, 3], "child": [6], "none": []}[kind]
+    if kind == "none" and any(e["type"] in (2, 3, 4, 5, 6) for e in batch):
+        raise UnexpectedInput("ordinary native input during refusal/activity", batch)
+    if [e["type"] for e in batch] != expected:
+        raise InvalidCase(f"{kind} native delivery missing/extra/wrong input")
+    for event in batch:
+        if event["window"] != window or event["send_event"] is not False:
+            raise InvalidCase("foreign-window or SendEvent delivery")
+        if kind == "own" and event["detail"] != keycode:
+            raise InvalidCase("wrong native key")
+        if kind == "child" and (
+            event["detail"] != 0 or (event["x"], event["y"]) != (7 + detail, 7)
+        ):
+            raise InvalidCase("wrong native child motion")
+        if type(event["server_ms"]) is not int:
+            raise InvalidCase("missing native server timestamp")
+    if any(
+        b["ordinal"] != a["ordinal"] + 1 for a, b in zip(batch, batch[1:], strict=False)
+    ):
+        raise InvalidCase("repeated/replayed receiver ordinal")
+    return batch
+
+
+class RegistrationOracle:
+    def __init__(self, backend, receiver):
+        self.backend, self.receiver = backend, receiver
+        self.clock = ServerClock(backend._display)
+        self.previous = None
+        self.last_ordinal = 0
+
+    def consume(self, kind, detail=None):
+        batch = self.receiver.consume(kind, detail)
+        if batch and batch[0]["ordinal"] != self.last_ordinal + 1:
+            raise InvalidCase("replayed native delivery")
+        if batch:
+            self.last_ordinal = batch[-1]["ordinal"]
+        return batch
+
+    def confirm(self, counter, batch, prior=None):
+        low, high = _server_interval(counter)
+        if not batch:
+            raise InvalidCase("registration requires native delivery")
+        stamps = [
+            _event_time(e["server_ms"], counter["server_after_ms"]) for e in batch
+        ]
+        if stamps != sorted(stamps) or not low <= stamps[-1] <= high:
+            raise InvalidCase("native delivery inconsistent with idle counter")
+        if (self.previous is not None and low <= self.previous) or (
+            prior is not None and low <= _server_interval(prior)[1]
+        ):
+            raise InvalidCase(
+                "counter registration did not advance; same-tick/ambiguous"
+            )
+        self.previous = stamps[-1]
+        counter.update(corroborated=True, event_server_ms=stamps[-1])
 
 
 def binomial_tail(n: int, k: int, q: float) -> float:
@@ -267,84 +624,61 @@ def _quiet_baseline(snapshot: Any) -> None:
         )
 
 
-def _counter_interval(
-    entry_ns: int, return_ns: int, idle_ms: float
-) -> tuple[float, float]:
-    """Bracket last input for a difference of two integer millisecond ticks.
-
-    Quantising both timestamps makes the elapsed-time error bidirectional:
-    actual idle is within idle_ms +/- 1ms, not [idle_ms, idle_ms + 1].
-    Nonnegative idle also bounds the last input by the query's return.
-    """
-    return entry_ns - (idle_ms + 1) * 1e6, return_ns - max(0, idle_ms - 1) * 1e6
-
-
-def _counter_read(backend: Any, destination: dict[str, Any]) -> tuple[float, float]:
-    """Raw corroboration only; never updates the production presence monitor."""
-    entry = time.monotonic_ns()
-    idle = float(backend.presence_idle_ms())
-    returned = time.monotonic_ns()
-    destination.update(
-        entry_ns=entry,
-        return_ns=returned,
-        idle_ms=idle if math.isfinite(idle) else None,
+def _server_interval(counter):
+    before, after, idle = (
+        counter["server_before_ms"],
+        counter["server_after_ms"],
+        counter["idle_ms"],
     )
-    if not math.isfinite(idle) or idle < 0:
-        raise InvalidCase("counter unreadable/nonfinite")
-    return _counter_interval(entry, returned, idle)
+    if (
+        type(before) is not int
+        or type(after) is not int
+        or not 0 <= before <= after
+        or after - before > 90_000
+        or not isinstance(idle, (int, float))
+        or isinstance(idle, bool)
+        or not math.isfinite(idle)
+        or not 0 <= idle < 2**31
+        or int(idle) != idle
+    ):
+        raise InvalidCase("invalid/noninteger/regressing server counter read")
+    return before - int(idle), after - int(idle)
 
 
-def _sample_counter_interval(row: dict[str, Any]) -> tuple[float, float]:
-    idle = row["snapshot"]["last_human_input_ago_ms"]
-    return _counter_interval(row["sample_entry_ns"], row["sample_return_ns"], idle)
+def _counter_read(backend: Any, destination: dict[str, Any], clock) -> tuple[int, int]:
+    """Bracket the *actual* idle query in SERVERTIME, not Python monotonic."""
+    destination["entry_ns"] = time.monotonic_ns()
+    try:
+        destination["server_before_ms"] = clock.read()
+        idle = backend.presence_idle_ms()
+        destination["idle_ms"] = (
+            idle if isinstance(idle, (float, int)) and math.isfinite(idle) else None
+        )
+        destination["server_after_ms"] = clock.read()
+    finally:
+        destination["return_ns"] = time.monotonic_ns()
+    return _server_interval(destination)
 
 
-def _confirm_own(backend: Any, result: dict[str, Any]) -> None:
-    """Corroborate every acknowledged own unit, not its text/display semantics."""
+def _confirm_own(backend: Any, result: dict[str, Any], oracle, batch) -> None:
     row = result["timeline"][-1]
     counter = row["own_counter"] = {}
-    low, high = _counter_read(backend, counter)
-    previous_high = _sample_counter_interval(row)[1]
-    if "event_counter" in result:
-        event = result["event_counter"]
-        previous_high = max(
-            previous_high,
-            _counter_interval(event["entry_ns"], event["return_ns"], event["idle_ms"])[
-                1
-            ],
-        )
-    before, after = row["emit_before_ns"], row["emit_after_ns"]
-    # Intersect independent event and counter brackets for consistency. Prove
-    # advancement with the UNCONDITIONED counter intervals: clipping first to
-    # an assumed successful write could falsely credit an ineffective emitter.
-    registered_low, registered_high = max(low, before), min(high, after)
-    if registered_low > registered_high or low <= previous_high:
-        raise InvalidCase("own counter registration unplaceable or did not advance")
-    counter["registration_interval_ns"] = [registered_low, registered_high]
-    counter["corroborated"] = True
+    _counter_read(backend, counter, oracle.clock)
+    try:
+        oracle.confirm(counter, batch, row["sample_counter"])
+    except InvalidCase as exc:
+        raise InvalidCase(f"own counter registration: {exc}") from exc
 
 
-def _confirm_event(backend: Any, result: dict[str, Any]) -> None:
-    """Observe counter registration without updating the production monitor.
-
-    XTEST sync alone does not prove the idle counter registered input. Retain a
-    raw counter read and its interval. Symmetric +/-1ms accounts for both integer
-    timestamps, not a change to the guard. A different/unplaceable input or a
-    missing read invalidates the control rather than becoming a masking miss.
-    """
+def _confirm_event(backend: Any, result: dict[str, Any], oracle) -> None:
+    batch = oracle.consume("child", result["human"]["id"])
+    result["human"]["delivery"] = batch
     counter = result["event_counter"] = {}
-    inferred_low, inferred_high = _counter_read(backend, counter)
-    human = result["human"]
-    prior = result["timeline"][1]
-    if (
-        inferred_high < human["send_before_ns"]
-        or inferred_low > human["sync_after_ns"]
-        or inferred_low <= prior["emit_after_ns"]
-    ):
-        raise InvalidCase("idle counter does not independently place the child event")
+    _counter_read(backend, counter, oracle.clock)
+    oracle.confirm(counter, batch)
 
 
-def _instrument(backend: Any, child: Any, result: dict[str, Any]):
+def _instrument(backend: Any, child: Any, result: dict[str, Any], oracle):
     """Harness-local wrappers only; production sample/guard/emit order is retained."""
     from amplifier_module_tool_computer_use.coexistence_guard import (
         CoexistenceGuard,
@@ -357,17 +691,20 @@ def _instrument(backend: Any, child: Any, result: dict[str, Any]):
     observer_error: list[str] = []
     armed = False
     active_row: dict[str, Any] | None = None
+    sample_row: dict[str, Any] | None = None
     call_id = 0
 
     def idle_source():
-        idle = float(backend.presence_idle_ms())
-        if not math.isfinite(idle) or idle < 0:
-            raise InvalidCase("nonfinite/negative idle")
-        return idle
+        assert sample_row is not None
+        counter = sample_row["sample_counter"] = {}
+        _counter_read(backend, counter, oracle.clock)
+        return counter["idle_ms"]
 
     class TimedPresence(PresenceMonitor):
         def sample(self, **kwargs):
+            nonlocal sample_row
             row = active_row if active_row is not None else {}
+            sample_row = row
             if active_row is None:
                 rows.append(row)
             row["sample_entry_ns"] = time.monotonic_ns()
@@ -377,6 +714,7 @@ def _instrument(backend: Any, child: Any, result: dict[str, Any]):
                 return snapshot
             finally:
                 row["sample_return_ns"] = time.monotonic_ns()
+                sample_row = None
 
     presence = TimedPresence(idle_source=idle_source, platform="linux-x11")
 
@@ -399,7 +737,8 @@ def _instrument(backend: Any, child: Any, result: dict[str, Any]):
             armed = False
             try:
                 result["human"] = child.fire()
-                _confirm_event(backend, result)
+                _confirm_event(backend, result, oracle)
+                oracle.receiver.arm()  # child consumed before the possible own pair
             except Exception as exc:
                 # Production contains observer exceptions. Retain it and refuse
                 # the harness's next emission after before_event returns.
@@ -484,6 +823,8 @@ def placement(
 
 def _halt_violation(result: dict[str, Any]) -> str | None:
     """Observations, not just exceptions, impose the invariant on every call."""
+    if result.get("forbidden_native_input"):
+        return "observation/halt invariant: native input after activity/refusal"
     rows = result["timeline"][1:]
     for i, row in enumerate(rows):
         if row.get("snapshot", {}).get("state") != "human_active" and not row.get(
@@ -561,11 +902,10 @@ def _assess(result: dict[str, Any], guard_ms: float) -> None:
         # Registration confirmation alone is insufficient if another input
         # overwrote the counter before the production sample. Its returned
         # observation must still overlap the independent event interval.
-        low, high = _sample_counter_interval(rows[1])
-        if (
-            low > result["human"]["sync_after_ns"]
-            or high < result["human"]["send_before_ns"]
-        ):
+        low, high = _server_interval(rows[1]["sample_counter"])
+        timestamp = result["event_counter"]["event_server_ms"]
+        own_timestamp = rows[0]["own_counter"]["event_server_ms"]
+        if not low <= timestamp <= high or low <= own_timestamp <= high:
             raise InvalidCase("fresh guard counter no longer places the child event")
     if location == "OUTSIDE":
         margin = rows[1]["snapshot"]["margin_ms"]
@@ -597,7 +937,26 @@ def _assess(result: dict[str, Any], guard_ms: float) -> None:
         result["status"] = "PASS"  # masking OR earlier detection, never require a miss
 
 
-def _run_case(case: str, backend: Any, child: Any) -> dict[str, Any]:
+def _outside_miss(result, guard_ms):
+    """A proven pre-sample outside miss survives a later oracle error."""
+    rows = result["timeline"][1:]
+    if len(rows) < 2 or not result.get("event_counter", {}).get("corroborated"):
+        return False
+    try:
+        low, high = _server_interval(rows[1]["sample_counter"])
+        return (
+            placement(result["case"], rows[0], rows[1], result["human"], guard_ms)
+            == "OUTSIDE"
+            and low <= result["event_counter"]["event_server_ms"] <= high
+            and not low <= rows[0]["own_counter"]["event_server_ms"] <= high
+            and not rows[1].get("halted")
+            and rows[1].get("snapshot", {}).get("state") == "quiet"
+        )
+    except (KeyError, InvalidCase):
+        return False
+
+
+def _run_case(case: str, backend: Any, child: Any, oracle) -> dict[str, Any]:
     from amplifier_module_tool_computer_use.coexistence_guard import HaltedError
     from amplifier_module_tool_computer_use.presence import GUARD_MS
 
@@ -608,16 +967,44 @@ def _run_case(case: str, backend: Any, child: Any) -> dict[str, Any]:
         "releases": [],
     }
     try:
-        presence, guard, tracked, arm = _instrument(backend, child, result)
+        presence, guard, tracked, arm = _instrument(backend, child, result, oracle)
         _quiet_baseline(presence.sample())
 
         def attempt():
+            oracle.receiver.arm()
+            halted = False
             try:
                 backend.type_text("a", guard=tracked)
-                _confirm_own(backend, result)
-                return False
             except HaltedError:
-                return True
+                halted = True
+            finally:
+                row = result["timeline"][-1]
+                forbidden = halted or any(
+                    r.get("halted")
+                    or r.get("snapshot", {}).get("state") == "human_active"
+                    for r in result["timeline"][1:]
+                )
+                try:
+                    if not oracle.receiver.armed:
+                        # A failed barrier already consumed its child batch.
+                        # Check for any additional input without replaying it.
+                        oracle.receiver.empty()
+                        batch = []
+                    else:
+                        batch = oracle.consume(
+                            "own"
+                            if "emit_after_ns" in row and not forbidden
+                            else "none"
+                        )
+                    row["delivery"] = batch
+                except Exception as exc:
+                    if forbidden and isinstance(exc, UnexpectedInput):
+                        result["forbidden_native_input"] = True
+                        row["unexpected_delivery"] = exc.evidence
+                    raise
+            if not halted:
+                _confirm_own(backend, result, oracle, batch)
+            return halted
 
         if attempt():
             result["status"] = "FAIL"
@@ -638,8 +1025,9 @@ def _run_case(case: str, backend: Any, child: Any) -> dict[str, Any]:
                 delay = float(case.split("-")[1].removesuffix("ms")) / 1000
                 anchor = result["timeline"][-1]["injection_anchor_ns"] / 1e9
                 time.sleep(max(0, anchor + delay - time.monotonic()))
+                oracle.receiver.arm()
                 result["human"] = child.fire()
-                _confirm_event(backend, result)
+                _confirm_event(backend, result, oracle)
             # Keep a reference gap before the next fresh sample. Placement
             # uses actual intervals; delayed child acknowledgements invalidate
             # a nominal inside control instead of silently becoming a pass.
@@ -680,6 +1068,10 @@ def _run_case(case: str, backend: Any, child: Any) -> dict[str, Any]:
         violation = _halt_violation(result)
         if violation:
             result.update(status="FAIL", reason=violation)
+        elif _outside_miss(result, GUARD_MS["linux-x11"]):
+            result.update(
+                status="FAIL", reason="proven outside event permitted ordinary input"
+            )
         if result["status"] == "PASS" and result["false_positive_samples_before_event"]:
             result["status"] = "FAIL"
     return result
@@ -694,6 +1086,7 @@ def _run_boundary(report: dict[str, Any], display_name: str) -> None:
 
     backend = LinuxX11Backend({"display": display_name})
     child = None
+    receiver = None
     report.update(
         platform="linux-x11",
         guard_ms=GUARD_MS["linux-x11"],
@@ -706,11 +1099,14 @@ def _run_boundary(report: dict[str, Any], display_name: str) -> None:
         if not probe.available:
             raise InvalidCase(f"backend unavailable: {probe.reason}")
         backend.type_text("")  # first-use setup, emits nothing
+        receiver = EventReceiver(display_name)
+        oracle = RegistrationOracle(backend, receiver)
+        report["registration_oracle"] = oracle.clock.identity
         child = EventChild(display_name)
         child.ready()
         for case in CASES:
             time.sleep(QUIET_FLOOR_SECONDS + 0.5)
-            result = _run_case(case, backend, child)
+            result = _run_case(case, backend, child, oracle)
             report["cases"].append(result)
             if result["status"] != "PASS":
                 break  # preserve the first failure, no replacement or retry
@@ -720,11 +1116,15 @@ def _run_boundary(report: dict[str, Any], display_name: str) -> None:
                 child.close()
                 report["child_cleanup"] = child.cleanup
         finally:
-            report["backend_close_called"] = True
-            backend.close()
-            # The production close method contains connection-close errors.
-            # Its return is not independent proof that an X connection closed.
-            report["backend_close_returned"] = True
+            try:
+                if receiver is not None:
+                    receiver.close()
+                    report["receiver_cleanup"] = receiver.cleanup
+            finally:
+                report["backend_close_called"] = True
+                backend.close()
+                # Production contains close errors; return is not closure proof.
+                report["backend_close_returned"] = True
     cleanup = report.get("child_cleanup", {})
     complete = len(report["cases"]) == len(CASES) and all(
         r["status"] == "PASS" for r in report["cases"]
@@ -734,6 +1134,7 @@ def _run_boundary(report: dict[str, Any], display_name: str) -> None:
         if complete
         and cleanup.get("returncode") == 0
         and not cleanup.get("forced", True)
+        and report.get("receiver_cleanup", {}).get("closed") is True
         else "UNQUALIFIED"
     )
     report["scope"] = (
