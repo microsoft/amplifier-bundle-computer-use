@@ -565,6 +565,7 @@ class MacOSBackend:
     """Executes computer-use actions against the local macOS desktop, in-process."""
 
     name = "macos"
+    type_text_guarded = True
 
     def __init__(self, config: dict[str, Any] | None = None) -> None:
         cfg = config or {}

@@ -563,6 +563,9 @@ class RemoteAgent:
         )
 
     def _op_type_text(self, args: dict[str, Any]) -> None:
+        # The controller's RemoteBackend owns guard callbacks and injection
+        # attribution in its own monotonic clock. No guard/permission is
+        # transferred on the wire; this endpoint dispatches one supplied unit.
         self.backend.type_text(str(args.get("text", "")))
 
     def _op_key(self, args: dict[str, Any]) -> None:

@@ -26,7 +26,6 @@ import base64
 import contextvars
 import copy
 import hashlib
-import inspect
 import json
 import logging
 import math
@@ -77,6 +76,20 @@ from .type_pacing import resolve_type_pacing_ms
 from .windows import WindowsBackend
 
 logger = logging.getLogger(__name__)
+
+# One cancellation signal per executing worker, never shared across calls.
+# Cancellation cannot undo an OS call already in flight; it can prevent the
+# next guarded typing character from being scheduled.
+_input_cancelled: contextvars.ContextVar[threading.Event | None] = (
+    contextvars.ContextVar("computer_input_cancelled", default=None)
+)
+
+
+def _check_input_cancelled() -> None:
+    signal = _input_cancelled.get()
+    if signal is not None and signal.is_set():
+        raise BackendError("request cancelled; no further input scheduled")
+
 
 __version__ = "0.2.0"
 
@@ -2259,26 +2272,13 @@ class ComputerTool:
                 raise ValueError("action 'type' requires 'text'")
             body = str(text)
             guard = binding.coexistence_guard
-            # Council re-review Finding 1: this used to be a `self.X` flag
-            # cached ONCE in `__init__` from the ORIGINAL backend's
-            # `type_text` signature, and never refreshed on retarget -
-            # mount on a backend without a `guard` kwarg (flag caches
-            # `False`), retarget onto one that HAS it and gets a real,
-            # active guard, and the whole check_start_permission()/
-            # bind_target()/pacing sequence below was silently skipped for
-            # `type`, with zero exception and zero log line. Deriving it
-            # HERE, from `binding.backend` (the same single-snapshot pin
-            # every other backend/guard/display access in this method
-            # already uses - see this method's own docstring), closes that
-            # gap: it can never be stale, because it is never cached across
-            # a retarget in the first place. `inspect.signature()` is cheap
-            # (microseconds) and this runs once per `type` action call, not
-            # once per keystroke - the per-keystroke loop below only calls
-            # `backend.type_text` itself.
+            # A guard-shaped signature does not prove callbacks are honored.
+            # Re-resolve the explicit contract on this pinned backend each
+            # operation; absent/false declarations use controller callbacks.
             backend_supports_guard = (
-                "guard" in inspect.signature(backend.type_text).parameters
+                getattr(backend, "type_text_guarded", False) is True
             )
-            guard_active = guard is not None and backend_supports_guard
+            guard_active = guard is not None
             # Measured safety gap (type_pacing.py): a 202-character string
             # typed at full speed via a per-character guarded loop can
             # complete in ~70ms - an inter-character gap far narrower than
@@ -2323,13 +2323,24 @@ class ComputerTool:
                         from .observed_control import observed_typing_guard
 
                         typing_guard = observed_typing_guard(guard, binding)
-                    if pacing_ms > 0:
-                        pacing_seconds = pacing_ms / 1000.0
-                        for ch in body:
-                            backend.type_text(ch, guard=typing_guard)
+
+                    def type_unit(unit):
+                        _check_input_cancelled()
+                        if backend_supports_guard:
+                            backend.type_text(unit, guard=typing_guard)
+                        else:
+                            typing_guard.before_event()
+                            backend.type_text(unit)
+                            typing_guard.after_event()
+
+                    # Zero pacing removes the delay, not the guard boundary.
+                    # In particular, a remote bulk call must not turn a long
+                    # string into one uninterruptible guarded unit.
+                    pacing_seconds = pacing_ms / 1000.0
+                    for ch in body:
+                        type_unit(ch)
+                        if pacing_ms > 0:
                             time.sleep(pacing_seconds)
-                    else:
-                        backend.type_text(body, guard=typing_guard)
                 finally:
                     guard.release_target()
             else:
@@ -2725,11 +2736,7 @@ class ComputerTool:
         # execute() against the channel. A re-raise failure with a human
         # detected present is the SAME refusal shape as the first raise.
         try:
-            band_token = (
-                await self._acquire_batch_band()
-                if batch
-                else await asyncio.to_thread(self._band_enter)
-            )
+            band_token = await self._acquire_batch_band()
         except asyncio.CancelledError:
             if not batch:
                 raise
@@ -2759,6 +2766,7 @@ class ComputerTool:
             "lock": threading.Lock(),
             "running": False,
             "cleanup": None,
+            "cancelled": threading.Event(),
         }
         result = None
         captures: list = []
@@ -2778,29 +2786,26 @@ class ComputerTool:
                 if deferred:
                     flight["cleanup"] = lambda: self._band_exit(band_token)
             if not deferred:
-                if not batch:
-                    await asyncio.to_thread(self._band_exit, band_token)
-                else:
-                    try:
-                        await asyncio.shield(
-                            self._submit_batch_thread(self._band_exit, band_token)
-                        )
-                    except asyncio.CancelledError:
-                        if result is None:
-                            raise
-                        # Actions have settled; retain their known progress and
-                        # any original failure while cleanup continues once.
-                        previous = result.error
-                        result.success = False
-                        result.error = {
-                            "message": "batch cancelled during band cleanup; release continues, no input scheduled",
-                            "type": "CancelledError",
-                        }
-                        if previous:
-                            result.error["previous_error"] = previous
-                        payload = json.loads(result.output)
-                        payload["text"] += "; " + result.error["message"]
-                        result.output = json.dumps(payload)
+                try:
+                    await asyncio.shield(
+                        self._submit_batch_thread(self._band_exit, band_token)
+                    )
+                except asyncio.CancelledError:
+                    if not batch or result is None:
+                        raise
+                    # Actions have settled; retain their known progress and
+                    # any original failure while cleanup continues once.
+                    previous = result.error
+                    result.success = False
+                    result.error = {
+                        "message": "batch cancelled during band cleanup; release continues, no input scheduled",
+                        "type": "CancelledError",
+                    }
+                    if previous:
+                        result.error["previous_error"] = previous
+                    payload = json.loads(result.output)
+                    payload["text"] += "; " + result.error["message"]
+                    result.output = json.dumps(payload)
         # Cleanup can change success (notably cancellation). Register only the
         # final emitted result, never an intermediate screenshot or failed batch.
         if result.success and captures:
@@ -2851,6 +2856,7 @@ class ComputerTool:
         params: dict[str, Any],
         binding: _Binding,
         repeat: int,
+        flight: dict[str, Any],
         approved: Callable | None = None,
     ) -> tuple[str, str | None]:
         """Dispatch a logical key repeat one guarded press at a time.
@@ -2866,8 +2872,16 @@ class ComputerTool:
         last_summary = ""
         last_image_b64: str | None = None
         for index in range(repeat):
-            last_summary, last_image_b64 = await asyncio.to_thread(
-                self._run_key_press, params, binding, index, repeat, approved
+            last_summary, last_image_b64 = await self._await_owned_step(
+                "key",
+                binding,
+                flight,
+                self._run_key_press,
+                params,
+                binding,
+                index,
+                repeat,
+                approved,
             )
             if index + 1 < repeat:
                 # Do not issue the next press in the same event-loop turn:
@@ -2884,10 +2898,8 @@ class ComputerTool:
         binding: _Binding,
         approved: Callable | None,
     ) -> tuple[str, str | None]:
-        if not binding.gate_writes:
-            # Preserve ungated local dispatch against its already checked,
-            # pinned backend. It cannot redirect input onto a new binding.
-            return self._run(action, params, binding=binding)
+        # Policy tightening while queued must take effect even without an
+        # approval gate. One guard's bind-to-release lifetime cannot overlap.
         with self._announce_lock:
             self._check_write(action, binding, approved)
             return self._run(action, params, binding=binding)
@@ -2907,21 +2919,21 @@ class ComputerTool:
                     "write requires approval for this exact request and target"
                 )
 
-    def _run_batch_step(
+    def _run_owned_step(
         self,
         action: str,
-        params: dict[str, Any],
         binding: _Binding,
-        approved: Callable | None,
         flight: dict[str, Any],
+        function: Callable,
+        args: tuple,
     ) -> tuple[str, str | None]:
+        token = _input_cancelled.set(flight["cancelled"])
         try:
-            with self._announce_lock:
-                self._check_write(action, binding, approved)
-                outcome = self._run(action, params, binding=binding)
-                with flight["lock"]:
-                    flight["outcome"] = outcome
-                return outcome
+            _check_input_cancelled()
+            outcome = function(*args)
+            with flight["lock"]:
+                flight["outcome"] = outcome
+            return outcome
         except HaltedError as exc:
             # A cancelled waiter can abandon its shielded worker. Record the
             # halt here, exactly once, against the worker's pinned target before
@@ -2929,11 +2941,37 @@ class ComputerTool:
             self._record_halt_result(action, exc, binding=binding)
             raise
         finally:
+            _input_cancelled.reset(token)
             with flight["lock"]:
                 flight["running"] = False
                 cleanup = flight["cleanup"]
             if cleanup is not None:
                 cleanup()
+
+    async def _await_owned_step(
+        self,
+        action: str,
+        binding: _Binding,
+        flight: dict[str, Any],
+        function: Callable,
+        *args,
+    ) -> tuple[str, str | None]:
+        with flight["lock"]:
+            flight["running"] = True
+            flight["outcome"] = None
+        try:
+            task = self._submit_batch_thread(
+                self._run_owned_step, action, binding, flight, function, args
+            )
+        except Exception:
+            with flight["lock"]:
+                flight["running"] = False
+            raise
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            flight["cancelled"].set()
+            raise
 
     async def _execute_calls(
         self,
@@ -2953,13 +2991,16 @@ class ComputerTool:
         terminal_full = False
 
         async def batch_step(action: str, params: dict[str, Any]):
-            with flight["lock"]:
-                flight["running"] = True
-                flight["outcome"] = None
-            task = self._submit_batch_thread(
-                self._run_batch_step, action, params, binding, approved, flight
+            return await self._await_owned_step(
+                action,
+                binding,
+                flight,
+                self._run_flat_step,
+                action,
+                params,
+                binding,
+                approved,
             )
-            return await asyncio.shield(task)
 
         for index, (action, params) in enumerate(calls):
             presses_completed = 0
@@ -2999,11 +3040,18 @@ class ComputerTool:
                         summary += f" ({repeat} times)"
                 elif action == "key":
                     summary, image_b64 = await self._run_key_repeat(
-                        params, binding, repeat, approved
+                        params, binding, repeat, flight, approved
                     )
                 else:
-                    summary, image_b64 = await asyncio.to_thread(
-                        self._run_flat_step, action, params, binding, approved
+                    summary, image_b64 = await self._await_owned_step(
+                        action,
+                        binding,
+                        flight,
+                        self._run_flat_step,
+                        action,
+                        params,
+                        binding,
+                        approved,
                     )
             except asyncio.CancelledError:
                 if not batch:
@@ -3035,11 +3083,8 @@ class ComputerTool:
                 )
             except Exception as exc:
                 if isinstance(exc, HaltedError):
-                    error = (
-                        {"message": str(exc), "type": type(exc).__name__}
-                        if batch
-                        else self._record_halt_result(action, exc).error
-                    )
+                    # The worker records once, even if its waiter was cancelled.
+                    error = {"message": str(exc), "type": type(exc).__name__}
                 else:
                     logger.exception("computer action %s failed", action)
                     error = {"message": str(exc), "type": type(exc).__name__}

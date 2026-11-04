@@ -69,7 +69,7 @@ class _FakeLocalBackend:
         self.click_calls: list[tuple] = []
 
     def type_text(self, text: str) -> None:
-        """`ComputerTool.__init__` inspects this signature."""
+        """Legacy backend with no guarded-typing capability declaration."""
 
     def presence_idle_ms(self) -> float:
         return 999_999.0
@@ -149,28 +149,32 @@ class _FakeRemoteBackend:
 
 
 class _FakeGuardCapableBackend:
-    """Local, presence-capable backend whose `type_text` DOES accept a
-    `guard=...` kwarg - modeling the REAL `Backend` protocol shape (see
-    `backend.py`), which every shipping backend (`LinuxX11Backend`,
-    `MacOSBackend`, `WindowsBackend`, `RemoteBackend`) actually implements.
+    """Explicitly promises and honors per-character guard callbacks.
 
-    Deliberately distinct from `_FakeLocalBackend`/`_FakeRemoteBackend`
-    above, whose `type_text(self, text)` has NO `guard` parameter - that
-    guard-less shape is what a stale `_backend_type_text_supports_guard`
-    (council re-review Finding 1) gets cached as, and this class is what a
-    session should ACTUALLY be driving after a retarget onto it.
+    Unlike the legacy fakes above, this backend owns the before/injection/
+    after sequence. Accepting a `guard` parameter alone is not the contract.
     """
 
     is_remote = False
+    type_text_guarded = True
 
     def __init__(self, name: str) -> None:
         self.name = name
         self.presence_platform = "linux-x11"
         self.close_calls = 0
         self.type_text_calls: list[tuple] = []
+        self.type_events: list[tuple[str, str]] = []
 
     def type_text(self, text: str, guard=None) -> None:
         self.type_text_calls.append((text, guard))
+        for ch in text:
+            if guard is not None:
+                guard.before_event()
+                self.type_events.append(("before", ch))
+            self.type_events.append(("type", ch))
+            if guard is not None:
+                guard.after_event()
+                self.type_events.append(("after", ch))
 
     def presence_idle_ms(self) -> float:
         return 999_999.0
@@ -607,144 +611,124 @@ def test_retarget_refuses_a_new_target_with_no_guard_by_default(monkeypatch):
 # `self._binding` ONCE, before the check, and pass that SAME snapshot into
 # `_run` for the dispatch (see `_run`'s own docstring).
 #
-# This section reconstructs the standalone repro that found it. Nothing in
-# production code is patched for the repro itself - only the INTERLEAVING
-# is deterministically forced (the same technique test 1b above already
-# uses), via a real, concurrent `retarget()` and a real `execute()` call for
-# a MUTATING action, both completely unmodified.
+# This section deterministically controls the interleaving of real
+# `retarget()` and `execute()` calls. Only inert backend input and worker
+# scheduling are wrapped; production policy checks and locking run unchanged.
+
+
+def _execute_across_retarget(
+    monkeypatch, computer, executor, request, target, backend_method, *, dispatch_first
+):
+    """Hold either inert input or the queued worker at an explicit barrier.
+
+    Keep real execute/retarget, policy checks and locking intact. A dispatch
+    already injecting holds the serialization lock, so retarget must refuse
+    until it finishes. A queued dispatch must reject its stale binding after
+    retarget wins. No scheduler timing decides which path this test exercises.
+    """
+    old_binding = computer._binding
+    reached = threading.Event()
+    release = threading.Event()
+    results: dict = {}
+
+    if dispatch_first:
+        original = getattr(old_binding.backend, backend_method)
+
+        def held_dispatch(*args, **kwargs):
+            result = original(*args, **kwargs)
+            reached.set()
+            assert release.wait(timeout=5.0), "input barrier was not released"
+            return result
+
+        monkeypatch.setattr(old_binding.backend, backend_method, held_dispatch)
+    else:
+        original = computer._run_flat_step
+
+        def queued_dispatch(action, params, binding, approved):
+            assert binding is old_binding, "worker must have pinned the OLD binding"
+            reached.set()
+            assert release.wait(timeout=5.0), "queued worker barrier was not released"
+            return original(action, params, binding, approved)
+
+        monkeypatch.setattr(computer, "_run_flat_step", queued_dispatch)
+
+    def execute():
+        try:
+            results["execute"] = asyncio.run(executor.execute(request))
+        except BaseException as exc:
+            results["exception"] = exc
+
+    worker = threading.Thread(target=execute)
+    worker.start()
+    try:
+        assert reached.wait(timeout=5.0), "execute never reached its barrier"
+        retarget = computer.retarget(target)
+        if dispatch_first:
+            assert retarget.success is False
+            assert retarget.error["type"] == "RetargetRefused"
+            assert computer._binding is old_binding
+        else:
+            assert retarget.success is True, retarget.error
+    finally:
+        release.set()
+        worker.join(timeout=5.0)
+
+    assert not worker.is_alive(), "execute thread did not settle"
+    assert "exception" not in results, results.get("exception")
+    result = results["execute"]
+    if dispatch_first:
+        assert result.success is True, result.error
+        retarget = computer.retarget(target)
+        assert retarget.success is True, retarget.error
+    else:
+        assert result.success is False
+        assert result.error["type"] == "BackendError"
+        assert "target or policy changed" in result.error["message"]
+    return result
 
 
 def test_read_only_check_and_dispatch_never_straddle_a_retarget_swap(monkeypatch):
-    """Reconstructs a six-lens council's repro almost verbatim: mount an OLD
-    local backend (read_only=False, permissive), race a real `execute()`
-    call for `left_click` against a real `retarget()` to a fake REMOTE
-    backend (read_only=True by default - no explicit config, so \u00a76.6's
-    "retarget never widens/narrows policy on its own" default applies).
-
-    Before the fix, this reproduced on the FIRST try in the standalone
-    script this test is drawn from: the check passed under the OLD,
-    permissive binding, but the click actually landed on the NEW,
-    restrictive backend - `new_backend.click_calls` was non-empty. Hammered
-    here across many iterations (timing-dependent, like every real race in
-    this file - see test 1b's own comment) because a single iteration
-    provides no guarantee the window was entered.
-
-    The load-bearing assertion: `new_backend.click_calls` must NEVER receive
-    an entry, across every iteration - not "usually doesn't", not "rarely
-    does" - because `new_backend` is always read_only=True (remote,
-    unconfigured) and a write that ever reaches it despite that is exactly
-    the policy bypass the council verified. A second assertion (at least one
-    iteration actually dispatched to `old_backend`) proves the test isn't
-    vacuous - that real interleaving, not just "retarget always finishes
-    first" or "click always finishes first", was actually exercised.
-    """
-    iterations = 60
-    old_backend_click_seen = False
-    blocked_by_new_read_only_seen = False
-
-    for i in range(iterations):
-        old_backend = _FakeLocalBackend(_unique(f"bypass-old-{i}"))
+    """Both orders: OLD allowed input succeeds; NEW restrictive input never runs."""
+    for dispatch_first in (True, False):
+        old_backend = _FakeLocalBackend(_unique("bypass-old"))
         new_backend = _FakeRemoteBackend(
-            "remote-ssh:linux-x11", user_host=_unique(f"bypass-new-host-{i}")
+            "remote-ssh:linux-x11", user_host=_unique("bypass-new-host")
         )
         target = f"ssh://user@{new_backend.user_host}"
+        monkeypatch.setattr(cu, "select_backend", lambda _cfg, _b=new_backend: _b)
 
-        def _slow_select_backend(_cfg, _b=new_backend, _i=i):
-            # Models real SSH connect latency, entirely on the RETARGET
-            # side - not a hook into the check-then-act window itself. A
-            # small, varied delay across iterations widens the chance real
-            # thread scheduling enters the race window at least once.
-            time.sleep(0.0002 * (_i % 5))
-            return _b
-
-        monkeypatch.setattr(cu, "select_backend", _slow_select_backend)
-
-        # No explicit `read_only` in cfg: the OLD (local) backend defaults
-        # to read_only=False; after retarget, the NEW (remote) backend
-        # defaults to read_only=True. An explicit value would carry over
-        # across retarget by design (\u00a76.6) and must not be used here.
+        # No explicit policy: local defaults permissive, remote restrictive.
         tool = _mounted_tool(old_backend, cfg={})
-        tool._announced = True  # session already disclosed on the OLD target
-
-        retarget_started = threading.Event()
-        results: dict = {}
-
-        def _do_retarget(
-            _tool=tool, _target=target, _results=results, _started=retarget_started
-        ):
-            _started.set()
-            _results["retarget"] = _tool.retarget(_target)
-
-        def _do_execute(_tool=tool, _results=results, _started=retarget_started):
-            _started.wait(timeout=2.0)
-            _results["execute"] = asyncio.run(
-                _tool.execute({"action": "left_click", "coordinate": [15, 30]})
-            )
-
-        t_retarget = threading.Thread(target=_do_retarget)
-        t_execute = threading.Thread(target=_do_execute)
-        t_execute.start()
-        t_retarget.start()
-        t_execute.join(timeout=5.0)
-        t_retarget.join(timeout=5.0)
-
-        assert "retarget" in results, f"iteration {i}: retarget thread never finished"
-        assert "execute" in results, f"iteration {i}: execute thread never finished"
-        assert results["retarget"].success is True, (
-            f"iteration {i}: {results['retarget'].error}"
+        tool._announced = True
+        assert tool._binding.read_only is False
+        request = {"action": "left_click", "coordinate": [15, 30]}
+        expected_xy = tool._binding.display.to_screen(15, 30)
+        _execute_across_retarget(
+            monkeypatch,
+            tool,
+            tool,
+            request,
+            target,
+            "click",
+            dispatch_first=dispatch_first,
         )
 
-        # THE invariant: a write checked as permissive must never land on
-        # the new, restrictive target - no matter how the real threads
-        # happened to interleave this iteration.
-        assert new_backend.click_calls == [], (
-            f"iteration {i}: a click landed on the NEW (read_only=True) "
-            f"backend: {new_backend.click_calls!r} - the read_only check "
-            "and the actual dispatch straddled the retarget() swap. This "
-            "is the exact policy-bypass race the council verified."
+        assert old_backend.click_calls == (
+            [(*expected_xy, "left", 1)] if dispatch_first else []
         )
-
-        if old_backend.click_calls:
-            old_backend_click_seen = True
-        exec_result = results["execute"]
-        if not exec_result.success and exec_result.error.get("type") is None:
-            # blocked-by-read_only is reported as a plain `success=False`
-            # with no `type` key (see `_execute_calls`'s MUTATING branch).
-            blocked_by_new_read_only_seen = True
-
-    assert old_backend_click_seen, (
-        f"the click never once dispatched to the OLD backend across "
-        f"{iterations} iterations - widen the iteration count or delay "
-        "spread; this test proves nothing if the check-passed-under-old "
-        "path was never exercised"
-    )
-    # Not a hard requirement (real thread timing is not fully controllable),
-    # but worth surfacing if it stops happening entirely - it would mean
-    # this test has stopped exercising the "retarget wins the race" branch.
-    if not blocked_by_new_read_only_seen:
-        import warnings
-
-        warnings.warn(
-            "no iteration observed the click blocked by the NEW target's "
-            "read_only=True - only the 'old backend wins' branch was "
-            "exercised this run; consider widening the delay spread",
-            stacklevel=1,
-        )
+        assert tool._binding.backend is new_backend
+        assert tool._binding.read_only is True
+        # A fresh request must also respect NEW policy, not reuse OLD permission.
+        blocked = asyncio.run(tool.execute(request))
+        assert blocked.success is False
+        assert "read_only" in blocked.error["message"]
+        assert new_backend.click_calls == []
 
 
 def test_desktop_tool_gate_writes_check_and_dispatch_never_straddle_a_retarget_swap(
     monkeypatch,
 ):
-    """Same race, same fix, exercised through `DesktopTool._execute_action`
-    (the `desktop` tool's `focus_window`/`set_clipboard` path) instead of
-    `ComputerTool._execute_calls` - proves the SAME single-snapshot
-    discipline was applied to BOTH dispatch paths, not just `computer`'s.
-
-    `focus_window` is gated by `_READ_ONLY_BLOCKED` (a `read_only` check,
-    not `gate_writes` - see `DesktopTool._execute_action`), so this reuses
-    the exact same "OLD permissive, NEW restrictive" shape as the test
-    above, through the OTHER tool class.
-    """
+    """Exercise both deterministic orders through DesktopTool's focus path."""
     import amplifier_module_tool_computer_use.backend as backend_mod
 
     class _FocusableLocalBackend(_FakeLocalBackend):
@@ -769,65 +753,38 @@ def test_desktop_tool_gate_writes_check_and_dispatch_never_straddle_a_retarget_s
         def focus_window(self, handle: str) -> None:
             self.focus_calls.append(handle)
 
-    iterations = 40
-    old_focus_seen = False
-
-    for i in range(iterations):
-        old_backend = _FocusableLocalBackend(_unique(f"desktop-bypass-old-{i}"))
+    for dispatch_first in (True, False):
+        old_backend = _FocusableLocalBackend(_unique("desktop-bypass-old"))
         new_backend = _FocusableRemoteBackend(
-            "remote-ssh:linux-x11", user_host=_unique(f"desktop-bypass-new-{i}")
+            "remote-ssh:linux-x11", user_host=_unique("desktop-bypass-new")
         )
         target = f"ssh://user@{new_backend.user_host}"
-
-        def _slow_select_backend(_cfg, _b=new_backend, _i=i):
-            time.sleep(0.0002 * (_i % 5))
-            return _b
-
-        monkeypatch.setattr(cu, "select_backend", _slow_select_backend)
+        monkeypatch.setattr(cu, "select_backend", lambda _cfg, _b=new_backend: _b)
 
         computer = _mounted_tool(old_backend, cfg={})
         computer._announced = True
         desktop = cu.DesktopTool(computer)
-
-        retarget_started = threading.Event()
-        results: dict = {}
-
-        def _do_retarget(
-            _tool=computer, _target=target, _results=results, _started=retarget_started
-        ):
-            _started.set()
-            _results["retarget"] = _tool.retarget(_target)
-
-        def _do_execute(_tool=desktop, _results=results, _started=retarget_started):
-            _started.wait(timeout=2.0)
-            _results["execute"] = asyncio.run(
-                _tool.execute({"action": "focus_window", "handle": "42"})
-            )
-
-        t_retarget = threading.Thread(target=_do_retarget)
-        t_execute = threading.Thread(target=_do_execute)
-        t_execute.start()
-        t_retarget.start()
-        t_execute.join(timeout=5.0)
-        t_retarget.join(timeout=5.0)
-
-        assert "retarget" in results, f"iteration {i}: retarget thread never finished"
-        assert "execute" in results, f"iteration {i}: execute thread never finished"
-        assert results["retarget"].success is True, (
-            f"iteration {i}: {results['retarget'].error}"
+        assert computer._binding.read_only is False
+        request = {"action": "focus_window", "handle": "42"}
+        _execute_across_retarget(
+            monkeypatch,
+            computer,
+            desktop,
+            request,
+            target,
+            "focus_window",
+            dispatch_first=dispatch_first,
         )
+
+        assert old_backend.focus_calls == (["42"] if dispatch_first else [])
+        assert computer._binding.backend is new_backend
+        assert computer._binding.read_only is True
+        blocked = asyncio.run(desktop.execute(request))
+        assert blocked.success is False
+        assert "read_only" in blocked.error["message"]
         assert new_backend.focus_calls == [], (
-            f"iteration {i}: focus_window landed on the NEW (read_only=True) "
-            f"backend: {new_backend.focus_calls!r}"
+            "focus_window must never reach the NEW restrictive backend"
         )
-        if old_backend.focus_calls:
-            old_focus_seen = True
-
-    assert old_focus_seen, (
-        f"focus_window never once dispatched to the OLD backend across "
-        f"{iterations} iterations - this test proves nothing if that path "
-        "was never exercised"
-    )
 
 
 # -- 5. Council re-review Finding 1: the guard-support flag goes stale ------
@@ -838,10 +795,9 @@ def test_type_text_guard_support_flag_refreshes_across_retarget(monkeypatch):
     to be computed ONCE in `ComputerTool.__init__`, from the ORIGINAL
     backend's `type_text` signature, and was never refreshed on retarget.
 
-    Repro: mount on `_FakeLocalBackend` (`type_text(self, text)` - no
-    `guard` kwarg, so the flag caches `False`), then retarget onto
-    `_FakeGuardCapableBackend` (`type_text(self, text, guard=None)`) which
-    gets its own real, actively-disclosed coexistence guard. Before the fix,
+    Repro: mount on `_FakeLocalBackend` (no explicit guarded-typing contract),
+    then retarget onto `_FakeGuardCapableBackend` (`type_text_guarded=True`)
+    which gets its own real, actively-disclosed coexistence guard. Before the fix,
     the stale `False` flag makes `type`'s `guard_active` resolve `False` for
     the NEW backend too - `check_start_permission()`/`bind_target()`/pacing
     are silently skipped, `type_text` is called with no guard at all, and
@@ -850,6 +806,7 @@ def test_type_text_guard_support_flag_refreshes_across_retarget(monkeypatch):
     backend at every `type` call, not cached from the backend `__init__` saw.
     """
     old_backend = _FakeLocalBackend(_unique("guardflag-old"))
+    assert getattr(old_backend, "type_text_guarded", False) is False
     tool = _mounted_tool(old_backend)
     assert tool._binding.coexistence_guard is not None, (
         "setup invalid: the OLD backend must get a real guard, or this "
@@ -857,6 +814,7 @@ def test_type_text_guard_support_flag_refreshes_across_retarget(monkeypatch):
     )
 
     new_backend = _FakeGuardCapableBackend(_unique("guardflag-new"))
+    assert new_backend.type_text_guarded is True
     target = f"ssh://user@{_unique('guardflag-host')}"
     monkeypatch.setattr(cu, "select_backend", lambda _cfg, _b=new_backend: _b)
 
@@ -870,18 +828,31 @@ def test_type_text_guard_support_flag_refreshes_across_retarget(monkeypatch):
         "not a loud, easily-noticed one"
     )
 
-    tool._run("type", {"text": "hi"}, binding=tool._binding)
+    pinned_binding = tool._binding
+    new_guard = pinned_binding.coexistence_guard
+    assert new_guard.presence._last_inject_monotonic is None
+    tool._run("type", {"text": "hi"}, binding=pinned_binding)
 
     assert new_backend.type_text_calls, (
         "type_text was never called on the new backend - repro setup broken"
     )
     for _text, guard in new_backend.type_text_calls:
-        assert guard is not None, (
+        assert guard is new_guard, (
             "SILENT SKIP CONFIRMED: type_text was called with guard=None "
-            "against a backend that supports guard= and HAS a real, active "
+            "against a backend that declares type_text_guarded=True and HAS an active "
             "coexistence guard - check_start_permission()/bind_target()/"
             "pacing were skipped with zero exception and zero log line. "
             "The guard-support flag is stale from the ORIGINAL backend "
-            "(_FakeLocalBackend, no `guard` kwarg), not refreshed for the "
+            "(_FakeLocalBackend, no capability declaration), not refreshed for the "
             "NEW backend this session now actually drives."
         )
+    assert new_backend.type_events == [
+        ("before", "h"),
+        ("type", "h"),
+        ("after", "h"),
+        ("before", "i"),
+        ("type", "i"),
+        ("after", "i"),
+    ]
+    assert new_guard.presence._last_inject_monotonic is not None
+    assert old_backend.close_calls == 1

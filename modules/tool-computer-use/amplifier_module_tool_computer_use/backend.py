@@ -262,16 +262,18 @@ class Backend(Protocol):
     def type_text(self, text: str, guard: Any = None) -> None:
         """Type literal text, one character at a time.
 
-        `guard` is optional coexistence infrastructure
-        (`coexistence_guard.CoexistenceGuard`, see that module and
-        `docs/designs/coexistence.md` \u00a75.2/\u00a78.6) - a backend that supports
-        per-keystroke intra-operation presence/pause/target-binding checks
-        accepts it and calls `guard.before_event()`/`guard.after_event()`
-        around each character (see `linux_x11.LinuxX11Backend.type_text`).
-        A backend with no proven per-platform `GUARD` band (\u00a75.5) may accept
-        and ignore it - the caller only ever passes a non-`None` guard when
-        `presence.GUARD_MEASURED` (or an explicit override) supports it for
-        this platform.
+        Backends explicitly advertise `type_text_guarded = True` only when
+        they honor a supplied guard: `before_event()` before input and
+        `after_event()` after each successful injection unit. Linux/macOS
+        units are characters; Windows/remote units are backend invocations.
+        The controller splits all guarded typing into character invocations,
+        including explicit zero pacing, so these backends also check between
+        characters. This is callback support, not proof of target-side
+        human-detection effectiveness.
+
+        Merely accepting `guard=` is NOT a capability. For backends without
+        this declaration the controller owns the callbacks and does not pass
+        a guard. Never accept and silently discard a supplied guard.
         """
         ...
 
