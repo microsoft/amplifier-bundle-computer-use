@@ -71,6 +71,11 @@ class _ObservedTypingGuard:
     def after_event(self):
         self.guard.after_event()
 
+    def target_clock_event(self):
+        from .target_clock import guarded_target_call
+
+        return guarded_target_call(self.guard)
+
 
 class ObservedControl:
     def __init__(self, computer):

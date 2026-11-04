@@ -8,6 +8,7 @@ No provider-private discovery, dialect projection or provenance seeding lives he
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import copy
 import json
@@ -585,6 +586,21 @@ def _pydantic_serializer_warning_is_suppressed() -> bool:
     return len(caught) == 0
 
 
+class _MountResult(dict):
+    """Metadata-compatible cleanup callable; Core registers the mount return."""
+
+    def __init__(self, metadata: dict[str, Any], cleanup: Any) -> None:
+        super().__init__(metadata)
+        self._cleanup = cleanup
+        self._cleanup_lock = asyncio.Lock()
+
+    async def __call__(self) -> None:
+        async with self._cleanup_lock:
+            if self._cleanup is not None:
+                await self._cleanup()
+                self._cleanup = None
+
+
 async def mount(
     coordinator: Any, config: dict[str, Any] | None = None
 ) -> dict[str, Any]:
@@ -600,6 +616,17 @@ async def mount(
     priority = int(cfg.get("priority", 50))
     unattended_writes_ok = bool(cfg.get("unattended_writes_ok", False))
     capture_post, capture_for_message = _make_capture_authority(coordinator, max_inline)
+    unregisters = []
+    provider_restores = []
+
+    async def cleanup() -> None:
+        for unregister in reversed(unregisters):
+            if callable(unregister):
+                unregister()
+        unregisters.clear()
+        for restore in reversed(provider_restores):
+            restore()
+        provider_restores.clear()
 
     async def handler(event: str, data: dict[str, Any]) -> HookResult:
         # No provider knowledge is needed to detect explicit intent; aliases
@@ -632,35 +659,80 @@ async def mount(
                 name,
             )
         else:
-            _wrap_provider(provider, coordinator, max_inline, capture_for_message)
+            fields = ("complete", "request_budget", _WRAPPED_FLAG)
+            own = getattr(provider, "__dict__", {})
+            before = {
+                field: (field in own, getattr(provider, field, None))
+                for field in fields
+            }
+            if _wrap_provider(provider, coordinator, max_inline, capture_for_message):
+                installed = {field: getattr(provider, field, None) for field in fields}
+
+                def restore() -> None:
+                    # Restore only this mount's wrappers. A later adapter may
+                    # have wrapped them in turn; do not overwrite its methods
+                    # or clear the flag while those wrappers remain reachable.
+                    intact = all(
+                        getattr(provider, field, None) is installed[field]
+                        for field in fields[:2]
+                    )
+                    for field in fields:
+                        if field == _WRAPPED_FLAG and not intact:
+                            continue
+                        if getattr(provider, field, None) is not installed[field]:
+                            continue
+                        existed, value = before[field]
+                        if existed:
+                            setattr(provider, field, value)
+                        elif field in getattr(provider, "__dict__", {}):
+                            delattr(provider, field)
+
+                provider_restores.append(restore)
         return HookResult(action="continue")
 
-    coordinator.hooks.register(
-        PROVIDER_REQUEST, handler, priority=priority, name="hook-computer-use"
-    )
-    coordinator.hooks.register(
-        TOOL_PRE,
-        _make_gate_handler(coordinator, unattended_writes_ok=unattended_writes_ok),
-        priority=priority,
-        name="hook-computer-use-gate",
-    )
-    coordinator.hooks.register(
-        TOOL_POST,
-        capture_post,
-        priority=priority,
-        name="hook-computer-use-capture",
-    )
-    coordinator.hooks.register(
-        TOOL_POST,
-        _make_halt_notice_handler(coordinator),
-        priority=priority,
-        name="hook-computer-use-halt-notice",
-    )
+    try:
+        unregisters.append(
+            coordinator.hooks.register(
+                PROVIDER_REQUEST, handler, priority=priority, name="hook-computer-use"
+            )
+        )
+        unregisters.append(
+            coordinator.hooks.register(
+                TOOL_PRE,
+                _make_gate_handler(
+                    coordinator, unattended_writes_ok=unattended_writes_ok
+                ),
+                priority=priority,
+                name="hook-computer-use-gate",
+            )
+        )
+        unregisters.append(
+            coordinator.hooks.register(
+                TOOL_POST,
+                capture_post,
+                priority=priority,
+                name="hook-computer-use-capture",
+            )
+        )
+        unregisters.append(
+            coordinator.hooks.register(
+                TOOL_POST,
+                _make_halt_notice_handler(coordinator),
+                priority=priority,
+                name="hook-computer-use-halt-notice",
+            )
+        )
+    except BaseException:
+        await cleanup()
+        raise
     _trace(f"MOUNTED max_inline={max_inline}")
     logger.info("hook-computer-use mounted (max_inline_screenshots=%d)", max_inline)
-    return {
-        "name": "hook-computer-use",
-        "version": __version__,
-        "provides": ["computer-use-history-projection"],
-        "description": "Copies generic screenshot/error histories and applies desktop write/halt policy",
-    }
+    return _MountResult(
+        {
+            "name": "hook-computer-use",
+            "version": __version__,
+            "provides": ["computer-use-history-projection"],
+            "description": "Copies generic screenshot/error histories and applies desktop write/halt policy",
+        },
+        cleanup,
+    )

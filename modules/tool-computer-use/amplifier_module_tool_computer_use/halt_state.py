@@ -117,6 +117,14 @@ _PRIVATE_FILE_MODE = 0o600
 #: `"idle_unreadable"`) - never invent a fake "this was just measured" basis
 #: for a fact that is actually a memory of a PRIOR session.
 PERSISTED_BASIS = "persisted_halt_from_prior_session"
+PERSISTED_UNKNOWN_BASIS = "persisted_target_clock_failure"
+TARGET_CLOCK_FAILURE_BASES = frozenset(
+    {
+        "target_clock_unreadable",
+        "target_clock_unacknowledged",
+        "target_precondition_rejected",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -130,9 +138,12 @@ class PersistedHalt:
     margin_ms: float | None
     guard_ms: float
     guard_measured: bool
+    # Absent in old records: retain their original human-detection semantics.
+    # Only new, explicitly UNKNOWN target-clock halts populate this field.
+    basis: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "platform": self.platform,
             "detected_at": self.detected_at,
             "reason": self.reason,
@@ -141,6 +152,9 @@ class PersistedHalt:
             "guard_ms": self.guard_ms,
             "guard_measured": self.guard_measured,
         }
+        if self.basis is not None:
+            result["basis"] = self.basis
+        return result
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> PersistedHalt:
@@ -158,16 +172,27 @@ class PersistedHalt:
             ),
             guard_ms=float(data.get("guard_ms", 0.0)),
             guard_measured=bool(data.get("guard_measured", False)),
+            basis=(
+                data["basis"]
+                if isinstance(data.get("basis"), str)
+                and data["basis"] in TARGET_CLOCK_FAILURE_BASES
+                else None
+            ),
         )
 
     def to_snapshot(self) -> PresenceSnapshot:
         """Rebuild a `PresenceSnapshot` suitable for
         `CoexistenceGuard.seed_halted()` - honestly labelled as a durable
         memory (`PERSISTED_BASIS`), never as a fresh live sample."""
+        unknown = self.basis in TARGET_CLOCK_FAILURE_BASES
         return PresenceSnapshot(
-            state=PresenceState.HUMAN_ACTIVE,
-            confidence=Confidence.HIGH,
-            basis=PERSISTED_BASIS,
+            state=PresenceState.UNKNOWN if unknown else PresenceState.HUMAN_ACTIVE,
+            confidence=Confidence.LOW if unknown else Confidence.HIGH,
+            basis=(
+                f"{PERSISTED_UNKNOWN_BASIS}:{self.basis}"
+                if unknown
+                else PERSISTED_BASIS
+            ),
             last_human_input_ago_ms=self.last_human_input_ago_ms,
             margin_ms=self.margin_ms,
             guard_ms=self.guard_ms,
@@ -206,6 +231,7 @@ def record_halt(
     """
     state_dir.mkdir(parents=True, exist_ok=True)
     os.chmod(state_dir, _PRIVATE_DIR_MODE)
+    basis = snapshot.basis.removeprefix(PERSISTED_UNKNOWN_BASIS + ":")
     record = PersistedHalt(
         platform=platform,
         detected_at=time.time(),
@@ -214,6 +240,12 @@ def record_halt(
         margin_ms=snapshot.margin_ms,
         guard_ms=snapshot.guard_ms,
         guard_measured=snapshot.guard_measured,
+        basis=(
+            basis
+            if snapshot.state is PresenceState.UNKNOWN
+            and basis in TARGET_CLOCK_FAILURE_BASES
+            else None
+        ),
     )
     path = _path_for(platform, state_dir)
     tmp_path = path.with_suffix(f"{path.suffix}.tmp-{os.getpid()}")
@@ -222,7 +254,7 @@ def record_halt(
     os.replace(tmp_path, path)  # atomic on the same filesystem
     logger.warning(
         "coexistence: durable halt record written for backend %r (%s) - a "
-        "human was detected present; every future session for this backend "
+        "safety halt is retained; every future session for this backend "
         "starts already HALTED until a human explicitly clears it (see "
         "scripts/resume_after_halt.py)",
         platform,

@@ -64,6 +64,11 @@ from .ledger import DEFAULT_DEADMAN_SECONDS, HeldInputLedger
 from .overlay_linux import LinuxOverlay
 from .overlay_windows import WindowsOverlay
 from .registry import NoBackendAvailable, select_backend
+from .target_clock import (
+    TargetClockFailure,
+    target_clock_exchange,
+    without_target_clock,
+)
 from .wire import PROTOCOL_VERSION, Request, Response, classify_op
 
 logging.basicConfig(
@@ -448,7 +453,27 @@ class RemoteAgent:
                 error_message=f"op {req.op!r} not implemented in Phase 1",
             )
         try:
-            result = handler(self, req.args)
+            args = dict(req.args)
+            has_condition = "_target_clock_condition" in args
+            condition = args.pop("_target_clock_condition", None)
+            if has_condition:
+                if self.backend.name != "windows-wsl2" or op_class != "write":
+                    raise BackendError("Windows target condition on non-Windows write")
+                # Mechanical forwarding only. The controller remains the sole
+                # classifier/latch owner; the bridge checks next to SendInput.
+                with target_clock_exchange(condition) as exchange:
+                    try:
+                        result = handler(self, args)
+                    except TargetClockFailure as exc:
+                        return Response(
+                            id=req.id, ok=True, result={"_target_clock": exc.result}
+                        )
+                return Response(
+                    id=req.id,
+                    ok=True,
+                    result={"value": result, "_target_clock": exchange.result},
+                )
+            result = handler(self, args)
             return Response(id=req.id, ok=True, result=result)
         except BackendError as exc:
             return Response(
@@ -514,6 +539,12 @@ class RemoteAgent:
                 f"backend {self.backend.name!r} has no presence_idle_ms() - "
                 "coexistence presence detection is not available on this target"
             )
+        if self.backend.name == "windows-wsl2":
+            observation = self.backend.presence_observation()
+            return {
+                "observation": observation,
+                "idle_ms": float(observation["now_ms"] - observation["last_input_ms"]),
+            }
         return {"idle_ms": float(idle_source())}
 
     def _op_capture_scaled(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -563,9 +594,8 @@ class RemoteAgent:
         )
 
     def _op_type_text(self, args: dict[str, Any]) -> None:
-        # The controller's RemoteBackend owns guard callbacks and injection
-        # attribution in its own monotonic clock. No guard/permission is
-        # transferred on the wire; this endpoint dispatches one supplied unit.
+        # No guard/permission is transferred: the dispatch scope forwards only
+        # the controller's timing precondition and the bridge's clock evidence.
         self.backend.type_text(str(args.get("text", "")))
 
     def _op_key(self, args: dict[str, Any]) -> None:
@@ -592,16 +622,36 @@ class RemoteAgent:
         x = args.get("x")
         y = args.get("y")
         button = str(args.get("button", "left"))
-        self.backend.mouse_down(x, y, button)
         token = f"mouse:{button}"
-        pending: dict[str, int | None] = {"x": None, "y": None}
+        pending: dict[str, Any] = {"x": None, "y": None, "up_confirmed": False}
         self._mouse_pending[token] = pending
+        windows = self.backend.name == "windows-wsl2"
 
         def _release() -> None:
-            self.backend.mouse_up(pending["x"], pending["y"], button)
+            if windows:
+                if not pending["up_confirmed"]:
+                    with without_target_clock():
+                        self.backend.mouse_up(None, None, button)
+            else:
+                self.backend.mouse_up(pending["x"], pending["y"], button)
             self._mouse_pending.pop(token, None)
 
-        self._ledger.hold("mouse", token, _release)
+        def register() -> None:
+            if windows:
+                self._ledger.hold("mouse", token, _release, retain_on_failure=True)
+            else:
+                self._ledger.hold("mouse", token, _release)
+
+        try:
+            self.backend.mouse_down(x, y, button)
+        except BaseException:
+            if windows:
+                register()
+                self._ledger.release(token)
+            else:
+                self._mouse_pending.pop(token, None)
+            raise
+        register()
 
     def _op_mouse_up(self, args: dict[str, Any]) -> None:
         """If a matching `mouse_down` is still tracked in the ledger, release
@@ -610,13 +660,27 @@ class RemoteAgent:
         the ledger entry is correctly retired in the same step - a second,
         already-released `mouse_up`, or one with no matching `mouse_down` at
         all (e.g. `read_only` toggled mid-session), still performs the real
-        action directly rather than silently dropping it."""
+        action directly rather than silently dropping it.
+
+        Windows runs explicit up outside the ledger callback. A refused up
+        triggers unconditioned no-motion cleanup, without suppressing the
+        original failure or retiring an unconfirmed cleanup obligation.
+        """
         x = args.get("x")
         y = args.get("y")
         button = str(args.get("button", "left"))
         token = f"mouse:{button}"
         pending = self._mouse_pending.get(token)
         if pending is not None:
+            if self.backend.name == "windows-wsl2":
+                try:
+                    self.backend.mouse_up(x, y, button)
+                except BaseException:
+                    self._ledger.release(token)
+                    raise
+                pending["up_confirmed"] = True
+                self._ledger.release(token)
+                return
             pending["x"], pending["y"] = x, y
             self._ledger.release(token)
         else:

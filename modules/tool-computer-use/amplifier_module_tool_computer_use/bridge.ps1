@@ -46,6 +46,119 @@ public static class CU {
     // reconciliation math (idle = GetTickCount() - dwTime) to be meaningful.
     [DllImport("user32.dll")] public static extern bool GetLastInputInfo(ref LASTINPUTINFO plii);
     [DllImport("kernel32.dll")] public static extern uint GetTickCount();
+    [DllImport("kernel32.dll")] public static extern ulong GetTickCount64();
+    [DllImport("ntdll.dll")] static extern int NtQuerySystemInformation(int infoClass, IntPtr info, int size, out int returned);
+    [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
+    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
+    [DllImport("advapi32.dll", SetLastError = true)] static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
+    [DllImport("advapi32.dll", SetLastError = true)] static extern bool GetTokenInformation(IntPtr token, int infoClass, IntPtr info, int size, out int returned);
+
+    public class Observation {
+        public int version = 1;
+        public string epoch;
+        public ulong now_ms;
+        public ulong last_input_ms;
+    }
+    public class Emission {
+        public string epoch;
+        public ulong before_ms;
+        public ulong after_ms;
+        public uint count;
+    }
+    // All of this state is confined to ONE bridge process/request, never shared
+    // between calls. Boot GUID + authentication LUID + session identifies the
+    // clock/input stream without estimating boot time from a wall clock.
+    static string epoch;
+    static string GetEpoch() {
+        if (epoch != null) return epoch;
+        IntPtr boot = Marshal.AllocHGlobal(32);
+        IntPtr stats = Marshal.AllocHGlobal(128);
+        IntPtr token = IntPtr.Zero;
+        try {
+            int returned;
+            if (NtQuerySystemInformation(90, boot, 32, out returned) != 0 || returned < 16)
+                throw new InvalidOperationException("Windows boot GUID unavailable");
+            byte[] guid = new byte[16]; Marshal.Copy(boot, guid, 0, 16);
+            if (new Guid(guid) == Guid.Empty)
+                throw new InvalidOperationException("Windows boot GUID was empty");
+            if (!OpenProcessToken(GetCurrentProcess(), 8, out token) ||
+                !GetTokenInformation(token, 10, stats, 128, out returned) || returned < 16)
+                throw new InvalidOperationException("Windows logon authentication ID unavailable");
+            string identity = new Guid(guid).ToString("D") + ":" +
+                System.Diagnostics.Process.GetCurrentProcess().SessionId + ":" +
+                Marshal.ReadInt32(stats, 8) + ":" + Marshal.ReadInt32(stats, 12);
+            using (var sha = System.Security.Cryptography.SHA256.Create())
+                epoch = BitConverter.ToString(sha.ComputeHash(Encoding.UTF8.GetBytes(identity))).Replace("-", "").ToLowerInvariant();
+            return epoch;
+        } finally {
+            if (token != IntPtr.Zero) CloseHandle(token);
+            Marshal.FreeHGlobal(boot); Marshal.FreeHGlobal(stats);
+        }
+    }
+    public static Observation Observe() {
+        string currentEpoch = GetEpoch();
+        LASTINPUTINFO lii = new LASTINPUTINFO();
+        lii.cbSize = (uint)Marshal.SizeOf(typeof(LASTINPUTINFO));
+        if (!GetLastInputInfo(ref lii)) throw new InvalidOperationException("GetLastInputInfo failed");
+        ulong now = GetTickCount64();
+        ulong last = (now & 0xffffffff00000000UL) | lii.dwTime;
+        if (last > now) {
+            if (last < 0x100000000UL) throw new InvalidOperationException("Future Windows last-input tick");
+            last -= 0x100000000UL;
+        }
+        return new Observation { epoch = currentEpoch, now_ms = now, last_input_ms = last };
+    }
+    public static bool Guarded;
+    public static Observation Latest;
+    public static Emission Injection;
+    public static bool EmissionAttempted;
+    static string expectedEpoch;
+    static ulong baselineNow, baselineLast;
+    static ulong? injectBefore;
+    static double guardMs;
+    public static void Configure(string expected, ulong now, ulong last, ulong? injection, double guard) {
+        if (String.IsNullOrEmpty(expected) || last > now ||
+            now - last >= 0x100000000UL || (injection.HasValue && injection.Value > now) ||
+            Double.IsNaN(guard) || Double.IsInfinity(guard) || guard < 0)
+            throw new InvalidOperationException("Malformed Windows target-clock condition");
+        expectedEpoch = expected; baselineNow = now; baselineLast = last;
+        injectBefore = injection; guardMs = guard; Guarded = true;
+    }
+    public static void Check() {
+        if (!Guarded) return;
+        Latest = Observe();
+        if (Latest.epoch != expectedEpoch || Latest.now_ms < baselineNow ||
+            Latest.last_input_ms < baselineLast)
+            throw new InvalidOperationException("Windows target-clock epoch/ticks changed");
+        if (injectBefore.HasValue) {
+            if ((double)Latest.last_input_ms - (double)injectBefore.Value > guardMs)
+                throw new InvalidOperationException("Windows target-clock input precondition rejected");
+        } else if (Latest.last_input_ms != baselineLast) {
+            throw new InvalidOperationException("Windows initial input precondition rejected");
+        }
+    }
+    public static void Emit(INPUT[] inputs) {
+        EmissionAttempted = false;
+        Check();
+        // No sleep, PowerShell startup or transport between this check and
+        // SendInput. This narrows the race; it is NOT an atomic check+syscall.
+        ulong before = GetTickCount64();
+        EmissionAttempted = true;
+        uint count = SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(INPUT)));
+        ulong after = GetTickCount64();
+        if (count != inputs.Length)
+            throw new InvalidOperationException("SendInput count mismatch; input outcome uncertain");
+        if (Guarded) {
+            Injection = new Emission { epoch = expectedEpoch, before_ms = before, after_ms = after, count = count };
+            injectBefore = before;
+            baselineNow = Latest.now_ms; baselineLast = Latest.last_input_ms;
+        }
+    }
+    public static void Release(INPUT[] inputs) {
+        // Cleanup after a refused/partial hold must not be gated or credited.
+        uint count = SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(INPUT)));
+        if (count != inputs.Length) throw new InvalidOperationException("SendInput release count mismatch");
+    }
 
     public delegate bool EnumProc(IntPtr h, IntPtr p);
     [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X; public int Y; }
@@ -55,11 +168,16 @@ public static class CU {
         public ushort wVk; public ushort wScan; public uint dwFlags; public uint time; public IntPtr dwExtraInfo;
     }
     // Size=40 matches the real x64 INPUT union; ki lands at offset 8 via IntPtr alignment.
-    [StructLayout(LayoutKind.Sequential, Size = 40)] public struct INPUT {
-        public uint type; public KEYBDINPUT ki;
+    [StructLayout(LayoutKind.Sequential)] public struct MOUSEINPUT {
+        public int dx, dy; public uint mouseData, dwFlags, time; public IntPtr dwExtraInfo;
+    }
+    [StructLayout(LayoutKind.Explicit, Size = 40)] public struct INPUT {
+        [FieldOffset(0)] public uint type;
+        [FieldOffset(8)] public KEYBDINPUT ki;
+        [FieldOffset(8)] public MOUSEINPUT mi;
     }
 }
-"@ -ReferencedAssemblies System.Drawing
+"@ -ReferencedAssemblies System, System.Drawing
 
 # ---- constants ---------------------------------------------------------------
 $MOUSE = @{ ldown = 0x02; lup = 0x04; rdown = 0x08; rup = 0x10; mdown = 0x20; mup = 0x40; wheel = 0x0800; hwheel = 0x1000 }
@@ -87,10 +205,25 @@ function Get-IdleMs {
   # (real OR synthetic) reached this machine - GetTickCount() - dwTime, both read
   # via the SAME P/Invoke pair so they share one clock (the \u007e10-16ms GetTickCount
   # tick this bundle's measured GUARD_MS["windows-wsl2"]=20.0 already accounts for).
-  $lii = New-Object CU+LASTINPUTINFO
-  $lii.cbSize = [System.Runtime.InteropServices.Marshal]::SizeOf([type]([CU+LASTINPUTINFO]))
-  if (-not [CU]::GetLastInputInfo([ref]$lii)) { throw "GetLastInputInfo failed" }
-  return [double]([CU]::GetTickCount() - $lii.dwTime)
+  $observation = [CU]::Observe()
+  return [double]($observation.now_ms - $observation.last_input_ms)
+}
+
+function New-KeyInput([int]$vkCode, [int]$flags = 0, [int]$scan = 0) {
+  $inputEvent = New-Object CU+INPUT; $inputEvent.type = 1
+  $key = New-Object CU+KEYBDINPUT
+  $key.wVk = [uint16]$vkCode; $key.wScan = [uint16]$scan; $key.dwFlags = [uint32]$flags
+  $inputEvent.ki = $key
+  return $inputEvent
+}
+
+function Send-MouseInput([uint32]$flags, [int]$data = 0) {
+  $inputEvent = New-Object CU+INPUT
+  $mouse = New-Object CU+MOUSEINPUT; $mouse.dwFlags = $flags
+  # Preserve negative wheel deltas as DWORD bit patterns.
+  $mouse.mouseData = [BitConverter]::ToUInt32([BitConverter]::GetBytes($data), 0)
+  $inputEvent.mi = $mouse
+  [CU]::Emit([CU+INPUT[]]@($inputEvent))
 }
 
 function Resolve-Vk([string]$name) {
@@ -117,12 +250,27 @@ function Send-KeyCombo([string]$combo, [double]$holdSeconds = 0) {
   if ($null -ne $mainKey) { $r = Resolve-Vk $mainKey; $mainVk = $r.vk; $needShift = $r.shift }
   if ($needShift -and ($VK['shift'] -notin $mods)) { $mods += $VK['shift'] }
 
-  foreach ($m in $mods) { [CU]::keybd_event([byte]$m, 0, 0, [IntPtr]::Zero) }
-  if ($null -ne $mainVk) { [CU]::keybd_event([byte]$mainVk, 0, 0, [IntPtr]::Zero) }
-  if ($holdSeconds -gt 0) { Start-Sleep -Milliseconds ([int]($holdSeconds * 1000)) }
-  if ($null -ne $mainVk) { [CU]::keybd_event([byte]$mainVk, 0, $KEYUP, [IntPtr]::Zero) }
+  $downs = @(); $ups = @()
+  foreach ($m in $mods) { $downs += (New-KeyInput $m) }
+  if ($null -ne $mainVk) { $downs += (New-KeyInput $mainVk); $ups += (New-KeyInput $mainVk $KEYUP) }
   [array]::Reverse($mods)
-  foreach ($m in $mods) { [CU]::keybd_event([byte]$m, 0, $KEYUP, [IntPtr]::Zero) }
+  foreach ($m in $mods) { $ups += (New-KeyInput $m $KEYUP) }
+  if ($holdSeconds -le 0) {
+    try { [CU]::Emit([CU+INPUT[]]($downs + $ups)) }
+    catch {
+      if ([CU]::EmissionAttempted) { [CU]::Release([CU+INPUT[]]$ups) }
+      throw
+    }
+  } else {
+    $released = $false; $pressed = $false
+    try {
+      [CU]::Emit([CU+INPUT[]]$downs); $pressed = $true
+      Start-Sleep -Milliseconds ([int]($holdSeconds * 1000))
+      [CU]::Emit([CU+INPUT[]]$ups); $released = $true
+    } finally {
+      if (-not $released -and ($pressed -or [CU]::EmissionAttempted)) { [CU]::Release([CU+INPUT[]]$ups) }
+    }
+  }
 }
 
 function Send-UnicodeText([string]$text) {
@@ -136,20 +284,35 @@ function Send-UnicodeText([string]$text) {
     $up = New-Object CU+INPUT; $up.type = 1
     $ku = New-Object CU+KEYBDINPUT; $ku.wVk = 0; $ku.wScan = [uint16][char]$ch; $ku.dwFlags = $UNICODE -bor $KEYUP
     $up.ki = $ku
-    $sz = [System.Runtime.InteropServices.Marshal]::SizeOf([type]([CU+INPUT]))
-    [void][CU]::SendInput(2, [CU+INPUT[]]@($down, $up), $sz)
+    try { [CU]::Emit([CU+INPUT[]]@($down, $up)) }
+    catch {
+      if ([CU]::EmissionAttempted) { [CU]::Release([CU+INPUT[]]@($up)) }
+      throw
+    }
     Start-Sleep -Milliseconds 8
   }
 }
 
-function Move-To([int]$x, [int]$y) { [void][CU]::SetCursorPos($x, $y); Start-Sleep -Milliseconds 20 }
+function Move-To([int]$x, [int]$y) {
+  [CU]::Check()
+  if (-not [CU]::SetCursorPos($x, $y)) { throw "SetCursorPos failed" }
+  Start-Sleep -Milliseconds 20
+}
 
 function Invoke-Click([string]$button, [int]$times) {
   $d = $MOUSE["$($button)down"]; $u = $MOUSE["$($button)up"]
   for ($i = 0; $i -lt $times; $i++) {
-    [CU]::mouse_event($d, 0, 0, 0, [IntPtr]::Zero)
-    Start-Sleep -Milliseconds 25
-    [CU]::mouse_event($u, 0, 0, 0, [IntPtr]::Zero)
+    $released = $false; $pressed = $false
+    try {
+      Send-MouseInput $d; $pressed = $true
+      Start-Sleep -Milliseconds 25
+      Send-MouseInput $u; $released = $true
+    } finally {
+      if (-not $released -and ($pressed -or [CU]::EmissionAttempted)) {
+        $savedGuarded = [CU]::Guarded; [CU]::Guarded = $false
+        try { Send-MouseInput $u } finally { [CU]::Guarded = $savedGuarded }
+      }
+    }
     if ($i -lt $times - 1) { Start-Sleep -Milliseconds 90 }
   }
 }
@@ -276,6 +439,33 @@ try {
       "and no input is sent to a locked session.")
   }
   $vs = $state.vs
+  if ($null -ne $req.target_clock_condition) {
+    $condition = $req.target_clock_condition
+    # Reject JSON strings/bools/null in integer fields before PowerShell's
+    # permissive numeric coercion can manufacture safety evidence.
+    foreach ($field in @('version', 'now_ms', 'last_input_ms')) {
+      $value = $condition.$field
+      if (($value -isnot [int] -and $value -isnot [long]) -or $value -lt 0) {
+        throw "Malformed Windows target-clock integer"
+      }
+    }
+    if ($condition.version -ne 1 -or $condition.epoch -isnot [string]) {
+      throw "Malformed Windows target-clock version/epoch"
+    }
+    $injection = $condition.inject_before_ms
+    if ($null -ne $injection -and (
+        ($injection -isnot [int] -and $injection -isnot [long]) -or $injection -lt 0)) {
+      throw "Malformed Windows target-clock injection"
+    }
+    # Windows PowerShell 5.1 ConvertFrom-Json represents JSON 20.0 as Decimal.
+    # Accept numeric Decimal, never strings/bools; Configure validates finiteness.
+    if (($condition.guard_ms -isnot [double] -and $condition.guard_ms -isnot [decimal] -and $condition.guard_ms -isnot [int] -and
+         $condition.guard_ms -isnot [long]) -or $condition.guard_ms -lt 0) {
+      throw "Malformed Windows target-clock guard"
+    }
+    [CU]::Configure($condition.epoch, $condition.now_ms, $condition.last_input_ms,
+      $injection, $condition.guard_ms)
+  }
 
   switch ($action) {
     'screenshot' {
@@ -305,23 +495,31 @@ try {
     'triple_click' { $c = Get-Coord $req 'coordinate'; Move-To $c[0] $c[1]; Invoke-Click 'l' 3; $out.coordinate = $c }
     'left_mouse_down' {
       if ($req.coordinate) { $c = Get-Coord $req 'coordinate'; Move-To $c[0] $c[1] }
-      [CU]::mouse_event($MOUSE.ldown, 0, 0, 0, [IntPtr]::Zero)
+      Send-MouseInput $MOUSE.ldown
     }
     'left_mouse_up' {
       if ($req.coordinate) { $c = Get-Coord $req 'coordinate'; Move-To $c[0] $c[1] }
-      [CU]::mouse_event($MOUSE.lup, 0, 0, 0, [IntPtr]::Zero)
+      Send-MouseInput $MOUSE.lup
     }
     'left_click_drag' {
       $s = if ($req.start_coordinate) { Get-Coord $req 'start_coordinate' } else { $p = New-Object CU+POINT; [void][CU]::GetCursorPos([ref]$p); @($p.X, $p.Y) }
       $e = Get-Coord $req 'coordinate'
       Move-To $s[0] $s[1]
-      [CU]::mouse_event($MOUSE.ldown, 0, 0, 0, [IntPtr]::Zero); Start-Sleep -Milliseconds 60
-      $steps = 24
-      for ($i = 1; $i -le $steps; $i++) {
-        Move-To ([int]($s[0] + ($e[0] - $s[0]) * $i / $steps)) ([int]($s[1] + ($e[1] - $s[1]) * $i / $steps))
+      $released = $false; $pressed = $false
+      try {
+        Send-MouseInput $MOUSE.ldown; $pressed = $true; Start-Sleep -Milliseconds 60
+        $steps = 24
+        for ($i = 1; $i -le $steps; $i++) {
+          Move-To ([int]($s[0] + ($e[0] - $s[0]) * $i / $steps)) ([int]($s[1] + ($e[1] - $s[1]) * $i / $steps))
+        }
+        Start-Sleep -Milliseconds 60
+        Send-MouseInput $MOUSE.lup; $released = $true
+      } finally {
+        if (-not $released -and ($pressed -or [CU]::EmissionAttempted)) {
+          $savedGuarded = [CU]::Guarded; [CU]::Guarded = $false
+          try { Send-MouseInput $MOUSE.lup } finally { [CU]::Guarded = $savedGuarded }
+        }
       }
-      Start-Sleep -Milliseconds 60
-      [CU]::mouse_event($MOUSE.lup, 0, 0, 0, [IntPtr]::Zero)
       $out.start = $s; $out.end = $e
     }
     'scroll' {
@@ -331,10 +529,10 @@ try {
       $clicks = [Math]::Max(1, [int]$amtRaw)
       for ($i = 0; $i -lt $clicks; $i++) {
         switch ($dir) {
-          'up' { [CU]::mouse_event($MOUSE.wheel, 0, 0, 120, [IntPtr]::Zero) }
-          'down' { [CU]::mouse_event($MOUSE.wheel, 0, 0, -120, [IntPtr]::Zero) }
-          'right' { [CU]::mouse_event($MOUSE.hwheel, 0, 0, 120, [IntPtr]::Zero) }
-          'left' { [CU]::mouse_event($MOUSE.hwheel, 0, 0, -120, [IntPtr]::Zero) }
+          'up' { Send-MouseInput $MOUSE.wheel 120 }
+          'down' { Send-MouseInput $MOUSE.wheel -120 }
+          'right' { Send-MouseInput $MOUSE.hwheel 120 }
+          'left' { Send-MouseInput $MOUSE.hwheel -120 }
           default { throw "scroll direction must be up/down/left/right (got '$dir')" }
         }
         Start-Sleep -Milliseconds 40
@@ -377,7 +575,8 @@ try {
       # this SAME bridge script/dispatcher (no new mechanism, no new transport) rather
       # than a standalone tool. Deliberately does nothing else (no CopyFromScreen, no
       # SendInput) - the cheapest possible action this bridge can perform.
-      $out.idle_ms = Get-IdleMs
+      $out.observation = [CU]::Observe()
+      $out.idle_ms = [double]($out.observation.now_ms - $out.observation.last_input_ms)
     }
     'get_clipboard' {
       # Get-Clipboard/Set-Clipboard handle the STA requirement internally; the
@@ -387,6 +586,7 @@ try {
     }
     'set_clipboard' {
       $val = "$($req.text)"
+      [CU]::Check()
       Set-Clipboard -Value $val
       $out.set = $val.Length
     }
@@ -417,11 +617,19 @@ try {
     }
     'focus_window' {
       $h = [IntPtr][int64]"$($req.handle)"
+      [CU]::Check()
       if ([CU]::IsIconic($h)) { [void][CU]::ShowWindow($h, 9) }   # SW_RESTORE
       # ALT nudge defeats Windows' foreground-lock heuristic
-      [CU]::keybd_event(0x12, 0, 0, [IntPtr]::Zero)
-      [void][CU]::SetForegroundWindow($h)
-      [CU]::keybd_event(0x12, 0, $KEYUP, [IntPtr]::Zero)
+      $released = $false; $pressed = $false
+      $altUp = [CU+INPUT[]]@((New-KeyInput 0x12 $KEYUP))
+      try {
+        [CU]::Emit([CU+INPUT[]]@((New-KeyInput 0x12))); $pressed = $true
+        [CU]::Check()
+        [void][CU]::SetForegroundWindow($h)
+        [CU]::Emit($altUp); $released = $true
+      } finally {
+        if (-not $released -and ($pressed -or [CU]::EmissionAttempted)) { [CU]::Release($altUp) }
+      }
       Start-Sleep -Milliseconds 250
       $out.focused = ([CU]::GetForegroundWindow()).ToString()
       $out.requested = $h.ToString()
@@ -433,4 +641,16 @@ catch {
   $out = @{ ok = $false; error = "$($_.Exception.Message)" }
 }
 
+if ($null -ne $req.target_clock_condition) {
+  try {
+    # Retain the rejected preflight, not an observation of our subsequent
+    # emergency release (which could otherwise be mislabelled as human input).
+    $observation = if ($out.ok) { [CU]::Observe() } else { [CU]::Latest }
+    $out.target_clock = @{ observation = $observation; injection = [CU]::Injection }
+  } catch {
+    $out.ok = $false
+    $out.error = "Windows target-clock response unavailable: $($_.Exception.Message)"
+    $out.target_clock = @{ observation = $null; injection = [CU]::Injection }
+  }
+}
 $out | ConvertTo-Json -Depth 6 -Compress

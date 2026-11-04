@@ -27,12 +27,11 @@ there and implemented here:
   injection, exactly matching O5's harness shape (inject, sample, inject,
   sample, ...).
 
-Clocks: everything here is `time.monotonic()` on ONE machine (the target this
-detector runs on). Comparing a controller-side timestamp against a target-side
-idle counter would require the two clocks to agree to within `GUARD` - orders
-of magnitude tighter than tailnet NTP skew provides (\u00a75.1). This module is
-never handed a foreign timestamp; the `idle_source` callable it is constructed
-with must itself be local to the machine it reads.
+Clocks: the scalar-idle path retains its existing `time.monotonic()` contract.
+Windows guards instead supply `target_clock_source`: structured observations
+and emission receipts on the same target GetTickCount64 timeline. Their margin
+never uses controller receipt time, transport RTT or an estimated clock offset.
+Controller monotonic time still owns latch decay and reporting intervals.
 
 Confidence is a margin test, not a probability
 ------------------------------------------------
@@ -50,6 +49,8 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
+
+from .target_clock import TargetObservation, tick
 
 #: Per-platform GUARD bands (milliseconds), \u00a75.5.
 #:
@@ -306,6 +307,9 @@ class PresenceMonitor:
 
     idle_source: Callable[[], float]
     platform: str
+    target_clock_source: Callable[[], Any] | None = None
+    _target_observation: TargetObservation | None = field(default=None, init=False)
+    _target_inject_before_ms: int | None = field(default=None, init=False)
     _last_inject_monotonic: float | None = field(default=None, init=False)
     _last_sample_monotonic: float | None = field(default=None, init=False)
     _state: PresenceState = field(default=PresenceState.UNKNOWN, init=False)
@@ -341,7 +345,81 @@ class PresenceMonitor:
         \u00a75.2: "on every elementary event - not once per operation." A
         200-character `type_text` calls this 200 times, not once.
         """
-        self._last_inject_monotonic = at if at is not None else time.monotonic()
+        if self.target_clock_source is None:
+            self._last_inject_monotonic = at if at is not None else time.monotonic()
+
+    def target_condition(self) -> dict[str, Any]:
+        observation = self._target_observation
+        if observation is None:
+            raise ValueError("no Windows target-clock observation before input")
+        return {
+            **observation.to_dict(),
+            "inject_before_ms": self._target_inject_before_ms,
+            "guard_ms": self.guard_ms,
+        }
+
+    def record_target_result(
+        self,
+        result: Any,
+        *,
+        require_injection: bool,
+        transport_latency_ms: float = 0.0,
+    ) -> PresenceSnapshot:
+        if not isinstance(result, dict):
+            raise ValueError("missing Windows target-clock result")
+        clock = result.get("target_clock")
+        if not isinstance(clock, dict) or "injection" not in clock:
+            raise ValueError("missing Windows target-clock receipt")
+        observation = TargetObservation.parse(clock.get("observation"))
+        self._validate_target_observation(observation)
+        injection = clock["injection"]
+        if injection is None:
+            if require_injection and result.get("ok") is True:
+                raise ValueError("Windows input acknowledged without emission receipt")
+        else:
+            if (
+                not isinstance(injection, dict)
+                or injection.get("epoch") != observation.epoch
+            ):
+                raise ValueError("Windows injection epoch mismatch")
+            before = tick(injection.get("before_ms"))
+            after = tick(injection.get("after_ms"))
+            count = tick(injection.get("count"))
+            if not before <= after <= observation.now_ms or not 0 < count < 2**32:
+                raise ValueError("invalid Windows emission receipt")
+            if (
+                self._target_observation is not None
+                and before < self._target_observation.now_ms
+            ):
+                raise ValueError("Windows emission predates checked observation")
+            # A failed composite may still acknowledge earlier emissions. Credit
+            # only this actual SendInput timestamp, never its later LastInputInfo
+            # (which may already belong to somebody else).
+            self._target_inject_before_ms = before
+        return self._reconcile_target(observation, transport_latency_ms)
+
+    def _validate_target_observation(self, observation: TargetObservation) -> None:
+        previous = self._target_observation
+        if previous is not None and (
+            previous.epoch != observation.epoch
+            or observation.now_ms < previous.now_ms
+            or observation.last_input_ms < previous.last_input_ms
+        ):
+            raise ValueError("Windows target epoch/ticks changed or regressed")
+
+    def _reconcile_target(
+        self, observation: TargetObservation, transport_latency_ms: float
+    ) -> PresenceSnapshot:
+        self._validate_target_observation(observation)
+        self._target_observation = observation
+        margin = (
+            None
+            if self._target_inject_before_ms is None
+            else float(observation.last_input_ms - self._target_inject_before_ms)
+        )
+        return self._snapshot(
+            observation.idle_ms, margin, time.monotonic(), transport_latency_ms
+        )
 
     def sample(self, *, now: float | None = None) -> PresenceSnapshot:
         """Read idle, reconcile against our own last injection, update the
@@ -349,6 +427,10 @@ class PresenceMonitor:
 
         Intended to be called once per inter-injection gap - i.e. right
         before the *next* injection - matching O5's harness shape exactly.
+
+        Windows' structured path computes its margin entirely in target ticks.
+        The scalar-idle timing discussion below describes the retained
+        compatibility path, not a fallback for a configured Windows guard.
 
         \u00a75.7 - measured safety gap fix: `now` is the anchor every downstream
         comparison treats as "the instant this observation became true." For
@@ -381,7 +463,13 @@ class PresenceMonitor:
         t_call_start = time.monotonic()
 
         try:
-            idle_ms = float(self.idle_source())
+            target = None
+            if self.target_clock_source is not None:
+                target = TargetObservation.parse(self.target_clock_source())
+                self._validate_target_observation(target)
+                idle_ms = target.idle_ms
+            else:
+                idle_ms = float(self.idle_source())
         except Exception as exc:  # any read failure -> unknown, never a guess
             transport_latency_ms = (time.monotonic() - t_call_start) * 1000.0
             bookkeeping_now = now if explicit_now else t_call_start
@@ -409,14 +497,16 @@ class PresenceMonitor:
         transport_latency_ms = (t_call_end - t_call_start) * 1000.0
         resolved_now = now if explicit_now else t_call_end
 
-        interval_ms = None
-        if self._last_sample_monotonic is not None:
-            interval_ms = (resolved_now - self._last_sample_monotonic) * 1000.0
-        self._last_sample_monotonic = resolved_now
-
         inferred_last_input = resolved_now - (idle_ms / 1000.0)
 
-        if self._last_inject_monotonic is None:
+        if target is not None:
+            self._target_observation = target
+            margin_ms = (
+                None
+                if self._target_inject_before_ms is None
+                else float(target.last_input_ms - self._target_inject_before_ms)
+            )
+        elif self._last_inject_monotonic is None:
             # No injection has happened yet this session - nothing of ours to
             # reconcile against. Any measured idle simply reports quiet/active
             # by the QUIET_FLOOR rule below, basis stays idle_reconciliation.
@@ -424,6 +514,19 @@ class PresenceMonitor:
         else:
             margin_ms = (inferred_last_input - self._last_inject_monotonic) * 1000.0
 
+        return self._snapshot(idle_ms, margin_ms, resolved_now, transport_latency_ms)
+
+    def _snapshot(
+        self,
+        idle_ms: float,
+        margin_ms: float | None,
+        resolved_now: float,
+        transport_latency_ms: float,
+    ) -> PresenceSnapshot:
+        interval_ms = None
+        if self._last_sample_monotonic is not None:
+            interval_ms = (resolved_now - self._last_sample_monotonic) * 1000.0
+        self._last_sample_monotonic = resolved_now
         state, confidence = self._classify(margin_ms, idle_ms)
 
         if state is PresenceState.HUMAN_ACTIVE:

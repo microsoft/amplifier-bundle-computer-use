@@ -27,8 +27,8 @@ from amplifier_module_tool_computer_use.coexistence_guard import CoexistenceGuar
 from amplifier_module_tool_computer_use.remote_agent import RemoteAgent
 from amplifier_module_tool_computer_use.remote_backend import RemoteBackend
 from amplifier_module_tool_computer_use.ssh_transport import SshConnectError
+from amplifier_module_tool_computer_use.target_clock import CURRENT_TARGET_CLOCK
 from amplifier_module_tool_computer_use.windows import WindowsBackend
-from amplifier_module_tool_computer_use.wire import Response
 from test_neutral_computer import Backend as NeutralBackend
 from test_neutral_computer import cu, run
 
@@ -41,6 +41,7 @@ class Clock:
         self.last_input = 0.0
         self.external_events = 0
         self.after_sleep = None
+        self.after_inject = None
 
     def monotonic(self):
         return self.now
@@ -75,39 +76,102 @@ def rig(request, monkeypatch):
         # A bridge call costs time even on the local WSL path. Idle is read
         # fresh; synthetic input updates the same last-input counter as a user.
         clock.now += 0.120
+
+        def observation():
+            return {
+                "version": 1,
+                "epoch": "synthetic-windows-boot-session",
+                "now_ms": round((clock.now + 10000) * 1000),
+                "last_input_ms": round((clock.last_input + 10000) * 1000),
+            }
+
         if operation == "presence_idle":
-            return {"ok": True, "idle_ms": (clock.now - clock.last_input) * 1000}
+            return {
+                "ok": True,
+                "idle_ms": (clock.now - clock.last_input) * 1000,
+                "observation": observation(),
+            }
         assert operation in {"type", "key"}
+        exchange = CURRENT_TARGET_CLOCK.get()
+        if exchange is not None:
+            condition = exchange.condition
+            fresh = observation()
+            baseline = condition["inject_before_ms"]
+            active = (
+                (fresh["last_input_ms"] != condition["last_input_ms"])
+                if baseline is None
+                else (fresh["last_input_ms"] - baseline > condition["guard_ms"])
+            )
+            if active:
+                result = {
+                    "ok": False,
+                    "error": "external input before emission",
+                    "target_clock": {"observation": fresh, "injection": None},
+                }
+                exchange.finish(result, require_injection=True)
+                return result
+        injected_at = observation()["now_ms"]
         clock.last_input = clock.now
         injections.append((operation, kwargs["text"]))
-        return {"ok": True}
+        if clock.after_inject:
+            clock.after_inject()
+        result = {
+            "ok": True,
+            "target_clock": {
+                "observation": observation(),
+                "injection": {
+                    "epoch": "synthetic-windows-boot-session",
+                    "before_ms": injected_at,
+                    "after_ms": injected_at,
+                    "count": 2,
+                },
+            },
+        }
+        if exchange is not None:
+            exchange.finish(result, require_injection=True)
+        return result
 
     windows.raw = raw
-    agent = SimpleNamespace(backend=windows)
+    agent = SimpleNamespace(
+        backend=windows, read_only=False, _HANDLERS=RemoteAgent._HANDLERS
+    )
 
     class Transport:
         fail_type = False
         lose_ack = False
+        input_tail = 0.005
+        presence_tail = 0.005
+        external_at = None
+        corrupt_type_response = None
 
         def send(self, line, **kwargs):
             data = json.loads(line)
             op, args = data["op"], data["args"]
             wires.append((op, args))
             clock.now += 0.020
+            if self.external_at == "outbound" and op == "type_text":
+                self.external_at = None
+                clock.external()
             if self.fail_type and op == "type_text":
                 raise SshConnectError("Lost response; input outcome unknown")
-            if op == "type_text":
-                value = RemoteAgent._op_type_text(agent, args)
-                if self.lose_ack:
-                    raise SshConnectError("Input applied; acknowledgement lost")
-            elif op == "key":
-                value = RemoteAgent._op_key(agent, args)
-            elif op == "presence_idle":
-                value = RemoteAgent._op_presence_idle(agent, args)
-            else:
-                raise AssertionError(op)
-            clock.now += 0.005  # response tail, not a widened guard threshold
-            return Response(id=data["id"], ok=True, result=value).encode()
+            from amplifier_module_tool_computer_use.wire import Request
+
+            response = RemoteAgent._dispatch(
+                agent, Request(id=data["id"], op=op, args=args)
+            )
+            if self.lose_ack and op == "type_text":
+                raise SshConnectError("Input applied; acknowledgement lost")
+            clock.now += (
+                self.presence_tail if op == "presence_idle" else self.input_tail
+            )
+            if self.external_at == "presence-tail" and op == "presence_idle":
+                self.external_at = None
+                clock.external()
+            if self.corrupt_type_response is not None and op == "type_text":
+                return json.dumps(
+                    {"id": data["id"], "ok": False, "error": self.corrupt_type_response}
+                ).encode()
+            return response.encode()
 
     transport = Transport()
     if request.param == "remote":
@@ -129,7 +193,9 @@ def rig(request, monkeypatch):
     monkeypatch.setattr(tool, "_ensure_announced", lambda: None)
     monkeypatch.setattr(tool, "_sync_remote_announcement_state", lambda guard: None)
     monitor = presence.PresenceMonitor(
-        backend.presence_idle_ms, platform="windows-wsl2"
+        backend.presence_idle_ms,
+        platform="windows-wsl2",
+        target_clock_source=backend.presence_observation,
     )
     target = ["original-window"]
     guard = CoexistenceGuard(
@@ -169,7 +235,8 @@ def test_own_33_character_typing_then_enter_is_not_human_activity(rig):
     assert run(rig.tool.execute({"action": "type", "text": TEXT})).success
     assert rig.injections == [("type", char) for char in TEXT]
     assert len(rig.timestamps) == 33
-    assert rig.monitor._last_inject_monotonic == rig.timestamps[-1]
+    assert rig.monitor._last_inject_monotonic is None
+    assert rig.monitor.target_condition()["inject_before_ms"] is not None
     rig.clock.now += 15.844  # a delayed next action, not reconstructed live timing
     assert run(rig.tool.execute({"action": "key", "text": "ENTER"})).success
     assert rig.injections[-1] == ("key", "ENTER")
@@ -177,6 +244,67 @@ def test_own_33_character_typing_then_enter_is_not_human_activity(rig):
     assert rig.monitor.last_snapshot.state is not presence.PresenceState.HUMAN_ACTIVE
     assert rig.monitor.guard_ms == presence.GUARD_MS["windows-wsl2"]
     assert len(rig.timestamps) == 34
+
+
+def test_own_input_does_not_become_external_with_asymmetric_response_tails(rig):
+    if not isinstance(rig.backend, RemoteBackend):
+        pytest.skip("Remote response-tail discriminator")
+    rig.transport.input_tail = 0.010
+    rig.transport.presence_tail = 0.046518420995
+    result = run(rig.tool.execute({"action": "type", "text": TEXT}))
+    assert result.success, result.error
+    assert rig.clock.external_events == 0
+    assert rig.injections == [("type", char) for char in TEXT]
+
+
+def test_external_input_is_not_hidden_by_a_long_write_response_tail(rig):
+    if not isinstance(rig.backend, RemoteBackend):
+        pytest.skip("Remote response-tail discriminator")
+    rig.transport.input_tail = 0.200
+    rig.transport.presence_tail = 0.005
+
+    def external_during_write_response():
+        # Target input occurs after injection, before its delayed acknowledgement.
+        # Controller receipt-time bookkeeping must not credit that event as ours.
+        rig.clock.external()
+
+    rig.clock.after_inject = external_during_write_response
+    result = run(rig.tool.execute({"action": "type", "text": TEXT}))
+    assert not result.success
+    assert result.error["type"] == "HaltedError"
+    assert rig.injections == [("type", TEXT[0])]
+
+
+@pytest.mark.parametrize("phase", ["presence-tail", "outbound"])
+def test_external_input_during_transport_refuses_before_next_emission(rig, phase):
+    if not isinstance(rig.backend, RemoteBackend):
+        pytest.skip("Remote transport-only contract")
+    # Establish a target-clock baseline before testing the next invocation.
+    assert run(rig.tool.execute({"action": "key", "text": "CTRL+A"})).success
+    previous = list(rig.injections)
+    rig.transport.external_at = phase
+    result = run(rig.tool.execute({"action": "type", "text": TEXT}))
+    assert not result.success
+    assert result.error["type"] == "HaltedError"
+    assert rig.injections == previous
+    assert rig.guard.halted
+    assert len(rig.halts) == 1
+
+
+def test_malformed_error_after_possible_input_latches_unknown_without_retry(rig):
+    if not isinstance(rig.backend, RemoteBackend):
+        pytest.skip("Remote wire-only contract")
+    rig.transport.corrupt_type_response = "corrupt"
+    result = run(rig.tool.execute({"action": "type", "text": TEXT}))
+    assert not result.success
+    assert result.error["type"] == "HaltedError"
+    assert rig.guard.halted
+    assert rig.guard._halt_snapshot.state is presence.PresenceState.UNKNOWN
+    assert len(rig.halts) == 1
+    assert rig.injections == [("type", TEXT[0])]
+    rig.clock.now += 100
+    assert not run(rig.tool.execute({"action": "key", "text": "ENTER"})).success
+    assert rig.injections == [("type", TEXT[0])]
 
 
 def test_signature_without_capability_cannot_skip_controller_callbacks(rig):
@@ -372,7 +500,11 @@ def test_disk_halt_clear_does_not_clear_cached_guard_and_fresh_guard_can_resume(
     assert not run(rig.tool.execute({"action": "type", "text": TEXT})).success
     assert not rig.injections
     rig.tool._coexistence_guard = CoexistenceGuard(
-        presence.PresenceMonitor(rig.backend.presence_idle_ms, platform="windows-wsl2"),
+        presence.PresenceMonitor(
+            rig.backend.presence_idle_ms,
+            platform="windows-wsl2",
+            target_clock_source=rig.backend.presence_observation,
+        ),
         release_all=lambda reason: [],
         durable_halt_poll=lambda: disk[0],
     )

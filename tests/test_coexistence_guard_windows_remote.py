@@ -42,6 +42,15 @@ class _FakeWindowsBackend:
         self.calls += 1
         return self._idle_ms
 
+    def presence_observation(self):
+        self.calls += 1
+        return {
+            "version": 1,
+            "epoch": "synthetic-windows-boot-session",
+            "now_ms": 2_000_000,
+            "last_input_ms": 2_000_000 - int(self._idle_ms),
+        }
+
 
 class _FakeRemoteBackend:
     """Stands in for `RemoteBackend` post-fix: `name` is the COMPOSITE
@@ -82,7 +91,7 @@ def test_windows_backend_gets_a_real_guard():
     assert guard.presence.guard_ms == GUARD_MS["windows-wsl2"]
 
 
-def test_windows_backend_guard_actually_calls_presence_idle_ms():
+def test_windows_backend_guard_actually_calls_target_clock_observation():
     backend = _FakeWindowsBackend(idle_ms=999_999.0)
     guard = _build_coexistence_guard(backend, {})
     assert guard is not None
