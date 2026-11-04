@@ -50,6 +50,23 @@ from .backend import Backend, BackendError, MonitorInfo
 from .coexistence_guard import CoexistenceGuard, HaltedError
 from .exclusion import Rect
 from .geometry import Display, ImageSpace, compute_display
+from .guard_diagnostics import (
+    DiagnosticLog,
+    checkpoint,
+    new_id,
+)
+from .guard_diagnostics import (
+    operation as diagnostic_operation,
+)
+from .guard_diagnostics import (
+    snapshot as diagnostic_snapshot,
+)
+from .guard_diagnostics import (
+    typing_path as diagnostic_typing_path,
+)
+from .guard_diagnostics import (
+    typing_unit as diagnostic_typing_unit,
+)
 from .halt_state import (
     load_halt,
     make_durable_halt_poll,
@@ -328,6 +345,8 @@ class _Binding:
     # retarget starts a new physical channel, so it starts a new edge).
     remote_pause_seen: bool
     remote_cancel_seen: bool
+    # Retained by cache/policy replacements; a fresh retarget gets a new token.
+    diagnostic_id: str | None = field(default_factory=new_id, compare=False)
 
 
 class ComputerTool:
@@ -417,6 +436,7 @@ class ComputerTool:
         # `_prune_shots()`.
         self._session_id: str = uuid.uuid4().hex
         self._observed_control = None
+        self._diagnostics = DiagnosticLog()
         # One-shot handoff to the hook's real tool:post call association. Only
         # successful image results emitted by this instance enter this queue.
         # It is bounded, memory-only, and cannot be reconstructed from history.
@@ -600,7 +620,7 @@ class ComputerTool:
 
     @_backend.setter
     def _backend(self, value: Backend) -> None:
-        self._binding = replace(self._binding, backend=value)
+        self._binding = replace(self._binding, backend=value, diagnostic_id=new_id())
 
     @property
     def _is_remote(self) -> bool:
@@ -2399,9 +2419,16 @@ class ComputerTool:
                 try:
                     typing_guard = guard
                     if self._observed_control is not None:
-                        from .observed_control import observed_typing_guard
+                        from .observed_control import (
+                            CURRENT_PROOF,
+                            observed_typing_guard,
+                        )
 
                         typing_guard = observed_typing_guard(guard, binding)
+                        diagnostic_typing_path(
+                            wrapper=typing_guard is not guard,
+                            proof=CURRENT_PROOF.get() is not None,
+                        )
 
                     def type_unit(unit):
                         _check_input_cancelled()
@@ -2419,10 +2446,12 @@ class ComputerTool:
                     # In particular, a remote bulk call must not turn a long
                     # string into one uninterruptible guarded unit.
                     pacing_seconds = pacing_ms / 1000.0
-                    for ch in body:
+                    for unit_index, ch in enumerate(body):
+                        diagnostic_typing_unit(unit_index)
                         type_unit(ch)
                         if pacing_ms > 0:
                             time.sleep(pacing_seconds)
+                    checkpoint(guard, "type_complete")
                 finally:
                     guard.release_target()
             else:
@@ -3028,11 +3057,14 @@ class ComputerTool:
     ) -> tuple[str, str | None]:
         token = _input_cancelled.set(flight["cancelled"])
         try:
-            _check_input_cancelled()
-            outcome = function(*args)
-            with flight["lock"]:
-                flight["outcome"] = outcome
-            return outcome
+            with diagnostic_operation(
+                self._diagnostics, binding, self._diagnostics.identity
+            ):
+                _check_input_cancelled()
+                outcome = function(*args)
+                with flight["lock"]:
+                    flight["outcome"] = outcome
+                return outcome
         except HaltedError as exc:
             # A cancelled waiter can abandon its shielded worker. Record the
             # halt here, exactly once, against the worker's pinned target before
@@ -3405,6 +3437,7 @@ DESKTOP_ACTIONS = [
     # show a possibly-irrelevant dialog for a machine the caller is about to
     # leave.
     "retarget",
+    "diagnostic_snapshot",
 ]
 
 #: Clipboard *reads* travel to the model provider as tool output (see README Safety
@@ -3516,6 +3549,8 @@ class DesktopTool:
             "land with extra or missing characters, so if a result looks off, verify what "
             "actually landed before assuming your own input was wrong. Which machine this "
             f"session controls is fixed for the whole session, not chosen per call: {_TARGET_MODEL}"
+            " Use `diagnostic_snapshot` for bounded cached, payload-free guard evidence; "
+            "it never contacts the target, samples presence, or clears a halt."
         )
 
     @property
@@ -3556,6 +3591,16 @@ class DesktopTool:
         }
 
     async def execute(self, input: dict[str, Any]) -> ToolResult:
+        # Pure cached diagnostics are available even while halted or after
+        # cleanup. Do not approve, disclose, poll, copy arbitrary input fields,
+        # touch the backend, or wait for _announce_lock on this route.
+        if isinstance(input, dict) and input.get("action") == "diagnostic_snapshot":
+            if input.keys() != {"action"}:
+                return ToolResult(
+                    success=False,
+                    error={"message": "diagnostic_snapshot accepts only action"},
+                )
+            return ToolResult(success=True, output=diagnostic_snapshot(self._computer))
         if self._computer._cleanup_started:
             return ToolResult(
                 success=False,

@@ -50,6 +50,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
+from .guard_diagnostics import new_id
 from .target_clock import TargetObservation, tick
 
 #: Per-platform GUARD bands (milliseconds), \u00a75.5.
@@ -315,6 +316,9 @@ class PresenceMonitor:
     _state: PresenceState = field(default=PresenceState.UNKNOWN, init=False)
     _latched_until: float | None = field(default=None, init=False)
     _last_snapshot: PresenceSnapshot | None = field(default=None, init=False)
+    _diagnostic_id: str | None = field(
+        default_factory=new_id, init=False, repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
         if self.platform not in GUARD_MS:
