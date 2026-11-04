@@ -40,6 +40,7 @@ from typing import Any
 
 from .backend import BackendError
 from .exclusion import ExclusionZone
+from .guard_diagnostics import DiagnosticLog, checkpoint
 from .halt_state import PERSISTED_BASIS, PERSISTED_UNKNOWN_BASIS, resolve_resume_command
 from .pause import DragState, PauseController, PausedError
 from .presence import (
@@ -206,6 +207,12 @@ class CoexistenceGuard:
     drag: DragState = field(default_factory=DragState)
     _halted: bool = field(default=False, init=False)
     _halt_snapshot: PresenceSnapshot | None = field(default=None, init=False)
+    _diagnostics: DiagnosticLog = field(
+        default_factory=DiagnosticLog, init=False, repr=False, compare=False
+    )
+
+    def __post_init__(self) -> None:
+        checkpoint(self, "guard_created")
 
     # -- target binding convenience (\u00a78.6) -----------------------------------
     def bind_target(self) -> None:
@@ -277,6 +284,7 @@ class CoexistenceGuard:
         was constructed - see `_poll_durable_halt` and the field's own
         docstring above.
         """
+        checkpoint(self, "before_sample")
         self._poll_durable_halt()
         if (
             self._halted
@@ -284,6 +292,7 @@ class CoexistenceGuard:
         ):
             # In particular, do not relabel an UNKNOWN receipt failure as a
             # human event when observing our own subsequent safety releases.
+            checkpoint(self, "halt_recheck")
             with without_target_clock():
                 self.release_all("halted")
             assert self._halt_snapshot is not None
@@ -294,12 +303,14 @@ class CoexistenceGuard:
             if getattr(self.presence, "target_clock_source", None) is not None:
                 self._halt_target_failure("target_clock_unreadable")
             raise
+        checkpoint(self, "before_next_write")
         self._notify_presence_sample(snap)
         if snap.state is PresenceState.HUMAN_ACTIVE:
             self._halted = True
             self._halt_snapshot = snap
         if self._halted:
             assert self._halt_snapshot is not None
+            checkpoint(self, "halt")
             self.release_all("halted")
             raise HaltedError(self._halt_snapshot)
         try:
@@ -354,6 +365,7 @@ class CoexistenceGuard:
         """
         self._halted = True
         self._halt_snapshot = snapshot
+        checkpoint(self, "halt")
 
     def _poll_durable_halt(self) -> None:
         """Defect 2 fix (live safety defect, fixed 2026-08-02): escalate to
@@ -394,6 +406,7 @@ class CoexistenceGuard:
             condition = self.presence.target_condition()
         except ValueError:
             self._halt_target_failure("target_clock_unreadable")
+        checkpoint(self, "condition_constructed")
         try:
             with target_clock_exchange(condition, self) as exchange:
                 yield
@@ -424,7 +437,9 @@ class CoexistenceGuard:
                 transport_latency_ms=transport_latency_ms,
             )
         except (ValueError, TypeError, KeyError):
+            checkpoint(self, "receipt_invalid")
             self._halt_target_failure("target_clock_unreadable")
+        checkpoint(self, "receipt", result=result)
         self._notify_presence_sample(snap)
         if snap.state is PresenceState.HUMAN_ACTIVE:
             self.seed_halted(snap)

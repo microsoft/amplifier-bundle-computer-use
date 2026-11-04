@@ -150,6 +150,41 @@ already produced one. Earlier screenshots and cropped zooms never satisfy it.
 Focus a window before typing into it; use the clipboard to pull exact text out of an app;
 use `select_monitor` to switch which monitor the model sees, mid-session.
 
+### Cached guard diagnostics
+
+`desktop(action="diagnostic_snapshot")` accepts **only** `action`. It returns a
+bounded, payload-free v1 snapshot without contacting a target, sampling presence,
+polling durable halts, showing disclosure, or acquiring the execution lock. It
+works while halted and after cleanup; it never clears a halt or authorizes input.
+
+The snapshot has opaque process/tool/binding/guard/presence identities, up to eight
+recent records per cache, and separately retained `type_complete` and
+`before_next_write` records. Compare their accepted-receipt count, last emission
+`before_ms`/`after_ms`/`count`, credited baseline, and target observation
+`epoch`/`now_ms`/`last_input_ms`. Request tokens and zero-based unit indices correlate
+records without storing text, keys, action arguments, screenshots or clipboard.
+Only an existing, valid SHA-256 epoch is exposed; other epoch strings are redacted.
+`halt_origin` distinguishes `live_presence`/`durable_presence` classifications
+from `live_safety`/`durable_safety` evidence failures. These labels and the existing
+`presence_state` classifier vocabulary describe guard classification/provenance,
+**not the input's author**. They do not establish that a human produced input.
+
+The `condition_constructed` checkpoint records
+`constructed_condition_present:"present"` only after `target_clock_event` actually
+constructs a condition. Other records use `"not_recorded"`; match the opaque
+request token and unit index to correlate a receipt, without carrying a previous
+unit's construction forward. `structured_clock` only reports configuration.
+`wire_condition_presence:"not_measured"` is always explicit: these controller-local
+diagnostics do not observe serialization, delivery or remote condition consumption.
+
+These are **cached observations, not fresh presence or physical-cause proof**.
+`null` means missing, `truncated` means older records were evicted, `fault` marks
+incomplete evidence (collection failure or contention), and `available:false`
+means a cache was busy or unreadable. Receipt counters are cumulative per cache,
+not per request; a faulted cache cannot establish a complete receipt count.
+Tool and guard caches are read separately, not as one atomic cross-cache snapshot.
+No file log, background collector, payload hash, replay or remote protocol is added.
+
 > **Every action above works against a remote (`ssh://`) target**, including
 > `left_mouse_down`/`left_mouse_up`, `left_click_drag`, `scroll`, `hold_key`, and
 > all four `desktop` window/clipboard actions. Each is a real entry in
