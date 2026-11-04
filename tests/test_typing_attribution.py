@@ -29,6 +29,7 @@ from amplifier_module_tool_computer_use.remote_backend import RemoteBackend
 from amplifier_module_tool_computer_use.ssh_transport import SshConnectError
 from amplifier_module_tool_computer_use.windows import WindowsBackend
 from amplifier_module_tool_computer_use.wire import Response
+from test_neutral_computer import Backend as NeutralBackend
 from test_neutral_computer import cu, run
 
 TEXT = "powershell.exe -NoLogo -NoProfile"
@@ -442,3 +443,78 @@ def test_queued_ungated_type_rechecks_policy_before_dispatch(rig, monkeypatch):
 
     assert not run(scenario()).success
     assert not rig.injections and not rig.timestamps
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"action": "left_click", "coordinate": [20, 30]},
+        {"action": "key", "text": "ENTER"},
+        {"action": "key", "text": "ENTER", "repeat": 3},
+    ],
+    ids=["click", "key", "key-repeat"],
+)
+def test_cancelled_lock_waiter_never_dispatches_and_cleans_up_once(
+    payload, monkeypatch
+):
+    backend = NeutralBackend()
+    tool = cu.ComputerTool(backend, {})
+    tool.resolve_display()
+    entered, proceed, waiting, settled = (threading.Event() for _ in range(4))
+    worker = []
+    exits = []
+    original_lock = tool._announce_lock
+    method = "_run_key_press" if payload["action"] == "key" else "_run_flat_step"
+    original_step = getattr(tool, method)
+
+    def queued(*args):
+        worker.append(threading.get_ident())
+        entered.set()
+        assert proceed.wait(5)
+        return original_step(*args)
+
+    class ObservedLock:
+        # Observe contention on the REAL operation lock, not a replacement
+        # dispatch implementation. Other preflight lock users are unchanged.
+        def __enter__(self):
+            if worker and threading.get_ident() == worker[0]:
+                waiting.set()
+            return original_lock.__enter__()
+
+        def __exit__(self, *args):
+            return original_lock.__exit__(*args)
+
+    monkeypatch.setattr(tool, method, queued)
+    monkeypatch.setattr(tool, "_announce_lock", ObservedLock())
+    monkeypatch.setattr(tool, "_ensure_announced", lambda: None)
+    monkeypatch.setattr(tool, "_band_enter", lambda: "owned-band")
+    monkeypatch.setattr(
+        tool, "_band_exit", lambda token: (exits.append(token), settled.set())
+    )
+
+    async def scenario():
+        task = asyncio.create_task(tool.execute(payload))
+        try:
+            assert await asyncio.to_thread(entered.wait, 5)
+            original_lock.acquire()
+            try:
+                proceed.set()
+                assert await asyncio.to_thread(waiting.wait, 5)
+                assert not backend.calls
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+                assert not backend.calls
+                assert not exits
+            finally:
+                original_lock.release()
+            assert await asyncio.to_thread(settled.wait, 5)
+        finally:
+            proceed.set()
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+    run(scenario())
+    assert not backend.calls
+    assert exits == ["owned-band"]

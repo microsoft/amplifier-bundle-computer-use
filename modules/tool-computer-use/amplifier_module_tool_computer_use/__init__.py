@@ -2849,6 +2849,10 @@ class ComputerTool:
                     "action 'key' blocked: computer-use is mounted read_only"
                 )
             self._check_write("key", binding, approved)
+            # Cancellation can arrive while this worker waits for the lock.
+            # No backend invocation has begun yet; do not treat queued input
+            # as already-in-flight uncertainty.
+            _check_input_cancelled()
             return self._run("key", params, binding=binding)
 
     async def _run_key_repeat(
@@ -2902,6 +2906,7 @@ class ComputerTool:
         # approval gate. One guard's bind-to-release lifetime cannot overlap.
         with self._announce_lock:
             self._check_write(action, binding, approved)
+            _check_input_cancelled()
             return self._run(action, params, binding=binding)
 
     def _check_write(
