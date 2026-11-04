@@ -495,6 +495,9 @@ class ComputerTool:
         # one lock with `_ensure_announced` is what makes the verified race
         # structurally impossible rather than merely unlikely.
         self._announce_lock: threading.Lock = threading.Lock()
+        # Terminal lifecycle fence, serialized with retarget's build+swap by
+        # the same lock. A retained tool must not allocate after Session cleanup.
+        self._cleanup_started = False
         # `announced`/`announcement`/`announce_refused` below: `announced`
         # sticky-False until this session's first real action successfully
         # builds (or is refused) a disclosure; `announce_refused` sticky for
@@ -1510,6 +1513,8 @@ class ComputerTool:
         makes this method's unlocked fast-path reads safe against a
         concurrent retarget, not merely unlikely to lose the race.
         """
+        if self._cleanup_started:
+            raise AnnouncementRefused("computer-use session cleanup has started")
         binding = self._binding
         if binding.announce_refused is not None:
             raise binding.announce_refused
@@ -1520,6 +1525,8 @@ class ComputerTool:
             # already announced (or been refused, or installed an entirely
             # new binding) while this thread waited for the lock above -
             # re-read rather than trust the snapshot taken before it.
+            if self._cleanup_started:
+                raise AnnouncementRefused("computer-use session cleanup has started")
             binding = self._binding
             if binding.announce_refused is not None:
                 raise binding.announce_refused
@@ -1600,6 +1607,14 @@ class ComputerTool:
                 },
             )
         try:
+            if self._cleanup_started:
+                return ToolResult(
+                    success=False,
+                    error={
+                        "message": "retarget refused: session cleanup has started",
+                        "type": "RetargetRefused",
+                    },
+                )
             current = self._binding
             # Second TOCTOU fix: this read used to be unlocked
             # (`current.band_state.depth != 0`) while `_band_enter`/
@@ -1959,22 +1974,25 @@ class ComputerTool:
         human detected present (\\u00a77.6, via `_handle_channel_failure` -
         reused verbatim, the exact policy the FIRST raise already applies).
         """
-        handle = self._live_band_handle()
-        state = self._band_state
-        if handle is None or state is None:
-            return None
-        with state.lock:
-            state.depth += 1
-            try:
-                self._ensure_band_raised(handle)
-            except BaseException:
-                # Never leave `depth` incremented with no matching
-                # decrement - a failed raise must not leak a phantom
-                # in-flight action that later blocks every legitimate
-                # lower forever.
-                state.depth -= 1
-                raise
-        return handle, state
+        with self._announce_lock:
+            if self._cleanup_started:
+                raise AnnouncementRefused("computer-use session cleanup has started")
+            handle = self._live_band_handle()
+            state = self._band_state
+            if handle is None or state is None:
+                return None
+            with state.lock:
+                state.depth += 1
+                try:
+                    self._ensure_band_raised(handle)
+                except BaseException:
+                    # Never leave `depth` incremented with no matching
+                    # decrement - a failed raise must not leak a phantom
+                    # in-flight action that later blocks every legitimate
+                    # lower forever.
+                    state.depth -= 1
+                    raise
+            return handle, state
 
     def _ensure_band_raised(self, handle: Any) -> None:
         """Re-raise a channel that was already consented to. Never asks a
@@ -2716,6 +2734,14 @@ class ComputerTool:
 
     async def execute(self, input: dict[str, Any]) -> ToolResult:
         """Run a flat canonical call or one fully prevalidated v1 batch."""
+        if self._cleanup_started:
+            return ToolResult(
+                success=False,
+                error={
+                    "message": "computer-use session cleanup has started",
+                    "type": "BackendError",
+                },
+            )
         if (
             self._observed_control is not None
             and isinstance(input, dict)
@@ -2976,6 +3002,10 @@ class ComputerTool:
     def _check_write(
         self, action: str, binding: _Binding, approved: Callable | None
     ) -> None:
+        # Also guards reads: called under _announce_lock at final dispatch, not
+        # just before queueing. A lazy backend must never reconnect after close.
+        if self._cleanup_started:
+            raise BackendError("computer-use session cleanup has started")
         if self._binding is not binding:
             raise BackendError("request stopped: target or policy changed")
         if action in MUTATING or action in MUTATING_DESKTOP:
@@ -3526,6 +3556,14 @@ class DesktopTool:
         }
 
     async def execute(self, input: dict[str, Any]) -> ToolResult:
+        if self._computer._cleanup_started:
+            return ToolResult(
+                success=False,
+                error={
+                    "message": "computer-use session cleanup has started",
+                    "type": "BackendError",
+                },
+            )
         if not isinstance(input, dict):
             return ToolResult(
                 success=False, error={"message": "desktop input must be an object"}
@@ -3583,7 +3621,15 @@ class DesktopTool:
         # that DID mount. It answers "what can I do on the machine I am bound
         # to", which only has an answer once there is a machine.
         if str(input.get("action") or "").strip() == "doctor":
-            return _build_doctor_report(self._computer)
+            try:
+                with self._computer._announce_lock:
+                    self._computer._check_write(action, binding, approved)
+                    return _build_doctor_report(self._computer)
+            except BackendError as exc:
+                return ToolResult(
+                    success=False,
+                    error={"message": str(exc), "type": "BackendError"},
+                )
         # M4 disclosure-gate exemption (docs/designs/capability-awareness.md
         # \u00a76.1): `retarget` is dispatched BEFORE `_ensure_announced` for the
         # SAME reason `doctor` is, above - this call's whole job is to
@@ -3659,6 +3705,14 @@ class DesktopTool:
                 error={"message": f"action {action!r} blocked: mounted read_only"},
             )
         backend = binding.backend
+
+        def checked_call(function, *args):
+            # Direct desktop reads/monitor changes do not use _run_flat_step.
+            # Check and invoke in one worker-held lock, like canonical actions.
+            with self._computer._announce_lock:
+                self._computer._check_write(action, binding, approved)
+                return function(*args)
+
         try:
             # C4, same reasoning as ComputerTool.execute: keep the sync Backend
             # protocol, move the (possibly-remote) blocking call off the event
@@ -3677,7 +3731,7 @@ class DesktopTool:
                             "clipboard_read_policy=block"
                         },
                     )
-                output = await asyncio.to_thread(backend.get_clipboard)
+                output = await asyncio.to_thread(checked_call, backend.get_clipboard)
                 digest = _text_digest(output)
                 logger.info(
                     "computer-use audit: op=get_clipboard policy=%s chars=%d sha256=%s",
@@ -3720,7 +3774,9 @@ class DesktopTool:
                 )
                 return ToolResult(success=True, output="clipboard set")
             if action == "list_monitors":
-                monitors = await asyncio.to_thread(self._computer.list_monitors)
+                monitors = await asyncio.to_thread(
+                    checked_call, self._computer.list_monitors
+                )
                 current = self._computer.current_monitor
                 lines = [
                     f"  [{m.id}] {m.width}x{m.height} at ({m.x},{m.y})"
@@ -3737,7 +3793,9 @@ class DesktopTool:
                 target = str(input.get("monitor") or "").strip()
                 if not target:
                     raise ValueError("action 'select_monitor' requires 'monitor'")
-                disp = await asyncio.to_thread(self._computer.select_monitor, target)
+                disp = await asyncio.to_thread(
+                    checked_call, self._computer.select_monitor, target
+                )
                 return ToolResult(
                     success=True,
                     output=(
@@ -4943,6 +5001,7 @@ def _dispatch_announcement(
         try:
             overlay = LinuxOverlay(
                 backend.display,
+                own_display=True,
                 screen_width=disp.screen_width,
                 screen_x=disp.origin_x,
                 screen_y=disp.origin_y,
@@ -5248,6 +5307,25 @@ def _select_and_build(cfg: dict[str, Any]) -> ComputerTool:
         raise
 
 
+class _MountResult(dict):
+    """Keep direct-call metadata while satisfying Core's cleanup-callable contract.
+
+    Core registers the truthy mount return itself. Do not also register it here.
+    The lock makes explicit cleanup and Session cleanup share one completion.
+    """
+
+    def __init__(self, metadata: dict[str, Any], cleanup: Callable) -> None:
+        super().__init__(metadata)
+        self._cleanup = cleanup
+        self._cleanup_lock = asyncio.Lock()
+
+    async def __call__(self) -> None:
+        async with self._cleanup_lock:
+            if self._cleanup is not None:
+                await self._cleanup()
+                self._cleanup = None
+
+
 async def _mount_backend(coordinator: Any, cfg: dict[str, Any]) -> dict[str, Any]:
     """Build a working `computer`/`desktop` pair from `cfg` and mount both -
     the successful-path body `mount()` used to inline directly. Extracted so
@@ -5258,6 +5336,54 @@ async def _mount_backend(coordinator: Any, cfg: dict[str, Any]) -> dict[str, Any
     (`mount()`) or a `ToolResult` (`_activate`).
     """
     computer = await asyncio.to_thread(_select_and_build, cfg)
+    closed = False
+    close_error: BaseException | None = None
+
+    def close_current_binding() -> None:
+        nonlocal closed, close_error
+        with computer._announce_lock:
+            if close_error is not None:
+                raise close_error
+            if closed:
+                return
+            binding = computer._binding
+            # The ledger and disclosure handle belong to the CHANNEL, not this
+            # Session. Never stop the shared deadman or release another Session's
+            # holds. There is no owner-qualified ledger release API; retain this
+            # backend if its own release obligations are still outstanding.
+            if computer._mouse_pending:
+                raise RuntimeError(
+                    "computer-use cleanup deferred: this tool still has held input; "
+                    "release it before retrying cleanup. The backend and shared "
+                    "deadman remain available."
+                )
+            computer._cleanup_started = True
+            try:
+                try:
+                    handle = computer._live_band_handle()
+                    state = binding.band_state
+                    if handle is not None and state is not None:
+                        with state.lock:
+                            if state.depth == 0 and not (
+                                binding.ledger is not None
+                                and binding.ledger.held_tokens
+                            ):
+                                handle.hide()
+                finally:
+                    # Read the CURRENT binding at cleanup, not the initial backend:
+                    # retarget already released the old reference. Remote close
+                    # releases only this handle; last-owner teardown stays remote.
+                    closed = True
+                    binding.backend.close()
+            except BaseException as exc:
+                # A failed/unknown close must remain failed, not become a success
+                # on the next call or replay a possibly completed transport close.
+                close_error = exc
+                raise
+
+    async def cleanup() -> None:
+        await asyncio.to_thread(close_current_binding)
+
     if cfg.get("observed_control") is True:
         from .observed_control import ObservedControl
 
@@ -5266,20 +5392,27 @@ async def _mount_backend(coordinator: Any, cfg: dict[str, Any]) -> dict[str, Any
     # deliberately NOT built here - see `ComputerTool._ensure_announced` for
     # why it fires on first real action instead (a validation-probe mount()
     # must never be able to trigger a real dialog/overlay).
-    await coordinator.mount("tools", computer, name=computer.name)
     desktop = DesktopTool(computer)
-    await coordinator.mount("tools", desktop, name=desktop.name)
+    try:
+        await coordinator.mount("tools", computer, name=computer.name)
+        await coordinator.mount("tools", desktop, name=desktop.name)
+    except BaseException:
+        await cleanup()
+        raise
     backend_name = computer._backend.name
     logger.info(
         "tool-computer-use mounted: 'computer' (neutral v1, backend=%s) + 'desktop'",
         backend_name,
     )
-    return {
-        "name": "tool-computer-use",
-        "version": __version__,
-        "provides": ["computer", "desktop"],
-        "description": f"Neutral v1 canonical computer execution via backend={backend_name}",
-    }
+    return _MountResult(
+        {
+            "name": "tool-computer-use",
+            "version": __version__,
+            "provides": ["computer", "desktop"],
+            "description": f"Neutral v1 canonical computer execution via backend={backend_name}",
+        },
+        cleanup,
+    )
 
 
 # ============================================================================
@@ -5714,6 +5847,9 @@ class ComputerUseUnavailableTool:
         # as the base config to layer a `target` onto (see `_activate`).
         self._coordinator = coordinator
         self._cfg: dict[str, Any] = dict(cfg or {})
+        self._active_cleanup = None
+        self._lifecycle_lock = asyncio.Lock()
+        self._cleanup_started = False
 
     @property
     def name(self) -> str:
@@ -5769,6 +5905,20 @@ class ComputerUseUnavailableTool:
         }
 
     async def _activate(self, target: str | None) -> ToolResult:
+        # An asyncio lock, never a threading lock held across an await. Cleanup
+        # waits for build+mount+custody transfer, or fences activation first.
+        async with self._lifecycle_lock:
+            if self._cleanup_started or self._active_cleanup is not None:
+                return ToolResult(
+                    success=False,
+                    error={
+                        "message": "activation refused: stub already activated or cleaned up",
+                        "type": "ComputerUseUnavailable",
+                    },
+                )
+            return await self._activate_live(target)
+
+    async def _activate_live(self, target: str | None) -> ToolResult:
         """`action="activate"` - the bootstrap entry point requirement 1
         needs: from a session where NOTHING mounted, build a real, disclosed
         `ComputerTool`/`DesktopTool` pair and mount them, so the real tools
@@ -5835,6 +5985,9 @@ class ComputerUseUnavailableTool:
                 error={"message": str(exc), "type": "RemoteTargetUnavailable"},
             )
 
+        # The original unavailable mount return is the one Core registered.
+        # Transfer custody to it, without registering a second callback.
+        self._active_cleanup = manifest
         try:
             await self._coordinator.unmount("tools", name=self.name)
         except Exception:  # noqa: BLE001 - best-effort; the real tools are
@@ -5927,12 +6080,22 @@ async def _mount_unavailable(
         )
     stub = ComputerUseUnavailableTool(reason, coordinator, cfg)
     await coordinator.mount("tools", stub, name=stub.name)
-    return {
-        "name": "tool-computer-use",
-        "version": __version__,
-        "provides": [stub.name],
-        "description": f"computer-use not mounted: {reason}",
-    }
+
+    async def cleanup() -> None:
+        async with stub._lifecycle_lock:
+            stub._cleanup_started = True
+            if stub._active_cleanup is not None:
+                await stub._active_cleanup()
+
+    return _MountResult(
+        {
+            "name": "tool-computer-use",
+            "version": __version__,
+            "provides": [stub.name],
+            "description": f"computer-use not mounted: {reason}",
+        },
+        cleanup,
+    )
 
 
 async def mount(

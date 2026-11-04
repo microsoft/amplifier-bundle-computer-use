@@ -41,9 +41,10 @@ logger = logging.getLogger(__name__)
 _IMPORT_ERROR: str | None = None
 try:
     from Xlib import X as _X
+    from Xlib import display as _xdisplay
     from Xlib.ext import shape as _shape
 except Exception as exc:  # noqa: BLE001 - see linux_x11.py's identical pattern
-    _X = _shape = None  # type: ignore[assignment]
+    _X = _shape = _xdisplay = None  # type: ignore[assignment]
     _IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
 X: Any = _X
 shape: Any = _shape
@@ -73,16 +74,18 @@ class OverlayButton:
 class LinuxOverlay:
     """An override-redirect status band with Pause/Cancel buttons.
 
-    `display` must be an already-connected `Xlib.display.Display` (typically
-    the same connection `LinuxX11Backend` holds - a second connection is not
-    required and this class does not open one itself, matching \u00a710.1's
-    "same process that owns the injection call site").
+    `display` is an already-connected `Xlib.display.Display`. With
+    `own_display=True`, retain only its exact address and open an independent
+    connection while shown. A channel-cached overlay must outlive the tool
+    backend that created it; backend cleanup must not destroy sibling controls.
+    Standalone/remote-agent callers may still borrow their display (the default).
     """
 
     def __init__(
         self,
         display: Any,
         *,
+        own_display: bool = False,
         screen_width: int,
         screen_x: int = 0,
         screen_y: int = 0,
@@ -95,7 +98,9 @@ class LinuxOverlay:
                 f"python-xlib SHAPE extension not available ({_IMPORT_ERROR}); "
                 "cannot build the Linux coexistence overlay"
             )
-        self._display = display
+        self._own_display = own_display
+        self._display_name = display.get_display_name() if own_display else None
+        self._display = None if own_display else display
         self._screen_x = screen_x
         self._screen_y = screen_y
         self._screen_width = screen_width
@@ -129,6 +134,19 @@ class LinuxOverlay:
         """Create, shape, and map the overlay. Idempotent."""
         if self._shown:
             return
+        # Never reopen the creator backend. The cached address is the original
+        # target, not a fresh ambient DISPLAY lookup. hide() releases this
+        # connection so an idle cached handle holds no X11 resources.
+        if self._own_display and self._display is None:
+            self._display = _xdisplay.Display(self._display_name)
+        self._stop = threading.Event()
+        try:
+            self._show_window()
+        except BaseException:
+            self.hide()
+            raise
+
+    def _show_window(self) -> None:
         screen = self._display.screen()
         root = screen.root
         self._window = root.create_window(
@@ -154,7 +172,10 @@ class LinuxOverlay:
         self._display.sync()
         self._shown = True
         self._poll_thread = threading.Thread(
-            target=self._poll_events, name="cu-overlay-poll", daemon=True
+            target=self._poll_events,
+            args=(self._stop, self._display),
+            name="cu-overlay-poll",
+            daemon=True,
         )
         self._poll_thread.start()
         logger.info(
@@ -172,17 +193,24 @@ class LinuxOverlay:
         so a crash never leaves a ghost - this method just makes the clean
         shutdown path explicit and fast)."""
         self._stop.set()
-        if self._exclusion is not None:
-            for btn in self._buttons:
-                self._exclusion.unregister(f"overlay_{btn.name}_button")
-        if self._window is not None:
-            try:
-                self._window.unmap()
-                self._window.destroy()
-            except Exception:
-                logger.debug("coexistence overlay: error during hide", exc_info=True)
-            self._window = None
-        self._shown = False
+        try:
+            if self._exclusion is not None:
+                for btn in self._buttons:
+                    self._exclusion.unregister(f"overlay_{btn.name}_button")
+            if self._window is not None:
+                try:
+                    self._window.unmap()
+                    self._window.destroy()
+                except Exception:
+                    logger.debug(
+                        "coexistence overlay: error during hide", exc_info=True
+                    )
+                self._window = None
+            self._shown = False
+        finally:
+            if self._own_display and self._display is not None:
+                display, self._display = self._display, None
+                display.close()
 
     @property
     def shown(self) -> bool:
@@ -227,21 +255,23 @@ class LinuxOverlay:
         return color.pixel
 
     # -- click handling --------------------------------------------------------
-    def _poll_events(self) -> None:
+    def _poll_events(self, stop: threading.Event, display: Any) -> None:
         """Background thread: block on this window's own event queue for
         `ButtonPress` on a button rect. A dedicated thread (rather than
         folding into the caller's own loop) keeps this class usable
         standalone and testable without requiring the caller to pump events.
         """
-        while not self._stop.is_set():
+        # Each show generation owns its queue/stop token. A thread stopping
+        # after hide must never consume events from a later re-raise connection.
+        while not stop.is_set():
             try:
-                if self._display.pending_events() == 0:
-                    self._stop.wait(0.05)
+                if display.pending_events() == 0:
+                    stop.wait(0.05)
                     continue
-                event = self._display.next_event()
+                event = display.next_event()
             except Exception:  # noqa: BLE001 - connection torn down under us
                 return
-            if event.type != X.ButtonPress:
+            if stop.is_set() or event.type != X.ButtonPress:
                 continue
             name = (
                 self._exclusion.contains(event.root_x, event.root_y)
