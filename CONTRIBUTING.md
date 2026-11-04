@@ -86,36 +86,94 @@ apply safe auto-fixes, before committing.
 
 ### The ship gate
 
-`scripts/verify_coexistence.py` is the pre-release gate for the human/agent coexistence
-mechanism — a statistical, real-process evidence run (not
-a mock, not a unit test) that proves the presence detector still catches a human touching
-the input devices mid-injection, at production cadence, across a large sample of trials.
-It needs a real (if headless) X server:
+`scripts/verify_coexistence.py` defaults to **conditional Linux boundary qualification**
+under policy `coexistence-boundary-v1` (2026-11-04), not a universal physical-input
+safety claim. Read `docs/designs/coexistence.md` §11.1 before interpreting it.
+Focused headless tests exercise the maintained classifier/guard and harness logic:
 
 ```bash
-Xvfb :99 -screen 0 1280x800x24 -nolisten tcp &
-XVFB_PID=$!
-trap 'kill "$XVFB_PID" 2>/dev/null' EXIT
-DISPLAY=:99 .venv/bin/python scripts/verify_coexistence.py
+.venv/bin/python -m pytest tests/test_verify_coexistence.py tests/test_presence.py tests/test_halt_invariant.py -q
 ```
 
-**Kill the `Xvfb` you started — the `trap` above does this for you.** A backgrounded
-`Xvfb` with no cleanup is easy to forget, and a forgotten one does not just waste a
-process slot: `DISPLAY=:99` can leak into a later shell (a sourced rc file, a tmux pane,
-an inherited environment), and `LinuxX11Backend.probe()` used to accept *any* reachable,
-XTEST-capable X server as "the" desktop — including a stray `Xvfb` left running for days.
-`probe()` now checks a blindly-picked-up `DISPLAY` against this user's own login session
-(`systemctl --user show-environment`) before trusting it, but there is still no reason to
-leave the test server running — kill it when you are done.
+Native qualification is **not CI**. Its owner must supply an already authorized,
+isolated X11 test display, not a person's desktop or an ambient guessed `DISPLAY`.
+The script provisions no environment. The owner retains display cleanup. Run once
+with a new output filename; an external deadline bounds OS/Xlib stalls:
 
-This takes several minutes (dozens to ~100+ real trials, each a real subprocess spawn) and
-is **not** run in CI — CI runs headless with no display server at all. Run it locally,
-against a clean `Xvfb`, before cutting a release that touches the coexistence guard, the
-presence detector, or the input backends it depends on. See the script's own docstring
-for what evidence it produces and how to read the result. The gate establishes a fresh
-`QUIET`/high-confidence baseline before **every** trial, including the first; a baseline
-that is unreadable, recent, or otherwise invalid fails the whole run and is never retried
-or excluded from its denominator. Do not publish private host details or raw run logs.
+```bash
+timeout 90s .venv/bin/python scripts/verify_coexistence.py --mode boundary \
+  --display "$OWNED_TEST_DISPLAY" --output coexistence-boundary-NEW.json
+```
+
+Six predeclared controls run at most once: 6 s quiet typing; nominal 2 ms inside;
+nominal 8/15/55 ms outside; and a forced post-sample/pre-write barrier. Allow roughly
+22 seconds plus native setup. The 60 ms interval is the **O5 reference cadence**,
+not built-in production pacing. One independent XTEST child acknowledges readiness
+and each event, with matching IDs and send-before/sync-after monotonic intervals.
+Each case needs a fresh finite `QUIET`/high-confidence baseline above the quiet floor.
+Counter registration, actual sample and own-write intervals qualify placement;
+sleep requests do not. Every acknowledged own unit needs a separate raw idle
+query (not a monitor sample). Both raw queries and guard samples use symmetric
+±1 ms uncertainty: the integer idle counter is the difference of two quantised
+timestamps, not a rounded elapsed duration. The inferred last-input interval is
+`[query_entry − (idle+1)ms, query_return − max(0,idle−1)ms]`.
+It must intersect the independent send/sync bracket. Advancement must be proved
+from the **unclipped** counter intervals, including any preceding child read;
+clipping to an assumed successful emission cannot establish advancement.
+This checks input-counter registration, not typed text or display semantics.
+Unresolvable advancement, including at the artificial barrier, is `INVALID`.
+No retry, delay adjustment or latency fallback rescues an unplaceable 2 ms control.
+
+Quiet timing starts at the first acknowledged emission, not the first call's
+start. Each next unit is scheduled from the preceding acknowledgement: at least
+60 ms acknowledgement-to-next-send and at most 80 ms acknowledgement-to-next-
+acknowledgement, with at least 6 s from first to last acknowledgement. There are
+no catch-up bursts. Early wakes, excessive lateness or shorter spans are `INVALID`.
+These fixed scheduling limits and extra raw queries belong only to this harness;
+this is not a natural production timing benchmark.
+
+Every recorded `human_active` observation, in every case and follow-up, forbids
+that unit's and later ordinary emissions and requires `HaltedError`, a release
+callback within that exact guard invocation, and a subsequent refused attempt.
+Callbacks carry invocation IDs and timestamps; retry-only release cannot cover
+an omitted first release. Invalid/straddling/missing evidence is retained, never
+retried or replaced. The first failure stops the run. The barrier is artificial,
+not a measurement of the natural race. An inside event may be masked or detected.
+
+The new JSON receipt binds schema `coexistence-qualification-v1`, policy, run ID,
+source hashes and bounded case timelines. Existing paths are refused before input.
+Exit 0 / `MECHANISM_CONTROLS_PASS` qualifies only these Linux controls, not adoption
+or general safety. A generic `PASS` is not a valid successful top-level verdict.
+Exit 2 / `UNQUALIFIED` does not qualify them.
+An external interruption can leave `INCOMPLETE` or a partial/unreadable final
+receipt; neither qualifies or authorizes automatic replay. Native child/connection
+cleanup is owned by the harness's finally paths; the external supervisor must
+also reconcile an interrupted process.
+Release **callback invocation** is not proof of real held-ledger release or current
+mounted permissions/Stop. Main owns native review/current evidence/adoption; Windows
+retains the original trial. Do not publish private host details or raw logs.
+
+The **historical** command at source `bf3adece` was
+`.venv/bin/python scripts/verify_coexistence.py --trials 100` (with its explicitly
+owned display). Its 89/100, 11 misses, zero false positives result remains **FAILED**
+under that source's AND rule. Do not rerun until green or reinterpret it under the
+new policy. The paired comparison did not establish a diagnostic timing regression;
+production diagnostics remain unchanged.
+
+Optional **offline analysis only**, with a new receipt:
+
+```bash
+.venv/bin/python scripts/verify_coexistence.py --mode random-model \
+  --trials 100 --misses 11 --output coexistence-model-NEW.json
+```
+
+This collects no input or random trials. The fixed-α=0.05 exact binomial tail for
+`q ≤ 5/60` is conditional; with 11 misses it is about 0.210558, not rejection.
+Counts alone cannot establish phases, independence, counter registration, release,
+zero false positives or explained misses, so the result stays `UNSUPPORTED` /
+`UNQUALIFIED` (exit 2), never safety PASS. No seed is invented for supplied counts.
+If every physical event must prevent the next write, that product requirement is
+**unmet** by timestamp masking; changing tests does not implement it.
 
 ### Neutral boundary and retained wire obligation
 

@@ -1,6 +1,6 @@
 # Human/Agent Coexistence
 
-**Status:** Design proposal — revision 2 (reconciled against O1, O2, O5)
+**Status:** Design proposal — revision 2; acceptance correction `coexistence-boundary-v1`, 2026-11-04 (§11.1). Historical design/probes are not current platform qualification.
 **Scope:** How a person and the agent share one desktop — how the agent knows a human is there, how the human knows the agent is there, and how either one stops the other.
 **Companion:** `docs/designs/remote-transport.md` (transport, ledger, op classes, safety boundary)
 **Evidence base:** `coexistence-probes.md` — U1b, U1c, U3, U4, U5, U6, U7, **O1, O2, O5**
@@ -20,7 +20,7 @@
 | Piece | Where | Status |
 |---|---|---|
 | Presence detector (per-event inject-timestamp reconciliation) | Target-side, in the agent process, all three platforms | Build first. **O5 proves it survives sustained typing; the ±250 ms guard band did not.** |
-| Halt-on-human-touch (`yield`) | All three platforms, **not configurable off** | Build first — the human's own hands are the stop control, zero install (§6.0) |
+| Halt-on-observed-human-activity (`yield`) | All three platforms, **not configurable off** | Build first — stop on observation, with the physical-input limits in §6.0 |
 | Target binding (abort on focus change mid-op) | All three platforms | **New in revision 2.** Closes a gap no indicator speed can fix (§8.6) |
 | Persistent overlay + click-to-pause | Linux X11 now; Windows with transport Phase 4 | Proven on Linux (U4/U5/U6) |
 | macOS announcement (system dialog) | macOS now, **zero install** | **New in revision 2.** O1 proves `osascript display dialog` renders and returns the button from a Background-domain SSH process |
@@ -50,12 +50,12 @@ Four claims carry this, and two of them are corrections to revision 1 of this do
 Replay the incident under a detector alone, no announcement:
 
 - Agent opens Spotlight. Human is surprised — *unchanged*, that is the announcement's job.
-- Human reflexively dismisses it. **The agent sees `human_active` at high confidence within one sampling interval (~60 ms), even though it is mid-`type_text` (O5).**
-- Agent halts before its next write, releases held inputs, and reports: *"A human at this machine produced input 61 ms ago that I did not generate. Halting."*
+- Human reflexively dismisses it. **If a fresh sample attributes the input as `human_active`, the guard sees it even mid-`type_text` (O5 demonstrates one such observation, not every possible phase).**
+- On that observation the agent halts before its next task-directed write, invokes held-input release, and reports the observation and its basis.
 
-The surprise happens once. The fight, and the confident misdiagnosis, do not. The misdiagnosis is the failure that generalizes: an agent that says "TCC not granted" when TCC was fine burns a human's afternoon on a permissions dialog that was never the problem, then does it again next week on a different wrong hypothesis.
+In the detected case this prevents continued input conflict and supplies a reported basis instead of an unsupported causal diagnosis. It does not guarantee that every interaction is detected.
 
-The honest limit: detection is **post-hoc**. `yield` is a **stop-after-one-collision** guarantee, never a never-collide guarantee. Say so in the docs and never imply otherwise.
+The honest limit: detection is **post-hoc and incomplete**. `yield` is a stop-on-observation invariant, not a never-collide or universal stop-after-one-collision guarantee. The guard band and sample-to-write interval can mask an event entirely (§5.2).
 
 ### 2.2 Detection measures input, not attention
 
@@ -119,7 +119,7 @@ Revision 1 spent a full section and a nine-row matrix comparing four options. O1
 
 **Build the detector and `yield` on all three platforms, plus the announcement mechanism each platform proves: a persistent overlay on Linux (U4/U5/U6), a system dialog on macOS (O1), and the Windows overlay folded into transport Phase 4 (U4/Windows).** Do not build a resident macOS LaunchAgent — O1 supplies the channel it existed to supply, at zero install, without reversing `remote-transport.md` §11's "no daemon, no resident component" property, without a new ghosting failure mode, and without a per-target install story. Do not treat an out-of-band alert (push/webhook) as a substitute for on-desktop announcement — a phone buzzing in another room does not make a person at the keyboard stand back — though it remains a fine *complement* for unattended machines.
 
-**What this costs:** nothing is installed on any target; two new modules (~450 LOC); zero new resident processes; zero reversed architectural properties. **What it sacrifices:** macOS gets an interruption at session start rather than a persistent reminder, and no on-screen pause button — the macOS human's stop control is their own hands (§6.0), which is universal and free but is stop-after-one-collision, not never-collide.
+**What this costs:** nothing is installed on any target; two new modules (~450 LOC); zero new resident processes; zero reversed architectural properties. **What it sacrifices:** macOS gets an interruption at session start rather than a persistent reminder, and no on-screen pause button. Input detection (§6.0) is conditional on observation, not a universal physical stop control.
 
 ---
 
@@ -146,12 +146,14 @@ injections at 0, P, 2P, …          detector samples just before each injection
 human event at h ∈ (0, P):
     at sample time, last input is the human's;  margin = h
     detected  iff  h > GUARD
-    masked    iff  h ∈ (0, GUARD)
+    masked    iff  h ∈ (0, GUARD]     equality is masked: production uses > GUARD
 
-per-event masking probability  =  GUARD / P
+ideal uniform-phase per-event masking probability  =  GUARD / P
 ```
 
-A real human interaction is never one event — dismissing a dialog is a pointer motion plus a click, or a keydown plus a keyup. So `P(miss) ≈ (GUARD/P)^n`. On Linux with `GUARD = 5 ms` and `P = 60 ms`: 8.3% per event, **0.7% for a two-event interaction**. That is a number the design can defend. It is also a number that must be *measured per platform*, not assumed (§11, C1 evidence).
+This is an **ideal model**, not a bound on all physical input. It assumes independent uniform phases, a latest-input counter that still refers to that event, and negligible sample-to-write time. An event after a completed sample but before our next emission can be overwritten by that emission before any later sample sees it. External input can also overwrite the counter. Neither effect is included in `GUARD/P`.
+
+On Linux, `5/60 ≈ 8.3%` is conditional on that model and the **reference** 60 ms harness cadence. Production `type_text` supplies no fixed 60 ms delay. Multiple events from one interaction need not have independent phases; keydown/up may be tightly correlated. Do not square the fraction or claim 99% two-event detection without independent phase evidence.
 
 ### 5.3 The observation, and the corrected guard band
 
@@ -178,11 +180,13 @@ Every response envelope carries a `presence` block. Additive to the wire format,
 ```
 margin = inferred_last_input − our_last_inject
 
-margin >  GUARD   →  human_active, high     (someone else did that)
-|margin| ≤ GUARD  →  unknown                (that might have been us)
-margin <  −GUARD  →  our input is the most recent; consult idle:
+margin > GUARD   →  human_active, high     (the reconciliation attributes input)
+margin ≤ GUARD   →  quiet; consult idle for confidence:
     idle > QUIET_FLOOR  →  quiet, high
     otherwise           →  quiet, low
+no prior injection:
+    idle > QUIET_FLOOR  →  quiet, high
+    otherwise           →  human_active, high
 idle unreadable   →  unknown  →  hard error for any mode that depends on it
 ```
 
@@ -190,7 +194,7 @@ idle unreadable   →  unknown  →  hard error for any mode that depends on it
 
 > **Two different 250 ms numbers.** The pause-latency bound in §8.4 and §12 is *also* 250 ms and is *unchanged and correct* — it bounds how long after a human clicks Pause the injector may still emit an event, and it is set by the longest atomic composite (~200 ms), not by the detector. Do not conflate the two. The guard band shrank; the pause bound did not move.
 
-The `unknown` band occurs immediately after every one of our own injections, by construction. Which is why:
+This table follows the maintained scalar-idle classifier. Readable near-zero margins are ordinary quiet observations, not unreadable evidence; low-confidence quiet is not authority or proof of absence. Structured Windows target-clock failures retain their separate unknown safety-halt behavior. Neither classification nor production thresholds change in the acceptance correction.
 
 ### 5.4 Presence is a latch
 
@@ -203,22 +207,22 @@ HUMAN_ACTIVE ──(halt invariant, §6.0)──> HALTED
 any ──(human sets pause)──> PAUSED            [§8]
 ```
 
-`LATCH_DECAY = 60 s`. Once a human is seen they are present until a full minute of silence, which converts a noisy per-sample read into a stable state and correctly models the human who is reading rather than typing (§2.2). The latch is also what makes the residual per-event masking probability of §5.2 tolerable: a masked event costs one sample, not the session.
+`LATCH_DECAY = 60 s` for presence observations. Once `human_active` is observed, the presence latch retains it for a minute; the guard's halt remains latched independently and does not decay into permission to write. A latch cannot recover a masked or overwritten event it never observed. Masking can therefore cost the entire interaction, not just one sample.
 
-One pleasing consistency: a human **clicking the overlay's pause button** produces real hardware input, which resets idle, which sets the latch. Pausing and being detected are the same event.
+A human clicking the overlay's pause button can produce detectable input, but the explicit pause path must not depend on successful timestamp attribution.
 
 ### 5.5 What it costs to sample — and the Windows problem, stated plainly
 
 | Platform | Mechanism | Quantisation | `GUARD` | Per-sample cost |
 |---|---|---|---|---|
 | Linux X11 | `MIT-SCREEN-SAVER` `screensaver_query_info().idle` | 1 ms | **5 ms** — proven (O5) | µs, in-process X round trip |
-| macOS | `CGEventSourceSecondsSinceLastEventType(kCGEventSourceStateHIDSystemState, …)` | **unmeasured** | **unset until O4 measures it.** Do not extrapolate from Linux | µs, in-process |
-| Windows | `GetLastInputInfo` (`dwTime` from `GetTickCount`) | **10–16 ms** | **≥ 32 ms** — quantisation alone is 2–3× the Linux band | see below |
+| macOS | `CGEventSourceSecondsSinceLastEventType(kCGEventSourceStateHIDSystemState, …)` | See maintained `presence.py` O4 history | **10 ms** in production; not qualified by the Linux gate | µs, in-process |
+| Windows | `GetLastInputInfo` target-clock observations | **10–16 ms** historical tick scale | **20 ms** in production; not qualified by the Linux gate | see below |
 
-**The Windows consequence, not hedged:** with `GUARD ≥ 32 ms` and a 60 ms typing cadence, the per-event masking fraction is `32/60 ≈ 53%`. **Intra-`type_text` human detection on Windows is not viable on the timestamp mechanism.** Two things follow, and both are mechanism, not wishful phrasing:
+**The Windows limit:** the maintained 20 ms band gives an ideal `20/60 ≈ 33%` masking fraction at the 60 ms reference cadence. Structured target-clock checks narrow a timing race but are not atomic and do not eliminate masking. Linux controls do not establish Windows intra-typing qualification. Two design consequences remain:
 
 1. **Windows presence detection at op granularity is fine and ships in C1.** Between ops, `P` is seconds, so `GUARD/P` is negligible. What does not ship is the claim that a human keystroke landing *inside* a Windows `type_text` will be seen.
-2. **Windows `type_text` declares this in its result** until the injected-flag path (§5.6) lands with Phase 4: `"intra_op_detection": false, "reason": "GetLastInputInfo quantisation 16ms exceeds viable guard band"`. The house rule applies — the system does not claim a guarantee it does not have.
+2. **Windows results must not claim universal intra-op detection.** The design's proposed `"intra_op_detection": false` declaration is not a substitute for current Windows qualification. The house rule applies — the system does not claim a guarantee it does not have.
 
 There is a second Windows cost worth stating: per-event sampling means a `GetLastInputInfo` between every keystroke, and pre-Phase-4 that would be a `powershell.exe` spawn per keystroke. It is not. **The sampling loop lives inside the bridge script**: the PowerShell side performs the typing loop, samples idle between keystrokes, halts in place on detection, and returns `{"delivered": 47, "halted_on": "human_active"}` in the same single invocation. Zero additional spawns. This is the same artifact Phase 4 wants, which is a reason to sequence them together.
 
@@ -260,11 +264,11 @@ That is historical evidence for measuring the live path, not a benchmark, ratio,
 
 Revision 1 modelled consent entirely as the operator's decision. The person physically at the machine had no stated veto. That is corrected here, at mechanism level:
 
-> **A detected human halts writes before the next write, in every mode, on every platform, regardless of operator configuration. Mode determines what happens *after* the halt. Mode does not determine *whether* the halt occurs.**
+> **Once the guard observes `human_active`, it prevents the next task-directed emission, invokes the existing release path, and retains the halt, in every mode and on every platform. No configuration or controller action bypasses that halt. Required safety-release emissions are not task-directed writes.**
 
 Concretely: the halt is enforced in the same guard as pause and target binding, at the injection call site (§8.6). There is no configuration key that disables it, no operator opt-out that bypasses it, and no controller op that overrides it. The per-target opt-out described in §7.6 governs whether driving may *begin* on a machine with no announcement channel; it has no power over a human who then shows up.
 
-This makes the physically-present human's hands an unconditional stop control on all three platforms, including macOS where there is no on-screen pause button. It is the strongest guarantee in this design and it costs nothing, because the detector was being built anyway.
+The invariant is unconditional **after observation**, not after every physical input event. If the product requires every physical event to prevent the next ordinary emission, that stronger requirement is **UNMET** by the timestamp mechanism. It needs future mechanism work (for example §5.6), not a lower acceptance threshold. Explicit Stop, pause, authority and durable-halt behavior are unchanged.
 
 ### 6.1 `yield` — halt and stay halted (default)
 
@@ -519,7 +523,7 @@ Already covered by the existing ledger — stdin EOF plus the 5 s deadman, both 
 
 ### 9.7 Human input masked by the guard band
 
-Residual, quantified, not eliminated (§5.2). Per-event probability `GUARD/P`; ~0.7% for a two-event interaction on Linux; **~53% per event on Windows inside `type_text`, which is why §5.5 refuses to claim intra-op detection there.** Mitigations in force: the latch (§5.4) means one caught event suffices for a session; the §5.6 injected-flag path removes the failure mode entirely where it lands.
+Residual, not eliminated (§5.2). `GUARD/P` describes only the ideal uniform-phase model; it is not the whole blind window or a real two-event guarantee. The latch (§5.4) retains a caught event but cannot reconstruct one overwritten before sampling. Source attribution (§5.6) is future mechanism work, not established elimination of every race.
 
 ---
 
@@ -566,14 +570,30 @@ The existing `classify_op` policy applies unchanged. Because controller and agen
 
 **Phase C1 — the detector and the halt invariant, everywhere.** `PresenceMonitor` at the injection call site; per-elementary-event inject timestamps and per-gap sampling (§5.2); per-platform `GUARD` from O4; latch state machine; `presence` block on every response; protocol bump to 2; the §6.0 halt invariant with ledger release and a structured error. Windows sampling loop inside the bridge script. **Ships the fix for the misdiagnosis.** No overlay, no new processes, no installs.
 
-Evidence required to call C1 done — item 2 is the test the council required and revision 1 did not have:
+Evidence required to call C1 done — item 2 follows the explicitly scoped acceptance revision in §11.1:
 
 1. On each platform, an independent process producing input is detected as `human_active` with `margin > GUARD`, and the agent's own injection three seconds earlier is not.
-2. **Sustained-injection interleave test, per platform — the incident's actual regime.** The agent runs a continuous `type_text` at production cadence for ≥ 6 s. An independent process fires a single event at a time uniformly sampled within the run, unknown to the agent. Repeat ≥ 100 times. Record: detection rate, false-positive count across all non-human samples, detection latency, and the **measured per-event masked fraction**, which must match `GUARD/P` within noise. Acceptance: zero false positives; measured masked fraction ≤ `GUARD/P` + 2σ; Linux detection rate ≥ 90% per single event and ≥ 99% for a two-event interaction. **On Windows this test is expected to fail the rate threshold** (§5.5) — that is the point of running it. It must produce the number that justifies `"intra_op_detection": false`, not be skipped.
-3. `yield` halts before the next write, releases everything held (`RELEASED:` lines in agent stderr), and the model receives an error naming the cause, the margin, and the guard in force.
+2. **Deterministic mechanism controls with independently placed input.** The Linux harness runs each predeclared case once: six seconds of quiet own typing at the 60 ms reference cadence; nominal 2 ms inside-band input; nominal 8/15/55 ms outside-band input before a fresh sample; and an artificial post-sample/pre-write IPC barrier. A fresh `QUIET`/high-confidence baseline with finite idle strictly above the quiet floor is mandatory for each case. Child readiness, matching request IDs, send-before/sync-after intervals, counter registration, sample entry/return and acknowledged own-write/injection anchors establish placement; nominal sleeps do not. Missing, straddling or unplaceable evidence is `INVALID` and the run `UNQUALIFIED`, never retried or excluded. Quiet controls require no false positives. Proven outside-band input must halt before the next task-directed emission, invoke release, and refuse another attempted write. Inside-band detection or masking is allowed; a miss is not required. The barrier retains either outcome and discloses exposure, not a measured natural blind-window width or a must-detect/must-miss promise. Headless exact `G−ε`, `G`, `G+ε` controls test the production classifier/guard; scheduling cannot establish native equality. Other platforms need their own qualification; Linux success does not qualify Windows or macOS.
+3. After an observed `human_active`, `yield` prevents the next task-directed write, releases everything held (`RELEASED:` lines in agent stderr), and the model receives an error naming the observation, margin and guard. The boundary harness checks callback invocation only; real ledger release and mounted authority/Stop paths still need their own evidence.
 4. Windows presence read adds **zero** additional `powershell.exe` spawns per action — measured, not asserted.
 5. Idle unreadable → `state: unknown` → the dependent mode fails loud. No path treats it as `quiet`.
 6. The §6.0 halt invariant cannot be disabled by any configuration key — verified by attempting it.
+
+### 11.1 Acceptance correction — 2026-11-04, `coexistence-boundary-v1`
+
+The original maintained 100-trial result, **89 detections / 11 misses / zero false positives, remains FAILED under its original conjunctive policy** (fixed ≥90% detection AND masked fraction ≤ `5/60 + 2σ`). A later check must not relabel it. With independent uniform phases and `q=5/60`, `P[Binomial(100,q) ≥ 11] = 0.210558…`: the fixed-rate rule rejects about 21.06% of model-consistent runs. Repeating until green, lowering 90% to another fixed rate, or treating the noise bound as overriding the failed rate is not a correction.
+
+Main's bounded paired comparison is attributed evidence, not execution by this patch: 12 trials / six paired conditions matched baseline `673cd63f` and PR36 `fe61c545` (accepted source `bf3adece`, identical tree `97ab56bb`). Quiet continued; ~2 ms was masked in both; 15/55 ms halted both; the forced post-sample barrier was masked in both. Across 180 quiet checks per version, sample-return to guard-return means were 2.45/15.90 µs and maxima 18.30/60.61 µs. No many-millisecond diagnostic regression was reproduced. This neither explains every historical miss nor justifies suppressing Linux diagnostics. The forced barrier is artificial.
+
+The corrected gate qualifies the conditional mechanism in item 2, **not the stronger universal physical-event requirement in §6.0**. The script emits schema `coexistence-qualification-v1`, the policy ID, unique run ID, source hashes, predeclared cases and bounded timelines into a new, non-overwriting JSON receipt. Top-level `MECHANISM_CONTROLS_PASS` (exit 0) is scoped to those controls, not adoption or general safety; generic `PASS` is not a successful top-level verdict. An incomplete, failed or invalid run cannot qualify them. Main retains native review, current evidence and adoption ownership; Windows retains the original trial. No guard, permission, Stop, pacing, threshold or diagnostic-recording behavior changes.
+
+The harness enforces the observation invariant on **every** guarded row, including inside-band and barrier follow-up observations: `human_active` requires a corresponding halt, a release callback identified with and timestamped inside that guard invocation, no ordinary emission in that row or later rows, and a subsequent refused attempt. A retry's release cannot conceal an omitted initial release. Each acknowledged own unit also needs a distinct raw idle query, without updating the monitor, to corroborate counter registration in its own send/sync bracket with only the 1 ms Linux quantisation allowance and to establish advancement beyond preceding known input. This is not typed-text or display-semantic evidence. Unresolvable registration/advancement is invalid, including at the barrier; no latency fallback, inserted rescue delay or retry repairs placement. The extra corroboration is harness instrumentation, not a measurement of the natural production race.
+
+Quiet control scheduling anchors to the first acknowledged own emission and then to each previous acknowledgement, without catch-up bursts. Actual acknowledgements must span at least 6 s across 101 units; each acknowledgement-to-next-send gap is at least 60 ms and acknowledgement-to-next-acknowledgement gap at most 80 ms. These fixed harness bounds are not production latency promises. An early wake, excessive lateness, uncorroborated unit or shorter span is invalid, not a weaker qualifying run. All six case counts, one child's lifetime and per-unit evidence remain bounded.
+
+Integer-counter uncertainty is **symmetric ±1 ms** because idle is a difference of two quantised timestamps. For both raw corroboration and fresh guard samples, the last-input interval is `[query_entry − (idle+1)ms, query_return − max(0,idle−1)ms]`. Registration requires intersection with the independent event send/sync bracket. Advancement uses the original, unclipped counter intervals for both observations (including prior child corroboration), not a bracket narrowed by assuming the new emission succeeded. Thus a valid event spanning a tick boundary is not rejected by a one-sided estimate, while genuinely ambiguous advancement remains `INVALID`. Same-tick barrier ambiguity is not rescued by delays or retries. This corrects evidence arithmetic only; the production guard threshold remains unchanged.
+
+Optional `--mode random-model --trials 100 --misses K` is **offline supplied-count analysis, not a new collector or safety gate**. At fixed α=0.05 it reports the exact one-sided tail for `H0: q ≤ 5/60`, with conditional `MODEL_REJECTED` or `NOT_REJECTED`. Realized uniform phase coverage, independence, negligible sample-to-write exposure, counter registration, zero false positives, release/latch behavior and explained misses are not established by counts. Therefore the mode reports `UNSUPPORTED` / `UNQUALIFIED` even on non-rejection. No CLI alpha/threshold tuning is offered. At n=100 it has about 95% power against q=0.20; non-rejection is not evidence of no misses. A future measured statistical check must predeclare its seed, sampling plan and assumptions and retain unexplained misses as unqualified.
 
 **Phase C2 — target binding.** §8.6, all platforms, in the same guard as pause. Requires O9 for macOS.
 
@@ -593,10 +613,11 @@ Evidence: dialog renders on the console user's screen; answered path returns the
 
 | Metric | Target |
 |---|---|
-| **Sessions in which a human was detected and the agent performed a further write** | **Zero — with or without any opt-out.** §6.0 makes this unconditional; this is the metric that tests the property rather than counting how often the gate was bypassed. |
-| Human input during a driving session detected before the agent's next write | **100%** at high confidence, at op granularity, all platforms. Any miss is a P0. |
-| Human input detected during sustained typing | **≥ 99%** for a two-event interaction on Linux/macOS. **Measured and published, not claimed, on Windows** (§5.5) — the number, not a boolean. |
-| Measured per-event masked fraction vs `GUARD/P` | Within 2σ. A divergence means the model of the detector is wrong. |
+| **Sessions in which the guard observed `human_active` and permitted a further task-directed write** | **Zero — with or without any opt-out.** §6.0 is unconditional after observation; required safety releases remain allowed. |
+| Every physical input detected before the next ordinary write | **UNMET product requirement** with timestamp masking and a sample-to-write race. The conditional gate does not solve or silently waive it. |
+| Independently placed outside-band input, before a fresh sample | Every valid predeclared control halts before the next ordinary emission, invokes release and retains the halt. Missing/unplaceable evidence is unqualified. |
+| Human input detected during sustained typing, all phases / multiple correlated events | Record observations and platform limits; no universal 100% or unsupported 99% two-event claim. |
+| Ideal uniform-phase `GUARD/P` model | Separately scoped exact-binomial diagnostic only after its assumptions are established; supplied counts alone are unsupported (§11.1). |
 | Sessions in which the model attributes a failure to a wrong cause when a human intervened | **Zero.** The incident's signature failure. |
 | Keystrokes delivered to a window other than the one the op was bound to | **Zero.** §8.6. |
 | Benign target-binding aborts per 100 `type_text` ops | Recorded, not targeted. It is a known cost; an unknown one is the problem. |
@@ -635,7 +656,7 @@ O2 makes a persistent macOS reminder impossible without a resident LaunchAgent. 
 `manual` (safe, but a passer-by jogging a mouse ends a long unattended run) versus `after_inactivity(N)` (convenient, but resumes while the human may simply be reading — invisible to the detector per §2.2). **I recommend `manual` for any target with a console user, `after_inactivity(120)` for targets with none.** This is a values call about whose time is more expensive.
 
 **D4 — Windows `type_text` before Phase 4.**
-`GetLastInputInfo` quantisation makes intra-typing detection unviable on Windows today (§5.5) — ~53% per-event masking. Three ways to handle it: **(a)** ship it with `"intra_op_detection": false` declared in the result (recommended — honest, and op-granularity detection still works); **(b)** slow Windows typing to ~200 ms/character so the masked fraction drops to ~16%, at the cost of 40 s for a 200-character string; **(c)** do not ship Windows `type_text` until Phase 4 lands the injected-flag hook. **I recommend (a).** The declaration is what makes it safe; silence would not be.
+Historical revision-2 options were to declare the intra-op limit, slow typing, or wait for source attribution. The maintained band is now 20 ms (§5.5), with ideal `20/60 ≈ 33%` masking at the reference cadence, not the historical 53%. None of those options is adopted by this acceptance correction. Windows current qualification and adoption remain with their owners; a declaration discloses a limit but does not make an unmet guarantee true.
 
 **D5 — Does the opt-out in §7.6 exist at all?**
 It permits driving to *begin* on a target with a human present and no working announcement channel. After O1 this should be a near-empty set. It cannot override the §6.0 halt. **I recommend keeping it, logged every session** — the alternative is a hard block with no operator escape hatch, and hard blocks with no escape hatch get worked around in worse ways. If you would rather it not exist, that is defensible and it costs nothing to remove.
