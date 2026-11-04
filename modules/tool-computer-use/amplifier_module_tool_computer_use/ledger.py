@@ -21,9 +21,10 @@ plus the release triggers required to be wired in from day one:
    short enough that a genuine, unnoticed disconnect resolves before anyone
    would think to ask "why is shift stuck".
 
-No I/O of its own - callers supply a `release_fn` per held item and this class
-guarantees it is called exactly once, from every trigger, in a way that is
+No I/O of its own - callers supply a `release_fn` per held item. Release is
 race-safe if two triggers fire close together (e.g. EOF and the deadman).
+Receipt-backed Windows cleanup opts into retaining custody after a failed
+release; an attempted release is then not reported as confirmed.
 """
 
 from __future__ import annotations
@@ -47,6 +48,7 @@ class _Held:
     kind: str
     release_fn: Callable[[], None]
     released: bool = False
+    retain_on_failure: bool = False
 
 
 class HeldInputLedger:
@@ -70,16 +72,43 @@ class HeldInputLedger:
         self._timer: threading.Timer | None = None
         self._stopped = False
 
-    def hold(self, kind: str, token: str, release_fn: Callable[[], None]) -> None:
-        """Register `token` (e.g. a modifier name, a button name) as held."""
+    def hold(
+        self,
+        kind: str,
+        token: str,
+        release_fn: Callable[[], None],
+        *,
+        retain_on_failure: bool = False,
+    ) -> None:
+        """Register `token` (e.g. a modifier name, a button name) as held.
+
+        `retain_on_failure` is for acknowledged safety-release callbacks:
+        preserve their obligation and suppress success notifications when an
+        attempt fails. It does not retry the original input operation.
+        """
         with self._lock:
             if self._stopped:
                 # A hold requested after shutdown must not silently vanish
                 # from the ledger - release immediately rather than track a
                 # phantom entry no trigger will ever see.
-                release_fn()
+                if retain_on_failure:
+                    held = _Held(
+                        token=token,
+                        kind=kind,
+                        release_fn=release_fn,
+                        retain_on_failure=True,
+                    )
+                    self._held[token] = held
+                    self._release_locked(held)
+                else:
+                    release_fn()
                 return
-            self._held[token] = _Held(token=token, kind=kind, release_fn=release_fn)
+            self._held[token] = _Held(
+                token=token,
+                kind=kind,
+                release_fn=release_fn,
+                retain_on_failure=retain_on_failure,
+            )
             self._reset_deadman_locked()
 
     def release(self, token: str) -> None:
@@ -107,8 +136,8 @@ class HeldInputLedger:
             for held in list(self._held.values()):
                 if held.released:
                     continue
-                self._release_locked(held)
-                released.append(held.token)
+                if self._release_locked(held):
+                    released.append(held.token)
             if released:
                 logger.info(
                     "held-input ledger: released %s (reason=%s)", released, reason
@@ -132,24 +161,33 @@ class HeldInputLedger:
 
     # -- internals ----------------------------------------------------------
 
-    def _release_locked(self, held: _Held) -> None:
+    def _release_locked(self, held: _Held) -> bool:
+        # Prevent recursive release while a callback is running, without
+        # confusing "attempted" with "confirmed" for receipt-backed releases.
         held.released = True
         try:
             held.release_fn()
         except Exception:
+            if held.retain_on_failure:
+                held.released = False
+                logger.exception(
+                    "held-input ledger: release for %r unconfirmed; retaining custody",
+                    held.token,
+                )
+                return False
             logger.exception(
                 "held-input ledger: release_fn for %r (%s) raised - the input "
                 "may still be physically held; this is logged, not swallowed",
                 held.token,
                 held.kind,
             )
-        finally:
-            self._held.pop(held.token, None)
+        self._held.pop(held.token, None)
         if self._on_release is not None:
             try:
                 self._on_release(held.kind, held.token)
             except Exception:
                 logger.exception("held-input ledger: on_release callback raised")
+        return True
 
     def _reset_deadman_locked(self) -> None:
         if self._timer is not None:

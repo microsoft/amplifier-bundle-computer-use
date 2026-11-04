@@ -34,14 +34,27 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from contextlib import contextmanager
+from dataclasses import dataclass, field, replace
 from typing import Any
 
+from .backend import BackendError
 from .exclusion import ExclusionZone
-from .halt_state import PERSISTED_BASIS, resolve_resume_command
+from .halt_state import PERSISTED_BASIS, PERSISTED_UNKNOWN_BASIS, resolve_resume_command
 from .pause import DragState, PauseController, PausedError
-from .presence import PresenceMonitor, PresenceSnapshot, PresenceState
+from .presence import (
+    Confidence,
+    IdleUnreadableError,
+    PresenceMonitor,
+    PresenceSnapshot,
+    PresenceState,
+)
 from .target_binding import TargetBinding, TargetChangedError
+from .target_clock import (
+    TargetClockFailure,
+    target_clock_exchange,
+    without_target_clock,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +118,21 @@ class HaltedError(RuntimeError):
                 "Halting before the next write. To resume: after confirming "
                 f"it is safe, run `{resolve_resume_command()}` for this "
                 "backend."
+            )
+        elif snapshot.basis.startswith(PERSISTED_UNKNOWN_BASIS + ":"):
+            super().__init__(
+                "halted: a PRIOR session could not verify Windows target-clock "
+                f"safety evidence ({snapshot.basis.split(':', 1)[1]}) and "
+                "persisted that safety halt. This is NOT proof that a human "
+                "produced input, and is not a live reading. It does not clear "
+                "with time. To resume: after confirming it is safe, run "
+                f"`{resolve_resume_command()}` for this backend."
+            )
+        elif snapshot.state is PresenceState.UNKNOWN:
+            super().__init__(
+                f"halted: Windows target-clock safety evidence is unavailable or "
+                f"invalid ({snapshot.basis}); input may be unacknowledged. "
+                "Halting before the next write; do not replay uncertain input."
             )
         else:
             super().__init__(
@@ -250,7 +278,22 @@ class CoexistenceGuard:
         docstring above.
         """
         self._poll_durable_halt()
-        snap = self.presence.sample()
+        if (
+            self._halted
+            and getattr(self.presence, "target_clock_source", None) is not None
+        ):
+            # In particular, do not relabel an UNKNOWN receipt failure as a
+            # human event when observing our own subsequent safety releases.
+            with without_target_clock():
+                self.release_all("halted")
+            assert self._halt_snapshot is not None
+            raise HaltedError(self._halt_snapshot)
+        try:
+            snap = self.presence.sample()
+        except IdleUnreadableError:
+            if getattr(self.presence, "target_clock_source", None) is not None:
+                self._halt_target_failure("target_clock_unreadable")
+            raise
         self._notify_presence_sample(snap)
         if snap.state is PresenceState.HUMAN_ACTIVE:
             self._halted = True
@@ -340,6 +383,88 @@ class CoexistenceGuard:
         so a real elapsed gap exists for a human event to land in.
         """
         self.presence.record_inject()
+
+    @contextmanager
+    def target_clock_event(self):
+        """Forward this guard's checked condition only for this invocation."""
+        if getattr(self.presence, "target_clock_source", None) is None:
+            yield
+            return
+        try:
+            condition = self.presence.target_condition()
+        except ValueError:
+            self._halt_target_failure("target_clock_unreadable")
+        try:
+            with target_clock_exchange(condition, self) as exchange:
+                yield
+                if exchange.result is None:
+                    raise TargetClockFailure(None)
+                # Ledger cleanup callbacks contain their own exceptions. Do not
+                # let a contained callback turn a newly latched halt into a
+                # successful tool result with no durable-halt notification.
+                if self._halted:
+                    assert self._halt_snapshot is not None
+                    raise HaltedError(self._halt_snapshot)
+        except (BackendError, TargetClockFailure, OSError, ValueError):
+            # Includes lost acknowledgements: never manufacture an injection
+            # receipt, and never allow a retry to hide uncertain input.
+            self._halt_target_failure("target_clock_unacknowledged")
+
+    def accept_target_result(
+        self,
+        result: Any,
+        *,
+        require_injection: bool,
+        transport_latency_ms: float = 0.0,
+    ) -> None:
+        try:
+            snap = self.presence.record_target_result(
+                result,
+                require_injection=require_injection,
+                transport_latency_ms=transport_latency_ms,
+            )
+        except (ValueError, TypeError, KeyError):
+            self._halt_target_failure("target_clock_unreadable")
+        self._notify_presence_sample(snap)
+        if snap.state is PresenceState.HUMAN_ACTIVE:
+            self.seed_halted(snap)
+        elif result.get("ok") is not True:
+            self._halt_target_failure("target_precondition_rejected")
+        if self._halted:
+            with without_target_clock():
+                self.release_all("halted")
+            assert self._halt_snapshot is not None
+            raise HaltedError(self._halt_snapshot)
+
+    def _halt_target_failure(self, basis: str) -> None:
+        previous = self.presence.last_snapshot
+        if previous is None:
+            snapshot = PresenceSnapshot(
+                state=PresenceState.UNKNOWN,
+                confidence=Confidence.LOW,
+                basis=basis,
+                last_human_input_ago_ms=None,
+                margin_ms=None,
+                guard_ms=self.presence.guard_ms,
+                guard_measured=self.presence.guard_measured,
+                sample_interval_ms=None,
+                latched_until_ms=None,
+            )
+        else:
+            snapshot = replace(
+                previous,
+                state=PresenceState.UNKNOWN,
+                confidence=Confidence.LOW,
+                basis=basis,
+                last_human_input_ago_ms=None,
+                margin_ms=None,
+            )
+        if not self._halted:
+            self.seed_halted(snapshot)
+        with without_target_clock():
+            self.release_all("halted")
+        assert self._halt_snapshot is not None
+        raise HaltedError(self._halt_snapshot)
 
     @property
     def halted(self) -> bool:

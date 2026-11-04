@@ -1261,7 +1261,10 @@ class ComputerTool:
                 from .observed_control import check_observed_proof
 
                 check_observed_proof(binding)
-            yield
+            from .target_clock import guarded_target_call
+
+            with guarded_target_call(guard):
+                yield
         finally:
             guard.after_event()
             guard.release_target()
@@ -1277,7 +1280,7 @@ class ComputerTool:
         *,
         ledger: HeldInputLedger | None = None,
     ) -> None:
-        """Register a just-pressed mouse button in the channel-scoped held-
+        """Register a known/possibly pressed button in the channel-scoped held-
         input ledger. Mirrors `RemoteAgent._op_mouse_down`'s pattern exactly
         (`remote_agent.py`): the release_fn reads its coordinates out of a
         mutable pending box at the moment it actually fires, rather than
@@ -1285,6 +1288,10 @@ class ComputerTool:
         (deadman, halt, pause, target-change - none of which have a real
         `left_mouse_up` to supply fresh coordinates) still safely defaults
         to releasing at the button's last-known position.
+
+        Windows cleanup is unconditioned and never moves the pointer; an
+        unacknowledged release retains custody. Explicit Windows up is handled
+        outside the callback, so a safety halt cannot be swallowed by a ledger.
 
         A no-op when this backend has no channel-scoped ledger (no
         coexistence guard was built for it - \\u00a75.5's \"never claim a
@@ -1298,14 +1305,29 @@ class ComputerTool:
         if ledger is None:
             return
         token = f"mouse:{button}"
-        pending: dict[str, int | None] = {"x": None, "y": None}
+        pending: dict[str, Any] = {"x": None, "y": None, "up_confirmed": False}
         self._mouse_pending[token] = pending
+        windows = (
+            getattr(backend, "presence_platform", None) or backend.name
+        ) == "windows-wsl2"
 
         def _release() -> None:
-            backend.mouse_up(pending["x"], pending["y"], button)
+            if windows:
+                # Safety cleanup never inherits the guarded input condition
+                # and never moves a held pointer to a requested coordinate.
+                from .target_clock import without_target_clock
+
+                if not pending["up_confirmed"]:
+                    with without_target_clock():
+                        backend.mouse_up(None, None, button)
+            else:
+                backend.mouse_up(pending["x"], pending["y"], button)
             self._mouse_pending.pop(token, None)
 
-        ledger.hold("mouse", token, _release)
+        if windows:
+            ledger.hold("mouse", token, _release, retain_on_failure=True)
+        else:
+            ledger.hold("mouse", token, _release)
 
     def _release_mouse_button(
         self,
@@ -1325,6 +1347,10 @@ class ComputerTool:
         was toggled mid-session) - identical fallback to
         `RemoteAgent._op_mouse_up`.
 
+        Windows instead executes explicit up before retiring custody. Its
+        failure path attempts a no-motion safety release and re-raises the
+        original exception, retaining the obligation if cleanup fails.
+
         `ledger`: the pinned binding's ledger (see `_run`'s docstring) -
         defaults to a fresh `self._ledger` read for callers with no pinned
         snapshot of their own.
@@ -1333,6 +1359,21 @@ class ComputerTool:
         token = f"mouse:{button}"
         pending = self._mouse_pending.get(token)
         if ledger is not None and pending is not None:
+            windows = (
+                getattr(backend, "presence_platform", None) or backend.name
+            ) == "windows-wsl2"
+            if windows:
+                # Run the guarded explicit up OUTSIDE the ledger callback.
+                # A refusal/invalid ack still gets an unconditioned no-motion
+                # release, but the original halt/error must reach the caller.
+                try:
+                    backend.mouse_up(x, y, button)
+                except BaseException:
+                    ledger.release(token)
+                    raise
+                pending["up_confirmed"] = True
+                ledger.release(token)
+                return
             pending["x"], pending["y"] = x, y
             ledger.release(token)
         else:
@@ -2209,7 +2250,27 @@ class ComputerTool:
                 coord=(x, y) if x is not None and y is not None else None,
                 binding=binding,
             ):
-                backend.mouse_down(x, y, "left")
+                try:
+                    backend.mouse_down(x, y, "left")
+                except BaseException:
+                    if backend.name == "windows-wsl2":
+                        # The bridge may have emitted down before a receipt
+                        # caused the guard to halt. Establish custody even on
+                        # this path; retain it if the safety up cannot confirm.
+                        self._hold_mouse_button("left", backend, ledger=binding.ledger)
+                        if binding.ledger is not None:
+                            binding.ledger.release("mouse:left")
+                        else:
+                            from .target_clock import without_target_clock
+
+                            try:
+                                with without_target_clock():
+                                    backend.mouse_up(None, None, "left")
+                            except Exception:
+                                logger.exception(
+                                    "Windows down outcome uncertain; safety up unconfirmed"
+                                )
+                    raise
                 self._hold_mouse_button("left", backend, ledger=binding.ledger)
             return "left_mouse_down", None
 
@@ -2330,7 +2391,10 @@ class ComputerTool:
                             backend.type_text(unit, guard=typing_guard)
                         else:
                             typing_guard.before_event()
-                            backend.type_text(unit)
+                            from .target_clock import guarded_target_call
+
+                            with guarded_target_call(typing_guard):
+                                backend.type_text(unit)
                             typing_guard.after_event()
 
                     # Zero pacing removes the delay, not the guard boundary.
@@ -4120,6 +4184,12 @@ def _build_coexistence_guard(
         )
         return None
     presence = PresenceMonitor(idle_source=idle_source, platform=platform_for_guard)
+    if platform_for_guard == "windows-wsl2":
+        # No mixed-clock fallback, including an older/malformed Windows peer.
+        def read_target_clock():
+            return backend.presence_observation()
+
+        presence.target_clock_source = read_target_clock
     # Channel-scoped, not one-per-mount() (see `_get_channel_ledger` above) -
     # this is finding #2 of the adversarial review of
     # docs/designs/band-lifetime.md: `HeldInputLedger()` used to be built

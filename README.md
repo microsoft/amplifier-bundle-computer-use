@@ -253,6 +253,15 @@ destructive confirmations, anything that would send or publish on your behalf, o
 that twice fails to match expectations. That instruction is followed well in practice —
 but it is guidance to a model, not a gate. Treat it as such.
 
+**Windows timing stays on the target's clock.** Guarded Windows input uses boot/logon-scoped
+`GetTickCount64` observations and checked `SendInput` receipts, not controller response times.
+The bridge rechecks the supplied condition immediately before input, including after SSH
+transit and PowerShell startup. This narrows the check-to-input race; it is not atomic and
+does not remove the platform's existing guard-band masking. Missing, mismatched or lost
+receipts latch an **unknown safety-evidence halt**, not proof of human activity, and never
+authorize replay. Failed emergency releases retain their cleanup obligation. Historical
+halt records without the newer basis field retain their original interpretation.
+
 **`unattended_writes_ok` is a deliberate opt-out, not a convenience toggle.** With no TTY,
 the write gate denies rather than crashing on an unanswerable prompt. Setting
 `unattended_writes_ok: true` allows those writes with no human confirmation — always

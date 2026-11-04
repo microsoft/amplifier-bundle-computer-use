@@ -46,6 +46,7 @@ PAYLOAD_MODULES = (
     "linux_x11.py",
     "macos.py",
     "windows.py",
+    "target_clock.py",
     "wire.py",
     "ledger.py",
     "agent_scratch_lease.py",

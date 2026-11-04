@@ -23,6 +23,7 @@ from .backend import (
     WindowList,
 )
 from .ssh_transport import AgentStderrError, SshConnectError, SshTransport
+from .target_clock import CURRENT_TARGET_CLOCK, TargetClockFailure, guarded_target_call
 from .wire import AgentBackendUnavailableError, Request, Response, classify_op
 
 logger = logging.getLogger(__name__)
@@ -178,8 +179,15 @@ class RemoteBackend:
     def _call(self, op: str, **args: Any) -> Any:
         if self._transport is None or not self._connected:
             raise BackendError(f"remote backend not connected (op={op!r})")
-        req = Request(id=next(self._ids), op=op, args=args)
         op_class = classify_op(op)
+        exchange = (
+            CURRENT_TARGET_CLOCK.get()
+            if self.presence_platform == "windows-wsl2" and op_class == "write"
+            else None
+        )
+        if exchange is not None:
+            args["_target_clock_condition"] = exchange.condition
+        req = Request(id=next(self._ids), op=op, args=args)
         try:
             line = self._transport.send(req.encode())
         except SshConnectError as exc:
@@ -189,16 +197,36 @@ class RemoteBackend:
             # "Confirm". READ/CONTROL failures still just surface as an
             # error; nothing in this method silently retries any op class.
             raise BackendError(f"remote op {op!r} ({op_class}) failed: {exc}") from exc
-        resp = Response.decode(line)
+        try:
+            resp = Response.decode(line)
+        except ValueError as exc:
+            if exchange is not None:
+                raise TargetClockFailure(None) from exc
+            raise
         if resp.id != req.id:
             raise BackendError(
                 f"wire desync: sent id={req.id}, got id={resp.id} for op {op!r}"
             )
         if not resp.ok:
             raise BackendError(f"{resp.error_type}: {resp.error_message}")
+        if exchange is not None:
+            envelope = resp.result
+            if not isinstance(envelope, dict) or "_target_clock" not in envelope:
+                raise TargetClockFailure(envelope)
+            exchange.finish(
+                envelope["_target_clock"],
+                require_injection=op not in {"move", "set_clipboard"},
+            )
+            return envelope.get("value")
         return resp.result
 
     # -- coexistence presence source (docs/designs/coexistence.md §5) ---------
+
+    def presence_observation(self) -> Any:
+        result = self._call("presence_idle")
+        if not isinstance(result, dict):
+            raise BackendError("missing remote Windows target-clock observation")
+        return result.get("observation")
 
     def presence_idle_ms(self) -> float:
         """Milliseconds since the REMOTE machine last saw any input.
@@ -381,17 +409,18 @@ class RemoteBackend:
         self._call("hold_key", combo=combo, duration=duration)
 
     def type_text(self, text: str, guard: Any = None) -> None:
-        """Guard and account for this invocation in the controller's clock.
+        """Guard in the controller; Windows attribution uses target receipts.
 
         The guard is not serializable and the remote agent does not own it.
         Paced typing arrives one character per call. Record only acknowledged
-        success, after the response; a lost response is never retried or
+        success using the Windows emission receipt; a lost response is never retried or
         relabelled as successful input. Transport latency remains reported by
         presence sampling, never added to the detector's guard threshold.
         """
         if guard is not None:
             guard.before_event()
-        self._call("type_text", text=text)
+        with guarded_target_call(guard):
+            self._call("type_text", text=text)
         if guard is not None:
             guard.after_event()
 

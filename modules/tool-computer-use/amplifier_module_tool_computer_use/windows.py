@@ -30,6 +30,7 @@ from .backend import (
     WindowInfo,
     WindowList,
 )
+from .target_clock import CURRENT_TARGET_CLOCK, guarded_target_call
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +45,24 @@ _CLICK_ACTIONS = {
     ("middle", 1): "middle_click",
     ("left", 2): "double_click",
     ("left", 3): "triple_click",
+}
+
+_INPUT_ACTIONS = {
+    "mouse_move",
+    "left_click",
+    "right_click",
+    "middle_click",
+    "double_click",
+    "triple_click",
+    "left_mouse_down",
+    "left_mouse_up",
+    "left_click_drag",
+    "scroll",
+    "key",
+    "hold_key",
+    "type",
+    "focus_window",
+    "set_clipboard",
 }
 
 
@@ -219,6 +238,9 @@ class WindowsBackend:
             "action": action,
             **{k: v for k, v in params.items() if v is not None},
         }
+        exchange = CURRENT_TARGET_CLOCK.get() if action in _INPUT_ACTIONS else None
+        if exchange is not None:
+            payload["target_clock_condition"] = exchange.condition
         with tempfile.NamedTemporaryFile(
             "w", suffix=".json", delete=False, encoding="utf-8"
         ) as fh:
@@ -259,14 +281,25 @@ class WindowsBackend:
                 f"{(proc.stderr or '').strip()[:400]}"
             )
         try:
-            return json.loads(lines[-1])
+            result = json.loads(lines[-1])
         except json.JSONDecodeError as exc:
             raise BackendError(
                 f"bridge returned non-JSON for {action!r}: {lines[-1][:300]}"
             ) from exc
+        if exchange is not None:
+            exchange.finish(
+                result, require_injection=action not in {"mouse_move", "set_clipboard"}
+            )
+        return result
 
     # -- Backend protocol ---------------------------------------------------------
     # -- coexistence: presence (docs/designs/coexistence.md) ---------------------
+    def presence_observation(self) -> dict[str, Any]:
+        result = self.raw("presence_idle", timeout=15)
+        if not result.get("ok"):
+            raise BackendError(result.get("error", "presence_idle failed"))
+        return result.get("observation")
+
     def presence_idle_ms(self) -> float:
         """Milliseconds since the last input event (real OR synthetic) reached
         this Windows desktop, via `GetLastInputInfo`/`GetTickCount` on the far
@@ -495,9 +528,10 @@ class WindowsBackend:
         """
         if guard is not None:
             guard.before_event()
-        res = self.raw(
-            "type", text=text, timeout=max(self._timeout, 10 + len(text) * 0.05)
-        )
+        with guarded_target_call(guard):
+            res = self.raw(
+                "type", text=text, timeout=max(self._timeout, 10 + len(text) * 0.05)
+            )
         if not res.get("ok"):
             raise BackendError(res.get("error", "type failed"))
         if guard is not None:

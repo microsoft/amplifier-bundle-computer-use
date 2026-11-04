@@ -138,19 +138,38 @@ class Response:
 
     @classmethod
     def decode(cls, line: bytes | str) -> Response:
+        # Validate the complete envelope before accessing nested fields. Every
+        # malformed wire shape has one ValueError path; callers need not guess
+        # which accidental Python exception each malformed field can produce.
+        if not isinstance(line, (bytes, str)):
+            raise ValueError("wire response must be UTF-8 bytes or text")
         if isinstance(line, bytes):
             line = line.decode("utf-8")
         data = json.loads(line)
-        if "id" not in data or "ok" not in data:
-            raise ValueError(f"malformed wire response (missing id/ok): {data!r}")
+        if (
+            not isinstance(data, dict)
+            or type(data.get("id")) is not int
+            or data["id"] < 0
+            or type(data.get("ok")) is not bool
+        ):
+            raise ValueError("malformed wire response id/ok")
         if data["ok"]:
-            return cls(id=int(data["id"]), ok=True, result=data.get("result"))
-        err = data.get("error") or {}
+            if "result" not in data or "error" in data:
+                raise ValueError("malformed successful wire response")
+            return cls(id=data["id"], ok=True, result=data["result"])
+        err = data.get("error")
+        if (
+            not isinstance(err, dict)
+            or not isinstance(err.get("type"), str)
+            or not isinstance(err.get("message"), str)
+            or "result" in data
+        ):
+            raise ValueError("malformed failed wire response")
         return cls(
-            id=int(data["id"]),
+            id=data["id"],
             ok=False,
-            error_type=err.get("type", "BackendError"),
-            error_message=err.get("message", "remote op failed with no message"),
+            error_type=err["type"],
+            error_message=err["message"],
         )
 
     def encode(self) -> bytes:
