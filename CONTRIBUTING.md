@@ -122,6 +122,25 @@ Stale, missing, extra or replayed input invalidates the case. The receiver is al
 checked after every attempted backend call, including refusals: ordinary native
 input after activity/halt is **FAIL**, even without a logged emission callback.
 
+The X server sends `MappingNotify` to all clients independently of input masks.
+The observed first-key queue contained `MappingKeyboard`, `MappingModifier`,
+`KeyPress`, `KeyRelease`; counting all four as input incorrectly rejected the
+expected pair. Only genuine, well-formed `MappingNotify` notifications are
+handled separately. Keyboard ranges must match server setup; the receiver
+refreshes its mapping and rechecks that the original keycode still maps to
+unshifted `a`. Changed mappings, unknown notifications and synthetic
+`SendEvent` notifications invalidate the case. Input ordinals exclude these
+notifications; the full-event sequence and notification summaries remain saved.
+The notification budgets are 8 per batch / 64 per run, separate from the unchanged
+three-input capture rejection and exact two-key/one-motion/no-input matching.
+
+Every drain retains its pending count, at most 16 closed-schema event summaries,
+type counts, omitted count and truncation/remaining status before classification
+or mapping refresh can fail. These are evidence limits, not input allowances.
+Overflow or unknown traffic stays invalid; captured input after a halt remains
+**FAIL** even if a mapping, overflow or later read also fails. A native result
+without sufficient retained evidence cannot qualify or authorize a retry.
+
 Delivery alone does not establish **counter registration**. A harness-private
 read-only SYNC 3.1 binding discovers `SERVERTIME`. On the backend's same Xlib
 connection it queries `S0`, the actual MIT-SCREEN-SAVER idle value, then `S1`.

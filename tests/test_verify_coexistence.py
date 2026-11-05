@@ -142,6 +142,106 @@ class Oracle(verify.RegistrationOracle):
         self.last_ordinal = 0
 
 
+class RawConnection:
+    """Exercise the actual receiver drain, not Receiver's simplified override."""
+
+    def __init__(self, events=()):
+        self.queue = list(events)
+        self.reads = 0
+        self.refreshes = []
+        self.updated_ranges = []
+        self.pairs = [(38, 0)]
+        self.symbol = 97
+        self.mapping_fault = None
+        self.display = SimpleNamespace(
+            info=SimpleNamespace(min_keycode=8, max_keycode=255)
+        )
+
+    def sync(self):
+        pass
+
+    def pending_events(self):
+        return len(self.queue)
+
+    def next_event(self):
+        self.reads += 1
+        return self.queue.pop(0)
+
+    def refresh_keyboard_mapping(self, event):
+        from Xlib.display import Display
+
+        self.refreshes.append(event.request)
+        # Use python-xlib's actual type check and Keyboard-only cache refresh.
+        Display.refresh_keyboard_mapping(self, event)
+        if self.mapping_fault == "new-traffic":
+            self.queue.append(raw_event(4, detail=1))
+        elif self.mapping_fault == "query-error":
+            raise OSError("mapping query failed")
+        elif self.mapping_fault == "wrong-cache":
+            self.pairs = [(39, 0)]
+        elif self.mapping_fault == "wrong-level":
+            self.pairs = [(38, 1)]
+        elif self.mapping_fault == "wrong-current":
+            self.symbol = 98
+
+    def _update_keymap(self, first, count):
+        self.updated_ranges.append((first, count))
+
+    def keysym_to_keycodes(self, symbol):
+        assert symbol == 97
+        return self.pairs
+
+    def get_keyboard_mapping(self, first, count):
+        assert (first, count) == (38, 1)
+        return [[self.symbol, 65]]
+
+
+class RawReceiver(verify.EventReceiver):
+    def __init__(self, events=()):
+        self.conn = RawConnection(events)
+        self.ordinal = self.event_sequence = self.mapping_notifications = 0
+        self.armed = False
+        self.keycode = 38
+        self.window = SimpleNamespace(id=99)
+        self.last_drain = None
+
+    def add(self, kind, timestamp, detail=0, x=0, y=0):
+        self.conn.queue.append(raw_event(kind, timestamp, detail, x, y))
+
+    def close(self):
+        self.cleanup = {"closed": True}
+
+
+def raw_event(kind, timestamp=3000, detail=38, x=0, y=0):
+    return SimpleNamespace(
+        type=kind,
+        window=SimpleNamespace(id=99),
+        detail=detail,
+        event_x=x,
+        event_y=y,
+        time=timestamp,
+        send_event=False,
+    )
+
+
+def mapping(request=1, first=8, count=248, **kwargs):
+    from Xlib.protocol.event import MappingNotify
+
+    # Decode wire bytes as a received event: python-xlib's outgoing constructor
+    # forces integer send_event=0 even when the caller supplies True.
+    return MappingNotify(
+        binarydata=struct.pack(
+            "=BBHBBB25x",
+            34 | (0x80 if kwargs.get("send_event") else 0),
+            0,
+            0,
+            request,
+            first,
+            count,
+        )
+    )
+
+
 class Child:
     def __init__(self, backend):
         self.backend = backend
@@ -661,12 +761,263 @@ def test_receiver_structural_setup_and_independent_cleanup(monkeypatch, fault):
         assert calls[-3:] == ["restore", "destroy", "close"]
 
 
-def test_real_receiver_drain_has_fixed_batch_bound_without_native_display():
-    receiver = object.__new__(verify.EventReceiver)
-    receiver.ordinal = 0
-    receiver.conn = SimpleNamespace(sync=lambda: None, pending_events=lambda: 4)
-    with pytest.raises(verify.InvalidCase, match="exceeds bound"):
+@pytest.mark.parametrize("count", [4, 16, 21])
+def test_real_receiver_drain_retains_bounded_overflow_evidence(count):
+    receiver = RawReceiver([raw_event(4, detail=1)] * count)
+    with pytest.raises(verify.UnexpectedInput) as caught:
         receiver._drain()
+    evidence = caught.value.evidence["receiver"]
+    assert evidence["pending_count"] == count
+    assert len(evidence["batch"]) == min(count, verify.RECEIVER_CAPTURE_LIMIT)
+    assert evidence["type_counts"] == {"4": min(count, 16)}
+    assert evidence["omitted_count"] == max(0, count - 16)
+    assert evidence["remaining_count"] == max(0, count - 16)
+    assert evidence["truncated"] is (count > 16)
+    assert receiver.conn.reads == min(count, 16)
+    assert json.loads(json.dumps(evidence)) == evidence
+
+
+@pytest.mark.parametrize("position", ["before", "inside", "after", "all"])
+def test_real_drain_filters_only_validated_notifications_with_input_ordinals(position):
+    pair = [raw_event(2), raw_event(3)]
+    notices = [mapping(), mapping(0, 0, 0)]
+    events = {
+        "before": notices + pair,
+        "inside": pair[:1] + notices + pair[1:],
+        "after": pair + notices,
+        "all": notices + pair[:1] + notices + pair[1:] + notices,
+    }[position]
+    receiver = RawReceiver()
+    oracle = SimpleNamespace(receiver=receiver, last_ordinal=0)
+    receiver.arm()
+    receiver.conn.queue.extend(events)
+    batch = verify.RegistrationOracle.consume(oracle, "own")
+    assert [e["type"] for e in batch] == [2, 3]
+    assert [e["ordinal"] for e in batch] == [1, 2]
+    assert oracle.last_ordinal == 2
+    evidence = receiver.last_drain
+    assert [e["sequence"] for e in evidence["batch"]] == list(range(1, len(events) + 1))
+    assert evidence["pending_count"] == len(events)
+    assert evidence["mapping_count"] == len(events) - 2
+    assert all(e["mapping_validated"] for e in evidence["batch"] if e["type"] == 34)
+    assert receiver.conn.updated_ranges == [(8, 248)] * ((len(events) - 2) // 2)
+    with pytest.raises(verify.InvalidCase, match="replayed"):
+        receiver.consume("own")
+    receiver.arm()
+    receiver.conn.queue.extend([mapping(2, 0, 0), raw_event(2), raw_event(3)])
+    batch = verify.RegistrationOracle.consume(oracle, "own")
+    assert [e["ordinal"] for e in batch] == [3, 4]
+    assert oracle.last_ordinal == 4
+
+
+@pytest.mark.parametrize("mapping_request", [0, 1, 2])
+def test_real_drain_notification_during_arm_and_none_is_not_input(mapping_request):
+    receiver = RawReceiver([mapping(mapping_request)])
+    receiver.arm()
+    assert receiver.armed and receiver.ordinal == 0
+    receiver.conn.queue.append(mapping(mapping_request))
+    assert receiver.consume("none") == []
+    assert receiver.ordinal == 0 and receiver.event_sequence == 2
+    assert receiver.conn.refreshes == [mapping_request, mapping_request]
+    assert receiver.conn.updated_ranges == (
+        [(8, 248)] * 2 if mapping_request == 1 else []
+    )
+
+
+@pytest.mark.parametrize("kind", [2, 3, 4, 5, 6])
+@pytest.mark.parametrize("operation", ["arm", "none", "own"])
+def test_notifications_never_excuse_unexpected_input(kind, operation):
+    receiver = RawReceiver()
+    if operation != "arm":
+        receiver.arm()
+    receiver.conn.queue.extend(
+        [mapping(), raw_event(kind), mapping(0, 0, 0)]
+        + ([raw_event(2), raw_event(3)] if operation == "own" else [])
+    )
+    with pytest.raises(verify.InvalidCase) as caught:
+        if operation == "arm":
+            receiver.arm()
+        else:
+            receiver.consume(operation)
+    if operation != "own":
+        assert isinstance(caught.value, verify.UnexpectedInput)
+    assert receiver.last_drain["type_counts"][str(kind)] >= 1
+
+
+@pytest.mark.parametrize(
+    "notice",
+    [
+        lambda: mapping(request=3),
+        lambda: mapping(first=7),
+        lambda: mapping(count=0),
+        lambda: mapping(first=250, count=7),
+        lambda: mapping(send_event=True),
+        lambda: SimpleNamespace(
+            type=34, request=1, first_keycode=8, count=248, send_event=False
+        ),
+        lambda: raw_event(0),
+        lambda: raw_event(19),  # no speculative structural-event exemption
+        lambda: raw_event(35),
+    ],
+)
+def test_unknown_malformed_and_sendevent_notifications_retained_and_rejected(notice):
+    receiver = RawReceiver([notice()])
+    with pytest.raises(verify.InvalidCase):
+        receiver.arm()
+    assert len(receiver.last_drain["batch"]) == 1
+    assert "error" in receiver.last_drain
+    assert receiver.conn.refreshes == []
+
+
+@pytest.mark.parametrize(
+    "fault",
+    ["wrong-cache", "wrong-current", "wrong-level", "query-error", "new-traffic"],
+)
+def test_mapping_refresh_revalidates_original_key_and_rejects_new_traffic(fault):
+    receiver = RawReceiver([mapping()])
+    receiver.conn.mapping_fault = fault
+    with pytest.raises(verify.InvalidCase):
+        receiver.arm()
+    assert receiver.conn.refreshes == [1]
+    assert receiver.last_drain["batch"][0]["request"] == 1
+    assert "error" in receiver.last_drain
+    assert receiver.last_drain["remaining_count"] == (
+        1 if fault == "new-traffic" else 0
+    )
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("request", True),
+        ("request", None),
+        ("count", "not-a-CARD8"),
+        ("first_keycode", -1),
+        ("first_keycode", 256),
+        ("send_event", 0),
+    ],
+)
+def test_malformed_received_mapping_fields_are_rejected(field, value):
+    notice = mapping()
+    notice._data[field] = value
+    receiver = RawReceiver([notice])
+    with pytest.raises(verify.InvalidCase):
+        receiver.empty()
+    assert receiver.conn.refreshes == []
+    assert "error" in receiver.last_drain
+    assert json.loads(json.dumps(receiver.last_drain))
+
+
+@pytest.mark.parametrize("mapping_request", [0, 2])
+def test_unused_mapping_fields_remain_card8_not_keyboard_ranges(mapping_request):
+    receiver = RawReceiver([mapping(mapping_request, first=255, count=255)])
+    receiver.empty()
+    summary = receiver.last_drain["batch"][0]
+    assert summary["mapping_validated"]
+    assert (summary["first_keycode"], summary["count"]) == (255, 255)
+
+
+def test_notifications_preserve_exact_child_motion():
+    receiver = RawReceiver()
+    receiver.arm()
+    receiver.conn.queue.extend(
+        [mapping(), raw_event(6, detail=0, x=8, y=7), mapping(0, 0, 0)]
+    )
+    assert receiver.consume("child", 1)[0]["ordinal"] == 1
+    receiver.arm()
+    receiver.conn.queue.extend(
+        [mapping(), raw_event(6, detail=0, x=9, y=7), mapping(0, 0, 0)]
+    )
+    with pytest.raises(verify.InvalidCase, match="wrong native child motion"):
+        receiver.consume("child", 1)
+
+
+@pytest.mark.parametrize("count", [9, 17, 30])
+def test_notification_budget_is_not_an_input_allowance(count):
+    receiver = RawReceiver([mapping()] * count)
+    with pytest.raises(verify.InvalidCase):
+        receiver.arm()
+    assert receiver.conn.reads == min(count, 16)
+    assert receiver.last_drain["pending_count"] == count
+    assert receiver.last_drain["omitted_count"] == max(0, count - 16)
+    assert receiver.conn.refreshes == []
+
+
+def test_notification_run_budget_is_finite():
+    receiver = RawReceiver()
+    for _ in range(verify.MAPPING_RUN_LIMIT // verify.MAPPING_BATCH_LIMIT):
+        receiver.conn.queue.extend([mapping()] * verify.MAPPING_BATCH_LIMIT)
+        receiver.empty()
+    receiver.conn.queue.append(mapping())
+    with pytest.raises(verify.InvalidCase):
+        receiver.arm()
+    assert receiver.last_drain["mapping_run_count"] == verify.MAPPING_RUN_LIMIT + 1
+
+
+@pytest.mark.parametrize("fault", ["overflow", "mapping", "unknown", "partial-read"])
+def test_post_halt_native_click_evidence_survives_receiver_faults(
+    rig, monkeypatch, fault
+):
+    _, backend, child = rig
+    backend.receiver = RawReceiver()
+    type_text = backend.type_text
+
+    def broken(text, guard):
+        try:
+            type_text(text, guard)
+        except HaltedError:
+            receiver = backend.receiver
+            receiver.add(4, backend.server_now(), detail=1)
+            receiver.add(5, backend.server_now(), detail=1)
+            if fault == "overflow":
+                receiver.conn.queue.extend([mapping()] * 19)
+            elif fault == "mapping":
+                receiver.conn.queue.append(mapping())
+                receiver.conn.mapping_fault = "wrong-current"
+            elif fault == "unknown":
+                receiver.conn.queue.append(raw_event(0))
+            else:
+                receiver.conn.queue.append(raw_event(0))
+                next_event = receiver.conn.next_event
+
+                def partial_read():
+                    if len(receiver.conn.queue) == 1:
+                        raise OSError("partial read failed")
+                    return next_event()
+
+                monkeypatch.setattr(receiver.conn, "next_event", partial_read)
+            raise
+
+    monkeypatch.setattr(backend, "type_text", broken)
+    result = verify._run_case("outside-15ms", backend, child)
+    assert result["status"] == "FAIL" and result["forbidden_native_input"]
+    assert "emit_after_ns" not in result["timeline"][2]
+    evidence = result["timeline"][2]["unexpected_delivery"]["receiver"]
+    assert [e["type"] for e in evidence["batch"][:2]] == [4, 5]
+    assert evidence["pending_count"] == (21 if fault == "overflow" else 3)
+    assert evidence["truncated"] is (fault in ("overflow", "partial-read"))
+    assert evidence["input_count"] == 2
+    assert json.loads(json.dumps(result))["status"] == "FAIL"
+
+
+def test_case_overflow_evidence_is_retained_in_json(rig, monkeypatch):
+    _, backend, child = rig
+    backend.receiver = RawReceiver()
+    type_text = backend.type_text
+
+    def extra_input(text, guard):
+        type_text(text, guard)
+        backend.receiver.conn.queue.extend([raw_event(4, detail=1)] * 19)
+
+    monkeypatch.setattr(backend, "type_text", extra_input)
+    result = verify._run_case("quiet", backend, child)
+    saved = json.loads(json.dumps(result))
+    assert saved["status"] == "INVALID"
+    evidence = saved["receiver_evidence"]
+    assert evidence["pending_count"] == 21 and evidence["truncated"]
+    assert evidence["type_counts"] == {"2": 1, "3": 1, "4": 14}
+    assert evidence["omitted_count"] == 5
+    assert saved["timeline"][-1]["receiver_evidence"] == evidence
 
 
 def test_actual_monitor_idle_query_is_between_same_connection_server_reads(

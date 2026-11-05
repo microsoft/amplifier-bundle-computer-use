@@ -51,10 +51,18 @@ CASES = (
 )
 IPC_TIMEOUT_S = 3.0
 MAX_MESSAGE = 4096
+RECEIVER_CAPTURE_LIMIT = 16  # Evidence cap, never an input allowance.
+MAPPING_BATCH_LIMIT = 8
+MAPPING_RUN_LIMIT = 64
+INPUT_TYPES = (2, 3, 4, 5, 6)
 
 
 class InvalidCase(RuntimeError):
     """Missing or unplaceable evidence, not a detection miss."""
+
+    def __init__(self, message, evidence=None):
+        super().__init__(message)
+        self.evidence = evidence
 
 
 class UnexpectedInput(InvalidCase):
@@ -218,6 +226,9 @@ class EventReceiver:
         self.window = None
         self.focus = None
         self.ordinal = 0
+        self.event_sequence = 0
+        self.mapping_notifications = 0
+        self.last_drain = None
         self.armed = False
         self.cleanup = {}
         try:
@@ -264,28 +275,134 @@ class EventReceiver:
             self.close()
             raise
 
+    def _mapping(self, event, summary):
+        """X11 §11 MappingNotify is global and cannot be deselected.
+
+        https://www.x.org/releases/current/doc/xproto/x11protocol.html
+        Only this documented non-input event is accepted. Keyboard ranges are
+        validated against setup; Modifier/Pointer's unused CARD8 fields are
+        retained, not interpreted as input. No SendEvent notification is trusted.
+        """
+        from Xlib import XK, X
+        from Xlib.protocol.event import MappingNotify
+
+        request, first, count = (
+            summary["request"],
+            summary["first_keycode"],
+            summary["count"],
+        )
+        if (
+            not isinstance(event, MappingNotify)
+            or summary["send_event"] is not False
+            or type(request) is not int
+            or request not in (X.MappingModifier, X.MappingKeyboard, X.MappingPointer)
+            or any(type(v) is not int or not 0 <= v <= 255 for v in (first, count))
+        ):
+            raise InvalidCase("malformed/SendEvent MappingNotify")
+        if request == X.MappingKeyboard:
+            info = self.conn.display.info
+            if (
+                count == 0
+                or first < info.min_keycode
+                or first + count - 1 > info.max_keycode
+            ):
+                raise InvalidCase("invalid MappingNotify keyboard range")
+        # python-xlib 0.33 refreshes the cached keyboard range for Keyboard,
+        # and explicitly does nothing for Modifier/Pointer. Refresh first, then
+        # require the original oracle keycode AND its current level-zero symbol.
+        self.conn.refresh_keyboard_mapping(event)
+        symbol = XK.string_to_keysym("a")
+        pairs = list(self.conn.keysym_to_keycodes(symbol))
+        current = self.conn.get_keyboard_mapping(self.keycode, 1)
+        if (
+            not pairs
+            or min(pairs, key=lambda p: (p[1], p[0])) != (self.keycode, 0)
+            or len(current) != 1
+            or not current[0]
+            or current[0][0] != symbol
+        ):
+            raise InvalidCase("MappingNotify changed expected unshifted 'a' keycode")
+        summary["mapping_validated"] = True
+
     def _drain(self):
-        self.conn.sync()
-        count = self.conn.pending_events()
-        if count > 3:
-            raise InvalidCase("receiver input batch exceeds bound")
-        batch = []
-        for _ in range(count):
-            event = self.conn.next_event()
-            self.ordinal += 1
-            batch.append(
-                {
-                    "ordinal": self.ordinal,
-                    "type": event.type,
-                    "window": getattr(getattr(event, "window", None), "id", None),
-                    "detail": getattr(event, "detail", None),
-                    "x": getattr(event, "event_x", None),
-                    "y": getattr(event, "event_y", None),
-                    "server_ms": getattr(event, "time", None),
-                    "send_event": getattr(event, "send_event", None),
-                    "received_ns": time.monotonic_ns(),
-                }
+        # One fixed snapshot and bounded prefix, not a drain-until-empty loop.
+        # Retain raw evidence BEFORE classifying/refreshing anything. A later
+        # mapping error cannot conceal positive native input during refusal.
+        captured, batch, native = [], [], []
+        evidence = self.last_drain = {
+            "pending_count": None,
+            "capture_limit": RECEIVER_CAPTURE_LIMIT,
+            "batch": captured,
+            "omitted_count": None,
+            "truncated": False,
+            "remaining_count": None,
+            "mapping_count": 0,
+            "type_counts": {},
+            "input_count": 0,
+        }
+        try:
+            self.conn.sync()
+            count = self.conn.pending_events()
+            evidence["pending_count"] = _event_scalar(count)
+            if type(count) is not int or count < 0:
+                raise InvalidCase("invalid receiver queue count")
+            evidence.update(
+                omitted_count=count, truncated=count > RECEIVER_CAPTURE_LIMIT
             )
+            for _ in range(min(count, RECEIVER_CAPTURE_LIMIT)):
+                event = self.conn.next_event()
+                self.event_sequence += 1
+                summary = _event_summary(event)
+                summary["sequence"] = self.event_sequence
+                summary["ordinal"] = None
+                if type(summary["type"]) is int and summary["type"] in INPUT_TYPES:
+                    self.ordinal += 1
+                    summary["ordinal"] = self.ordinal
+                    batch.append(summary)
+                    evidence["input_count"] += 1
+                captured.append(summary)
+                native.append(event)
+                evidence["omitted_count"] -= 1
+                kind = str(summary["type"])
+                evidence["type_counts"][kind] = evidence["type_counts"].get(kind, 0) + 1
+            evidence["remaining_count"] = self.conn.pending_events()
+            if evidence["truncated"] or evidence["remaining_count"]:
+                raise InvalidCase("receiver evidence capture exceeds bound/new traffic")
+            mappings = [e for e in captured if e["type"] == 34]
+            evidence["mapping_count"] = len(mappings)
+            self.mapping_notifications += len(mappings)
+            evidence["mapping_run_count"] = self.mapping_notifications
+            if (
+                len(mappings) > MAPPING_BATCH_LIMIT
+                or self.mapping_notifications > MAPPING_RUN_LIMIT
+            ):
+                raise InvalidCase("receiver MappingNotify budget exceeds bound")
+            if len(batch) > 3:
+                raise InvalidCase("receiver input batch exceeds bound")
+            for event, summary in zip(native, captured, strict=True):
+                if summary["type"] == 34:
+                    self._mapping(event, summary)
+                elif (
+                    type(summary["type"]) is not int
+                    or summary["type"] not in INPUT_TYPES
+                ):
+                    raise InvalidCase("unexpected non-input receiver event")
+            # Mapping refresh performs read-only queries. Traffic arriving during
+            # them is not silently consumed or deferred into a positive match.
+            evidence["remaining_count"] = self.conn.pending_events()
+            if evidence["remaining_count"]:
+                raise InvalidCase("new receiver traffic during mapping validation")
+        except Exception as exc:
+            evidence["error"] = repr(exc)[:MAX_MESSAGE]
+            if evidence["omitted_count"]:
+                evidence["truncated"] = True
+            if batch:
+                error = UnexpectedInput(
+                    "receiver rejected batch containing native input", batch
+                )
+                error.evidence["receiver"] = evidence
+                raise error from exc
+            raise InvalidCase(f"receiver evidence invalid: {exc}", evidence) from exc
         return batch
 
     def empty(self):
@@ -351,8 +468,38 @@ class EventReceiver:
             "closed": not errors,
             "window_id": getattr(self.window, "id", None),
             "last_ordinal": self.ordinal,
+            "last_event_sequence": self.event_sequence,
+            "mapping_notifications": self.mapping_notifications,
             "errors": errors,
         }
+
+
+def _event_scalar(value):
+    """Only bounded protocol scalars; never arbitrary event data or repr payload."""
+    return value if value is None or type(value) in (int, bool) else "<invalid>"
+
+
+def _event_summary(event):
+    fields = {
+        "type": "type",
+        "detail": "detail",
+        "x": "event_x",
+        "y": "event_y",
+        "server_ms": "time",
+        "send_event": "send_event",
+        "request": "request",
+        "first_keycode": "first_keycode",
+        "count": "count",
+    }
+    return {
+        **{
+            key: _event_scalar(getattr(event, attr, None))
+            for key, attr in fields.items()
+        },
+        "name": type(event).__name__[:64],
+        "window": _event_scalar(getattr(getattr(event, "window", None), "id", None)),
+        "received_ns": time.monotonic_ns(),
+    }
 
 
 def _match_batch(batch, kind, window, keycode, detail=None):
@@ -671,7 +818,12 @@ def _confirm_own(backend: Any, result: dict[str, Any], oracle, batch) -> None:
 
 
 def _confirm_event(backend: Any, result: dict[str, Any], oracle) -> None:
-    batch = oracle.consume("child", result["human"]["id"])
+    try:
+        batch = oracle.consume("child", result["human"]["id"])
+    finally:
+        result["human"]["receiver_evidence"] = getattr(
+            oracle.receiver, "last_drain", None
+        )
     result["human"]["delivery"] = batch
     counter = result["event_counter"] = {}
     _counter_read(backend, counter, oracle.clock)
@@ -743,6 +895,9 @@ def _instrument(backend: Any, child: Any, result: dict[str, Any], oracle):
                 # Production contains observer exceptions. Retain it and refuse
                 # the harness's next emission after before_event returns.
                 observer_error.append(repr(exc))
+                result["barrier_receiver_evidence"] = getattr(
+                    oracle.receiver, "last_drain", None
+                )
 
     guard = CoexistenceGuard(
         presence=presence, release_all=release, on_presence_sample=observer
@@ -997,7 +1152,13 @@ def _run_case(case: str, backend: Any, child: Any, oracle) -> dict[str, Any]:
                             else "none"
                         )
                     row["delivery"] = batch
+                    row["receiver_evidence"] = getattr(
+                        oracle.receiver, "last_drain", None
+                    )
                 except Exception as exc:
+                    row["receiver_evidence"] = getattr(
+                        oracle.receiver, "last_drain", None
+                    )
                     if forbidden and isinstance(exc, UnexpectedInput):
                         result["forbidden_native_input"] = True
                         row["unexpected_delivery"] = exc.evidence
@@ -1049,6 +1210,15 @@ def _run_case(case: str, backend: Any, child: Any, oracle) -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001 - retain failed evidence, never a miss
         result["status"] = "INVALID"
         result["reason"] = repr(exc)[:MAX_MESSAGE]
+        result["receiver_evidence"] = getattr(oracle.receiver, "last_drain", None)
+        if isinstance(exc, UnexpectedInput):
+            result["unexpected_receiver_input"] = exc.evidence
+            if any(
+                row.get("halted")
+                or row.get("snapshot", {}).get("state") == "human_active"
+                for row in result["timeline"][1:]
+            ):
+                result["forbidden_native_input"] = True
     finally:
         # Attribute only against the child's actual send interval, never the
         # requested delay. A sample overlapping an event is not labelled FP.
@@ -1217,6 +1387,7 @@ def main() -> int:
                 _run_boundary(report, args.display)
         except Exception as exc:  # noqa: BLE001 - retain setup/cleanup failures
             report.update(status="UNQUALIFIED", error=repr(exc))
+            report["receiver_evidence"] = getattr(exc, "evidence", None)
         finally:
             report["finished_monotonic_ns"] = time.monotonic_ns()
             output.seek(0)
