@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import secrets
 import shutil
 import subprocess
 import tempfile
@@ -194,6 +195,21 @@ class WindowsBackend:
         self._ps_config = cfg.get("powershell_path")
         self._ps: str | None = None
         self._timeout = float(cfg.get("timeout", 90.0))
+        # Diagnostic correlation only: stable across this backend's one-shot
+        # bridge processes. Never part of public action/guard/receipt state.
+        # WSL Python and the configured PowerShell executable can differ in
+        # pointer width. Stay positive on both native IntPtr architectures.
+        self._input_marker = secrets.randbelow((1 << 31) - 1) + 1
+
+    def prepare_input_probe(self, duration_ms: int = 35000):
+        """Prepare private stdin for an explicitly owned passive helper.
+
+        Does not resolve paths, spawn processes, observe a desktop or reset a
+        halt. The caller owns launch, readiness, deadline, result and reaping.
+        """
+        from .windows_input_diagnostics import prepare_probe
+
+        return prepare_probe(self._input_marker, duration_ms)
 
     # -- capability probe (D1) ---------------------------------------------------
     def probe(self) -> ProbeResult:
@@ -238,6 +254,10 @@ class WindowsBackend:
             "action": action,
             **{k: v for k, v in params.items() if v is not None},
         }
+        # Not a caller-selectable action parameter (including through raw()).
+        payload.pop("_input_marker", None)
+        if action in _INPUT_ACTIONS:
+            payload["_input_marker"] = self._input_marker
         exchange = CURRENT_TARGET_CLOCK.get() if action in _INPUT_ACTIONS else None
         if exchange is not None:
             payload["target_clock_condition"] = exchange.condition

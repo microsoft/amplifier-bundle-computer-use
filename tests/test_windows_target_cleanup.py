@@ -86,7 +86,7 @@ def make_rig(monkeypatch):
             "time",
             SimpleNamespace(monotonic=lambda: state.now / 1000),
         )
-        backend = WindowsBackend.__new__(WindowsBackend)
+        backend = WindowsBackend()
         backend._timeout = 1
         backend._ps = "inert-powershell"
         backend._ps_config = None
@@ -298,7 +298,10 @@ def assert_emergency_is_no_motion_and_unconditioned(rig, owner):
     emergency = emergency_calls(rig)
     assert emergency, "possibly held input requires a separate safety mouse-up"
     for call in emergency:
-        assert call["payload"] == {"action": "left_mouse_up"}
+        assert set(call["payload"]) == {"action", "_input_marker"}
+        assert call["payload"]["action"] == "left_mouse_up"
+        down = next(c for c in rig.calls if c["payload"]["action"] == "left_mouse_down")
+        assert call["payload"]["_input_marker"] == down["payload"]["_input_marker"]
         assert call["context"] is None
     assert any(call["custody"][owner] == (True, True) for call in emergency), (
         "Windows cleanup must own a retain-on-failure ledger entry before release"
@@ -489,7 +492,8 @@ def test_local_uncertain_down_still_sends_safety_up_without_ledger(
     assert rig.guard.halted
     emergency = emergency_calls(rig)
     assert len(emergency) == 1
-    assert emergency[0]["payload"] == {"action": "left_mouse_up"}
+    assert set(emergency[0]["payload"]) == {"action", "_input_marker"}
+    assert emergency[0]["payload"]["action"] == "left_mouse_up"
     assert emergency[0]["context"] is None
     assert rig.emitted == ["left_mouse_down", "left_mouse_up"]
     assert CURRENT_TARGET_CLOCK.get() is None

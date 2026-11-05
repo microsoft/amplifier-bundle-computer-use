@@ -185,6 +185,57 @@ not per request; a faulted cache cannot establish a complete receipt count.
 Tool and guard caches are read separately, not as one atomic cross-cache snapshot.
 No file log, background collector, payload hash, replay or remote protocol is added.
 
+### Opt-in Windows input correlation (diagnostic only)
+
+Each `WindowsBackend` now supplies a private random backend-scoped marker to its
+one-shot bridge processes. The marker is nonzero positive 31-bit, compatible with
+both 32-bit and 64-bit PowerShell even when WSL Python has a different pointer width.
+All actual `SendInput` calls stamp it, including emergency
+releases. Legacy direct bridge requests without the marker remain untagged.
+No public action, target-clock receipt, guard decision, pacing or halt policy changes.
+`SetCursorPos` and clipboard operations are **not** `SendInput` and are not tagged.
+
+An explicitly owned, disposable passive observer is packaged as `input_probe.ps1`.
+It is **never** started by mounting the tool or reading cached diagnostics. In the
+WSL process that owns the **same backend instance**, prepare its private launch
+material without contacting Windows:
+
+```python
+request = backend.prepare_input_probe(duration_ms=35000)
+# request.script is the packaged helper; request.stdin is PRIVATE, not a log.
+```
+
+The authorized diagnostic owner launches that script with the backend's resolved
+`powershell` executable and existing WSL path translation (`windows._translate`):
+`-NoProfile -NonInteractive -ExecutionPolicy Bypass -File <translated request.script>`.
+Write `request.stdin` to that process's stdin and close stdin. Do not put the marker
+in argv, a public tool call, logs or a report. Keep stdout streaming: wait for the
+flushed JSON `event:"probe_ready"` frame **before** the separately authorized ordinary
+guarded action. A missing/failed readiness frame forbids that action; this helper
+does not authorize input or reset a halt. There is no automatic action/retry.
+
+Retain the readiness, `probe_result` and `probe_final` JSON frames, the ordinary
+action's existing `target_clock.injection` receipt, and independently observed
+helper exit/reaping. The owner must bound startup/compilation externally and
+reconcile an interrupted/unknown process; the observation requests at most 35 seconds
+after setup, not a hard process-exit deadline. Compiler files are removed only from
+this helper's fresh CodeDOM temporary-file collection. Cleanup failures remain visible.
+Use `windows_input_diagnostics.correlate_probe(frames, injection_receipt)` offline;
+it starts nothing and accepts only bounded closed-schema evidence.
+
+The observer records at most 256 category/timing/flag/marker-match events and 32
+counter transitions, plus loss, sampling and cleanup coverage. It reads no keys,
+scan codes, coordinates, text or clipboard content and emits no raw marker,
+extra-info, PID or private path. `own_marker` means **matching marker + injected
+flag**, not authenticated authorship: other software can spoof it. `other_injected`
+does not identify the sender. `unattributed_noninjected` does **not** prove hardware
+or human input. Late callbacks, same-tick competition, multiple events between
+counter samples, absent events, dropped evidence and failed cleanup remain unresolved;
+no timing grace is added. OS hook removal/loss outside the observer's own counters
+cannot be ruled out. This prospective diagnostic cannot reconstruct an old event.
+Headless tests qualify parsing/source contracts only; native Windows hook delivery
+and marker propagation still require an explicitly coordinated device check.
+
 > **Every action above works against a remote (`ssh://`) target**, including
 > `left_mouse_down`/`left_mouse_up`, `left_click_drag`, `scroll`, `hold_key`, and
 > all four `desktop` window/clipboard actions. Each is a real entry in
