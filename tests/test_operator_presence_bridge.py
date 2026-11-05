@@ -22,7 +22,7 @@ BRIDGE = (
 
 def test_powershell_override_condition_is_explicit_typed_and_old_peers_refuse_v2():
     source = BRIDGE.read_text()
-    assert "$condition.version -notin @(1, 2)" in source
+    assert "$condition.version -notin @(1, 2, 3)" in source
     assert "$condition.operator_presence_override -isnot [bool]" in source
     assert "$condition.operator_presence_override -ne $true" in source
     assert "$condition.operator_presence_channel -isnot [string]" in source
@@ -41,6 +41,15 @@ def test_powershell_override_condition_is_explicit_typed_and_old_peers_refuse_v2
     )
     # The pre-change bridge accepts ONLY v1: v2 cannot silently select unguarded input.
     assert "version=2" in (BRIDGE.parent / "coexistence_guard.py").read_text()
+    assert "$condition.focus_target -cne" in source
+    assert "$action -ne 'focus_window'" in source
+    assert 'throw "Focus transition requires Windows condition v3"' in source
+    focus = source.split("    'focus_window' {", 1)[1].split("    default {", 1)[0]
+    assert focus.index("::Emit([CU+INPUT[]]") < focus.index("::ActivateFocus($h)")
+    assert focus.index("::ActivateFocus($h)") < focus.index("::Emit($altUp)")
+    assert "if (-not [CU]::FocusTransition -and [CU]::IsIconic($h))" in focus
+    assert "finally {" in focus and "[CU]::Release($altUp)" in focus
+    assert "::VerifyFocus()" in focus
 
 
 def test_actual_bridge_csharp5_predicates_with_inert_native_boundaries(tmp_path):
@@ -73,6 +82,26 @@ def test_actual_bridge_csharp5_predicates_with_inert_native_boundaries(tmp_path)
     source, count = re.subn(
         r'\[DllImport\("kernel32.dll"\)\] public static extern ulong GetTickCount64\(\);',
         "public static ulong FakeTick = 10000; public static ulong GetTickCount64() { return FakeTick; }",
+        source,
+    )
+    assert count == 1
+    # Native focus calls are inert too. Restore may activate immediately, and
+    # SetForegroundWindow can refuse or land on a third window.
+    source, count = re.subn(
+        r'\[DllImport\("user32.dll"\)\] public static extern bool IsIconic\(IntPtr h\);',
+        "public static bool FakeMinimized; public static bool IsIconic(IntPtr h) { return FakeMinimized; }",
+        source,
+    )
+    assert count == 1
+    source, count = re.subn(
+        r'\[DllImport\("user32.dll"\)\] public static extern bool ShowWindow\(IntPtr h, int cmd\);',
+        "public static int Restores; public static bool ShowWindow(IntPtr h, int cmd) { Restores++; FakeObservation.foreground = h.ToString(); return true; }",
+        source,
+    )
+    assert count == 1
+    source, count = re.subn(
+        r'\[DllImport\("user32.dll"\)\] public static extern bool SetForegroundWindow\(IntPtr h\);',
+        'public static string FakeDestination = "200"; public static int Activations; public static bool SetForegroundWindow(IntPtr h) { Activations++; FakeObservation.foreground = FakeDestination; return FakeDestination == h.ToString(); }',
         source,
     )
     assert count == 1
@@ -113,6 +142,24 @@ public static class OfflineChecks {
         CU.Configure("boot/session", 10000, 1000, injection, 20);
         CU.FakeObservation = new CU.Observation { epoch="boot/session", now_ms=10100, last_input_ms=10090, foreground="window-a" };
     }
+    static void FreshFocus(bool minimized) {
+        Fresh(null);
+        CU.FakeObservation.foreground = "100"; CU.FakeDestination = "200";
+        CU.FakeMinimized = minimized;
+        CU.ConfigureOperatorPresence(Channel, 1100, "100");
+        CU.ConfigureFocus("200");
+    }
+    // Mirrors the PowerShell try/finally whose ordering is source-checked above.
+    static void FocusWithAlt() {
+        bool released = false, pressed = false;
+        try {
+            CU.Emit(new CU.INPUT[1]); pressed = true;
+            CU.ActivateFocus(new IntPtr(200));
+            CU.Emit(new CU.INPUT[1]); released = true;
+        } finally {
+            if (!released && (pressed || CU.EmissionAttempted)) CU.Release(new CU.INPUT[1]);
+        }
+    }
     public static void Main() {
         Fresh(null); Refuses(CU.Check);  // default initial aggregate change
         Fresh(9990); Refuses(CU.Check); // default >20ms post-inject change
@@ -145,6 +192,38 @@ public static class OfflineChecks {
         CU.Configure("boot/session", 10000, 1000, null, 20); Refuses(CU.Check); // no policy leakage
         Refuses(delegate { CU.Configure("", 10000, 1000, null, 20); });
         Refuses(delegate { CU.Configure("boot/session", 10000, 10001, null, 20); });
+        foreach (bool minimized in new bool[] { false, true }) {
+            FreshFocus(minimized); int restores = CU.Restores;
+            FocusWithAlt(); CU.VerifyFocus();
+            Assert(CU.Latest.foreground == "200");
+            Assert(CU.Restores == restores + (minimized ? 1 : 0));
+            Assert(CU.Injection.count == 1);
+            // Returning to the source after transition is NOT permitted.
+            CU.FakeObservation.foreground = "100"; Refuses(CU.Check);
+        }
+        FreshFocus(false); CU.FakeObservation.foreground = "200";
+        CU.ConfigureOperatorPresence(Channel, 1100, "200");
+        FocusWithAlt(); CU.VerifyFocus(); Assert(CU.Latest.foreground == "200"); // already focused
+        foreach (string destination in new string[] { "300", "0", "100", null }) {
+            FreshFocus(false); CU.FakeDestination = destination; int sends = CU.Sends;
+            Refuses(FocusWithAlt); Assert(CU.Sends == sends + 2); // down + unconditional emergency up
+        }
+        FreshFocus(true); CU.FakeObservation.foreground = "300";
+        int activations = CU.Activations; int restoreCount = CU.Restores;
+        Refuses(FocusWithAlt);
+        Assert(CU.Activations == activations && CU.Restores == restoreCount); // no early destination binding
+        FreshFocus(false); CU.FakeWall = 1100; Refuses(FocusWithAlt); // expired before down
+        FreshFocus(false); CU.Emit(new CU.INPUT[1]); CU.FakeWall = 1100;
+        Refuses(delegate { CU.ActivateFocus(new IntPtr(200)); });
+        CU.Release(new CU.INPUT[1]); // expiry does not gate emergency up
+        FreshFocus(false); CU.ActivateFocus(new IntPtr(200)); CU.FakeWall = 1100;
+        Refuses(delegate { CU.Emit(new CU.INPUT[1]); }); CU.Release(new CU.INPUT[1]);
+        FreshFocus(false); CU.ActivateFocus(new IntPtr(200)); CU.FakeCount = 0;
+        Refuses(delegate { CU.Emit(new CU.INPUT[1]); });
+        Refuses(delegate { CU.Release(new CU.INPUT[1]); }); // uncertain cleanup is not swallowed
+        FreshFocus(false); CU.ActivateFocus(new IntPtr(200)); CU.FakeObservation.epoch = "other";
+        Refuses(CU.VerifyFocus);
+        Fresh(null); Assert(!CU.FocusTransition); // no transition grant in a new request
         Console.WriteLine("CSharp5 inert bridge checks=" + checks);
     }
 }
@@ -176,4 +255,4 @@ public static class OfflineChecks {
         timeout=120,
     )
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "CSharp5 inert bridge checks=22" in result.stdout
+    assert "CSharp5 inert bridge checks=48" in result.stdout

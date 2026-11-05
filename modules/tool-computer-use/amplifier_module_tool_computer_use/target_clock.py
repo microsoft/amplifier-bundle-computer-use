@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import math
 import time
+from collections.abc import Callable
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -77,6 +78,8 @@ class TargetClockFailure(RuntimeError):
 class TargetClockExchange:
     condition: dict[str, Any]
     guard: Any = None
+    focus_target: str | None = None
+    focus_check: Callable[[], None] | None = None
     result: Any = None
     started_at: float = field(default_factory=time.monotonic)
 
@@ -90,7 +93,7 @@ class TargetClockExchange:
             "operator_presence_expires_at",
             "operator_presence_target",
         }
-        if type(version) is int and version == 2:
+        if type(version) is int and version in (2, 3):
             channel = self.condition.get("operator_presence_channel")
             expiry = self.condition.get("operator_presence_expires_at")
             target = self.condition.get("operator_presence_target")
@@ -117,6 +120,19 @@ class TargetClockExchange:
                     "operator presence override requires Windows condition v2"
                 )
             observation = TargetObservation.parse(self.condition)
+        if version == 3:
+            destination = self.condition.get("focus_target")
+            if (
+                type(destination) is not str
+                or not destination
+                or destination == "0"
+                or len(destination) > 256
+                or self.focus_target not in (None, destination)
+            ):
+                raise ValueError("invalid Windows focus transition")
+            self.focus_target = destination
+        elif "focus_target" in self.condition or self.focus_target is not None:
+            raise ValueError("Windows focus transition requires condition v3")
         if "inject_before_ms" not in self.condition:
             raise ValueError("missing Windows injection precondition")
         injection = self.condition["inject_before_ms"]
@@ -132,19 +148,35 @@ class TargetClockExchange:
         # the bridge independently checks its deadline immediately before input.
         if self.guard is not None:
             self.condition = self.guard.target_condition()
+            if self.focus_target is not None:
+                self.condition.update(version=3, focus_target=self.focus_target)
+        elif self.condition.get("version") == 3 and self.focus_target is None:
+            raise TargetClockFailure(None)  # forwarding grant is one-shot too
         return self.condition
 
     def finish(self, result: Any, *, require_injection: bool) -> None:
         self.result = result
         if self.guard is not None:
+            if self.focus_target is not None and self.focus_check is not None:
+                self.focus_check()  # caller cancellation/Stop during transport
             self.guard.accept_target_result(
                 result,
                 require_injection=require_injection,
                 transport_latency_ms=(time.monotonic() - self.started_at) * 1000.0,
+                **(
+                    {"focus_target": self.focus_target}
+                    if self.focus_target is not None
+                    else {}
+                ),
             )
+            # One successful focus consumes this invocation's transition authority.
+            self.focus_target = None
+            self.focus_check = None
             self.condition = self.guard.target_condition()
         elif not isinstance(result, dict) or not result.get("ok"):
             raise TargetClockFailure(result)
+        else:
+            self.focus_target = None
 
 
 CURRENT_TARGET_CLOCK: ContextVar[TargetClockExchange | None] = ContextVar(
@@ -153,8 +185,12 @@ CURRENT_TARGET_CLOCK: ContextVar[TargetClockExchange | None] = ContextVar(
 
 
 @contextmanager
-def target_clock_exchange(condition: dict[str, Any], guard: Any = None):
-    exchange = TargetClockExchange(condition=condition, guard=guard)
+def target_clock_exchange(
+    condition: dict[str, Any], guard: Any = None, *, focus_target: str | None = None
+):
+    exchange = TargetClockExchange(
+        condition=condition, guard=guard, focus_target=focus_target
+    )
     token = CURRENT_TARGET_CLOCK.set(exchange)
     try:
         yield exchange
@@ -162,10 +198,12 @@ def target_clock_exchange(condition: dict[str, Any], guard: Any = None):
         CURRENT_TARGET_CLOCK.reset(token)
 
 
-def guarded_target_call(guard: Any):
+def guarded_target_call(guard: Any, *, focus_target: str | None = None):
     """Old/non-Windows guard fakes need only the existing before/after API."""
     factory = getattr(guard, "target_clock_event", None)
-    return factory() if factory is not None else nullcontext()
+    if factory is None:
+        return nullcontext()
+    return factory(focus_target=focus_target) if focus_target is not None else factory()
 
 
 @contextmanager

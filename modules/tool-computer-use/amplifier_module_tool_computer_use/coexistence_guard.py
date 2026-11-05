@@ -280,6 +280,7 @@ class CoexistenceGuard:
     operator_presence_override: OperatorPresenceOverride | None = None
     _halted: bool = field(default=False, init=False)
     _halt_snapshot: PresenceSnapshot | None = field(default=None, init=False)
+    _focus_evidence: dict[str, Any] | None = field(default=None, init=False, repr=False)
     _operator_presence_override_active: bool = field(default=False, init=False)
     _bind_on_sample: bool = field(default=False, init=False)
     _diagnostics: DiagnosticLog = field(
@@ -527,19 +528,27 @@ class CoexistenceGuard:
         self.presence.record_inject()
 
     @contextmanager
-    def target_clock_event(self):
+    def target_clock_event(self, *, focus_target: str | None = None):
         """Forward this guard's checked condition only for this invocation."""
         if getattr(self.presence, "target_clock_source", None) is None:
             yield
             return
         try:
             condition = self.target_condition()
+            # Only the finite operator policy binds foreground in the Windows
+            # condition. Default/non-Windows behavior remains unchanged.
+            if focus_target is not None and condition.get("version") == 2:
+                condition.update(version=3, focus_target=focus_target)
+            else:
+                focus_target = None
         except ValueError:
             self._halt_target_failure("target_clock_unreadable")
         checkpoint(self, "condition_constructed")
         try:
-            with target_clock_exchange(condition, self) as exchange:
-                yield
+            with target_clock_exchange(
+                condition, self, focus_target=focus_target
+            ) as exchange:
+                yield exchange
                 if exchange.result is None:
                     raise TargetClockFailure(None)
                 # Ledger cleanup callbacks contain their own exceptions. Do not
@@ -591,6 +600,7 @@ class CoexistenceGuard:
         *,
         require_injection: bool,
         transport_latency_ms: float = 0.0,
+        focus_target: str | None = None,
     ) -> None:
         try:
             snap = self.presence.record_target_result(
@@ -604,6 +614,45 @@ class CoexistenceGuard:
         checkpoint(self, "receipt", result=result)
         self._notify_presence_sample(snap)
         overridden = self._presence_override_active()
+        if focus_target is not None:
+            # Bounded, payload-free result discriminator, not attribution or
+            # authority. Never expose HWNDs or arbitrary bridge exception text.
+            focused = result.get("focused")
+            observed = self.presence.target_condition().get("foreground")
+            stages = {
+                "preflight",
+                "alt_down",
+                "activate",
+                "alt_up",
+                "verify",
+                "complete",
+            }
+            stage = result.get("focus_stage")
+            self._focus_evidence = {
+                "bridge_ok": result.get("ok") is True,
+                "focused_present": "focused" in result,
+                "focused_is_string": type(focused) is str,
+                "focused_matches": focused == focus_target,
+                "observed_present": observed is not None,
+                "observed_matches": observed == focus_target,
+                "bridge_stage": stage
+                if type(stage) is str and stage in stages
+                else "unknown",
+            }
+            # Validate ordinary clock/epoch/count evidence above FIRST. A failed
+            # bridge may report the desired foreground after partial activation;
+            # that is not authority to transfer or replay.
+            self.target_condition()  # includes a fresh durable Stop/pause check
+            if (
+                not overridden
+                or self.binding.status != "bound"
+                or not require_injection
+                or result.get("ok") is not True
+                or result.get("focused") != focus_target
+                or self.presence.target_condition().get("foreground") != focus_target
+            ):
+                self._halt_target_failure("focus_transition_unverified")
+            self.binding.bind(focus_target)
         if overridden and (
             self.presence.target_condition().get("foreground")
             != self.binding.bound_target
@@ -662,6 +711,8 @@ class CoexistenceGuard:
             "paused": self.pause.is_paused,
             "target_binding": self.binding.status,
         }
+        if self._focus_evidence is not None:
+            out["focus_transition_evidence"] = dict(self._focus_evidence)
         if self.operator_presence_override is not None:
             out["operator_presence_override"] = {
                 **self.operator_presence_override.config(),

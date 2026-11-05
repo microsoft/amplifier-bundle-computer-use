@@ -31,7 +31,7 @@ from .backend import (
     WindowInfo,
     WindowList,
 )
-from .target_clock import CURRENT_TARGET_CLOCK, guarded_target_call
+from .target_clock import CURRENT_TARGET_CLOCK, TargetClockFailure, guarded_target_call
 
 logger = logging.getLogger(__name__)
 
@@ -260,6 +260,11 @@ class WindowsBackend:
             payload["_input_marker"] = self._input_marker
         exchange = CURRENT_TARGET_CLOCK.get() if action in _INPUT_ACTIONS else None
         if exchange is not None:
+            if exchange.focus_target is not None and (
+                action != "focus_window"
+                or params.get("handle") != exchange.focus_target
+            ):
+                raise TargetClockFailure(None)
             payload["target_clock_condition"] = exchange.prepare()
         with tempfile.NamedTemporaryFile(
             "w", suffix=".json", delete=False, encoding="utf-8"

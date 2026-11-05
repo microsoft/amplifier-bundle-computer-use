@@ -7,6 +7,7 @@ of time.
 from __future__ import annotations
 
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -86,6 +87,28 @@ def test_persisted_halt_to_snapshot_is_honestly_labelled(tmp_path: Path) -> None
     assert snap.basis != "idle_reconciliation"
     assert snap.margin_ms == 30.0
     assert snap.guard_ms == 5.0
+
+
+@pytest.mark.parametrize(
+    "basis", ["operator_presence_target_changed", "focus_transition_unverified"]
+)
+def test_focus_failure_persists_unknown_not_human_authorship(tmp_path, basis):
+    snapshot = replace(
+        _snapshot(),
+        state=PresenceState.UNKNOWN,
+        confidence=Confidence.LOW,
+        basis=basis,
+        margin_ms=None,
+        last_human_input_ago_ms=None,
+    )
+    record_halt(
+        "remote-ssh:windows-wsl2:owned", snapshot, reason="focus", state_dir=tmp_path
+    )
+    loaded = load_halt("remote-ssh:windows-wsl2:owned", state_dir=tmp_path)
+    assert loaded is not None
+    assert loaded.basis == basis
+    assert loaded.to_snapshot().state is PresenceState.UNKNOWN
+    assert loaded.to_snapshot().basis == f"persisted_target_clock_failure:{basis}"
 
 
 # -- separate platforms are isolated -----------------------------------------
