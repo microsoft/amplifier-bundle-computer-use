@@ -58,6 +58,7 @@ public static class CU {
         public string epoch;
         public ulong now_ms;
         public ulong last_input_ms;
+        public string foreground;
     }
     public class Emission {
         public string epoch;
@@ -106,7 +107,8 @@ public static class CU {
             if (last < 0x100000000UL) throw new InvalidOperationException("Future Windows last-input tick");
             last -= 0x100000000UL;
         }
-        return new Observation { epoch = currentEpoch, now_ms = now, last_input_ms = last };
+        return new Observation { epoch = currentEpoch, now_ms = now, last_input_ms = last,
+            foreground = GetForegroundWindow().ToString() };
     }
     public static bool Guarded;
     public static Observation Latest;
@@ -116,6 +118,27 @@ public static class CU {
     static ulong baselineNow, baselineLast;
     static ulong? injectBefore;
     static double guardMs;
+    static bool operatorPresenceOverride;
+    static double operatorExpiry, operatorDeadline;
+    static string operatorTarget;
+    static double UnixSeconds() {
+        return (DateTime.UtcNow - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalSeconds;
+    }
+    public static void ConfigureOperatorPresence(string channel, double expiry, string target) {
+        double remaining = expiry - UnixSeconds();
+        const string prefix = "remote-ssh:windows-wsl2:";
+        if (!Guarded || String.IsNullOrEmpty(channel) || !channel.StartsWith(prefix, StringComparison.Ordinal) ||
+            channel.Length <= prefix.Length || channel.Length > prefix.Length + 256 ||
+            String.IsNullOrEmpty(target) || target == "0" || target.Length > 256 ||
+            Double.IsNaN(expiry) || Double.IsInfinity(expiry) || remaining <= 0 || remaining > 3600)
+            throw new InvalidOperationException("Malformed or expired operator presence condition");
+        foreach (char ch in channel)
+            if (Char.IsControl(ch)) throw new InvalidOperationException("Malformed operator channel");
+        operatorExpiry = expiry;
+        operatorTarget = target;
+        operatorDeadline = (double)GetTickCount64() + remaining * 1000;
+        operatorPresenceOverride = true;
+    }
     static IntPtr inputMarker;
     public static void ConfigureMarker(long marker) {
         if (marker <= 0 || (IntPtr.Size == 4 && marker > Int32.MaxValue))
@@ -138,6 +161,7 @@ public static class CU {
             throw new InvalidOperationException("Malformed Windows target-clock condition");
         expectedEpoch = expected; baselineNow = now; baselineLast = last;
         injectBefore = injection; guardMs = guard; Guarded = true;
+        operatorPresenceOverride = false;
     }
     public static void Check() {
         if (!Guarded) return;
@@ -145,10 +169,17 @@ public static class CU {
         if (Latest.epoch != expectedEpoch || Latest.now_ms < baselineNow ||
             Latest.last_input_ms < baselineLast)
             throw new InvalidOperationException("Windows target-clock epoch/ticks changed");
-        if (injectBefore.HasValue) {
+        if (operatorPresenceOverride &&
+            (UnixSeconds() >= operatorExpiry || (double)GetTickCount64() >= operatorDeadline))
+            throw new InvalidOperationException("Operator presence condition expired");
+        if (operatorPresenceOverride && Latest.foreground != operatorTarget)
+            throw new InvalidOperationException("Operator presence target changed");
+        // Only this aggregate last-input predicate is overridden. Observation,
+        // epoch/regression, checked SendInput count and receipts remain mandatory.
+        if (!operatorPresenceOverride && injectBefore.HasValue) {
             if ((double)Latest.last_input_ms - (double)injectBefore.Value > guardMs)
                 throw new InvalidOperationException("Windows target-clock input precondition rejected");
-        } else if (Latest.last_input_ms != baselineLast) {
+        } else if (!operatorPresenceOverride && Latest.last_input_ms != baselineLast) {
             throw new InvalidOperationException("Windows initial input precondition rejected");
         }
     }
@@ -471,7 +502,7 @@ try {
         throw "Malformed Windows target-clock integer"
       }
     }
-    if ($condition.version -ne 1 -or $condition.epoch -isnot [string]) {
+    if ($condition.version -notin @(1, 2) -or $condition.epoch -isnot [string]) {
       throw "Malformed Windows target-clock version/epoch"
     }
     $injection = $condition.inject_before_ms
@@ -487,6 +518,25 @@ try {
     }
     [CU]::Configure($condition.epoch, $condition.now_ms, $condition.last_input_ms,
       $injection, $condition.guard_ms)
+    $operatorFields = @('operator_presence_override', 'operator_presence_channel', 'operator_presence_expires_at', 'operator_presence_target')
+    $presentOperatorFields = @($condition.PSObject.Properties.Name | Where-Object { $_ -in $operatorFields })
+    if ($condition.version -eq 2) {
+      if ($presentOperatorFields.Count -ne 4 -or
+          $condition.operator_presence_override -isnot [bool] -or
+          $condition.operator_presence_override -ne $true -or
+          $condition.operator_presence_channel -isnot [string] -or
+          $condition.operator_presence_target -isnot [string]) {
+        throw "Malformed operator presence condition"
+      }
+      $expiry = $condition.operator_presence_expires_at
+      if ($expiry -isnot [double] -and $expiry -isnot [decimal] -and
+          $expiry -isnot [int] -and $expiry -isnot [long]) {
+        throw "Malformed operator presence expiry"
+      }
+      [CU]::ConfigureOperatorPresence($condition.operator_presence_channel, $expiry, $condition.operator_presence_target)
+    } elseif ($presentOperatorFields.Count -ne 0) {
+      throw "Operator presence override requires Windows condition v2"
+    }
   }
 
   switch ($action) {

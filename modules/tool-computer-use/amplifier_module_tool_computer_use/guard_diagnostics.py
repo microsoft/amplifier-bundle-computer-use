@@ -74,7 +74,13 @@ def _valid_record(value):
         return False
     tokens = {"request_id", "tool_id", "binding_id", "guard_id", "presence_id"}
     numbers = {"unit_index", "baseline_ms", "accepted_receipts"}
-    flags = {"structured_clock", "observed_wrapper", "proof_present", "halted"}
+    flags = {
+        "structured_clock",
+        "observed_wrapper",
+        "proof_present",
+        "halted",
+        "operator_presence_override_active",
+    }
     labels = {
         "phase": _PHASES,
         "presence_state": {"quiet", "human_active", "unknown"},
@@ -243,6 +249,12 @@ class DiagnosticLog:
             "observation": _observation(fields.get("_target_observation")),
             "presence_state": state,
             "halted": halted,
+            # Cached at enforcement, NOT resampled by diagnostic_snapshot.
+            # No channel/reason or inferred authority enters this cache.
+            "operator_presence_override_active": (
+                not halted
+                and guard_fields.get("_operator_presence_override_active") is True
+            ),
             "halt_origin": _origin(halted, guard_fields.get("_halt_snapshot")),
             "receipt_status": (
                 "invalid"

@@ -47,7 +47,7 @@ from .announce_macos import DEFAULT_TIMEOUT_SECONDS as MACOS_ANNOUNCE_TIMEOUT_SE
 from .announce_macos import AnnounceError, AnnounceResult
 from .announce_macos import announce as macos_announce
 from .backend import Backend, BackendError, MonitorInfo
-from .coexistence_guard import CoexistenceGuard, HaltedError
+from .coexistence_guard import CoexistenceGuard, HaltedError, OperatorPresenceOverride
 from .exclusion import Rect
 from .geometry import Display, ImageSpace, compute_display
 from .guard_diagnostics import (
@@ -4261,10 +4261,37 @@ def _build_coexistence_guard(
       - `drive_anyway` (default `False`, \u00a77.6/D5): permits *beginning* to
         drive when a human is already detected present at guard-construction
         time. Logged when it fires. Never affects the halt invariant.
+      - `operator_presence_override`: absent by default; strict exact-channel,
+        finite remote-Windows policy (\u00a76.0a), supplied ONLY by an approved
+        trusted mount owner. Suppresses live human_active halt decisions only.
+        Does not clear existing halts or alter disclosure/permissions/Stop.
     """
     coexistence_cfg = dict(cfg.get("coexistence") or {})
+    operator_policy = None
+    if "operator_presence_override" in coexistence_cfg:
+        raw = OperatorPresenceOverride.validate(
+            coexistence_cfg["operator_presence_override"]
+        )
+        if (
+            getattr(backend, "is_remote", False) is not True
+            or backend.name != "remote-ssh:windows-wsl2"
+            or getattr(backend, "presence_platform", None) != "windows-wsl2"
+            or not getattr(backend, "user_host", None)
+        ):
+            raise ValueError(
+                "operator_presence_override supports exact remote Windows channels only"
+            )
+        operator_policy = OperatorPresenceOverride(
+            **raw,
+            channel_source=lambda: _halt_key(backend),
+            config_source=lambda: (cfg.get("coexistence") or {}).get(
+                "operator_presence_override"
+            ),
+        )
     idle_source = getattr(backend, "presence_idle_ms", None)
     if idle_source is None:
+        if operator_policy is not None:
+            raise ValueError("operator_presence_override requires presence capability")
         return None
     # Coverage-gap fix: `backend.name` is the right key for LOCAL backends
     # ("linux-x11", "macos", "windows-wsl2" - each IS its own GUARD_MS
@@ -4302,10 +4329,15 @@ def _build_coexistence_guard(
     channel_key = _channel_identity(backend)
     ledger = _get_channel_ledger(channel_key)
     target_source = getattr(backend, "current_target", None)
+    if operator_policy is not None:
+        # RemoteBackend has no current_target RPC. Bind from the fresh clock
+        # sample already required before each unit, not a separate round trip.
+        target_source = lambda: presence.target_condition().get("foreground")
     guard = CoexistenceGuard(
         presence=presence,
         release_all=lambda reason: ledger.release_all(reason=reason),
         drive_anyway=bool(coexistence_cfg.get("drive_anyway", False)),
+        operator_presence_override=operator_policy,
         target_source=target_source,
         # Defect 2 fix: consult the durable halt record on every
         # before_event(), not just once here at mount time - closes the

@@ -186,7 +186,7 @@ class RemoteBackend:
             else None
         )
         if exchange is not None:
-            args["_target_clock_condition"] = exchange.condition
+            args["_target_clock_condition"] = exchange.prepare()
         req = Request(id=next(self._ids), op=op, args=args)
         try:
             line = self._transport.send(req.encode())

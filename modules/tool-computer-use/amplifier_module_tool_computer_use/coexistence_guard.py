@@ -13,26 +13,20 @@ passes through:
         record our own injection timestamp
         sample presence -> latch human_active if detected
 
-THE HALT INVARIANT (\u00a76.0) - the load-bearing property of this whole module
----------------------------------------------------------------------------
-> A detected human halts writes before the next one - every platform, every
-> mode, and no configuration key disables it.
-
-`CoexistenceGuard.__init__` takes exactly one policy knob relevant to
-"whether to keep going": `drive_anyway` (\u00a77.6/D5), and it governs ONLY
-`check_start_permission()` - whether *this session may begin driving at all*
-when a human is already detected at construction time. It has no effect on
-`before_event()`'s halt check. There is no parameter, config key, or method on
-this class that disables `before_event()` raising `HaltedError` once
-`_halted` is set - `test_halt_invariant.py` verifies this by construction
-(inspecting `__init__`'s signature) and functionally (setting `drive_anyway`,
-detecting a human mid-session, and confirming the very next `before_event()`
-still raises).
+DEFAULT HALT INVARIANT (\u00a76.0)
+--------------------------------
+A human_active classification halts before the next write by default.
+The explicit, finite remote-Windows operator policy in \u00a76.0a suppresses
+ONLY that live classification's halt decision, never sampling or evidence
+validation. No policy clears a latched/durable halt. drive_anyway still
+affects START only. Stop, pause, binding and exclusion remain independent.
 """
 
 from __future__ import annotations
 
 import logging
+import math
+import time
 from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
@@ -65,10 +59,88 @@ logger = logging.getLogger(__name__)
 _UNSET = object()
 
 
+@dataclass(frozen=True)
+class OperatorPresenceOverride:
+    """Trusted mount policy, not authority inferred from an observation.
+
+    No public action accepts this object/configuration. The mount owner must
+    obtain operator approval separately. Both clocks bound its lifetime; a
+    wall-clock rollback cannot extend it. Removing/changing the mount config
+    or channel invalidates it, permanently for the current guard.
+    """
+
+    channel: str
+    expires_at: float
+    reason: str
+    channel_source: Callable[[], str] = field(repr=False, compare=False)
+    config_source: Callable[[], Any] = field(repr=False, compare=False)
+    wall_clock: Callable[[], float] = field(default=time.time, repr=False)
+    monotonic_clock: Callable[[], float] = field(default=time.monotonic, repr=False)
+    _deadline: float = field(init=False, repr=False)
+
+    @staticmethod
+    def validate(raw: Any) -> dict[str, Any]:
+        if type(raw) is not dict or raw.keys() != {"channel", "expires_at", "reason"}:
+            raise ValueError(
+                "operator_presence_override requires channel/expires_at/reason only"
+            )
+        channel, expiry, reason = raw["channel"], raw["expires_at"], raw["reason"]
+        if (
+            type(channel) is not str
+            or not channel.startswith("remote-ssh:windows-wsl2:")
+            or not 1 <= len(channel.removeprefix("remote-ssh:windows-wsl2:")) <= 256
+            or not channel.isprintable()
+            or type(reason) is not str
+            or not 1 <= len(reason) <= 160
+            or not reason.strip()
+            or not reason.isprintable()
+            or type(expiry) not in (int, float)
+            or not 0 < expiry < 2**53
+            or not math.isfinite(expiry)
+        ):
+            raise ValueError("invalid operator_presence_override types/scope")
+        return dict(raw)
+
+    def __post_init__(self) -> None:
+        self.validate(self.config())
+        now, mono = self.wall_clock(), self.monotonic_clock()
+        if (
+            not math.isfinite(now)
+            or not math.isfinite(mono)
+            or not 0 < self.expires_at - now <= 3600
+            or self.channel_source() != self.channel
+        ):
+            raise ValueError(
+                "operator_presence_override needs exact channel and future expiry <=3600s"
+            )
+        object.__setattr__(self, "_deadline", mono + self.expires_at - now)
+
+    def config(self) -> dict[str, Any]:
+        return {
+            "channel": self.channel,
+            "expires_at": self.expires_at,
+            "reason": self.reason,
+        }
+
+    def active(self) -> bool:
+        try:
+            now, mono = self.wall_clock(), self.monotonic_clock()
+            return (
+                math.isfinite(now)
+                and math.isfinite(mono)
+                and now < self.expires_at
+                and mono < self._deadline
+                and self.channel_source() == self.channel
+                and self.validate(self.config_source()) == self.config()
+            )
+        except Exception:  # noqa: BLE001 - broken/revoked policy fails closed
+            return False
+
+
 class HaltedError(RuntimeError):
     """Raised by `before_event()` once a human has been detected (\u00a76.0).
 
-    Unconditional: no config key, constructor argument, or opt-out reaches
+    Once latched, no config key, constructor argument, or opt-out clears
     this raise. The only way past it is a human clearing the halt through the
     one channel that requires nothing of the controller at all - restarting a
     fresh driving session after they choose to (\u00a713, D3: resume is manual
@@ -205,14 +277,47 @@ class CoexistenceGuard:
     exclusion: ExclusionZone = field(default_factory=ExclusionZone)
     binding: TargetBinding = field(default_factory=TargetBinding)
     drag: DragState = field(default_factory=DragState)
+    operator_presence_override: OperatorPresenceOverride | None = None
     _halted: bool = field(default=False, init=False)
     _halt_snapshot: PresenceSnapshot | None = field(default=None, init=False)
+    _operator_presence_override_active: bool = field(default=False, init=False)
+    _bind_on_sample: bool = field(default=False, init=False)
     _diagnostics: DiagnosticLog = field(
         default_factory=DiagnosticLog, init=False, repr=False, compare=False
     )
 
     def __post_init__(self) -> None:
+        policy = self.operator_presence_override
+        if policy is not None:
+            if (
+                type(policy) is not OperatorPresenceOverride
+                or self.presence.platform != "windows-wsl2"
+                or self.presence.target_clock_source is None
+                or self.target_source is None
+            ):
+                raise ValueError(
+                    "operator presence override requires structured Windows clock and target binding"
+                )
+            self._operator_presence_override_active = policy.active()
+            if not self._operator_presence_override_active:
+                raise ValueError("operator presence override is inactive")
+            logger.warning(
+                "coexistence: OPERATOR PRESENCE OVERRIDE channel=%r expires_at=%s reason=%r; "
+                "live human_active remains reported, not proof of authorship; Stop/pause remain enforced",
+                policy.channel,
+                policy.expires_at,
+                policy.reason,
+            )
         checkpoint(self, "guard_created")
+
+    def _presence_override_active(self) -> bool:
+        policy = self.operator_presence_override
+        if policy is None:
+            return False
+        self._operator_presence_override_active = not self._halted and policy.active()
+        if not self._operator_presence_override_active and not self._halted:
+            self._halt_target_failure("operator_presence_override_expired_or_revoked")
+        return self._operator_presence_override_active
 
     # -- target binding convenience (\u00a78.6) -----------------------------------
     def bind_target(self) -> None:
@@ -221,10 +326,13 @@ class CoexistenceGuard:
         `target_source` was supplied - `TargetBinding.check()` is then a
         no-op, matching \u00a78.6's "where binding cannot be enforced, it must
         be declared" rather than silently pretending to enforce it)."""
-        if self.target_source is not None:
+        if self.operator_presence_override is not None:
+            self._bind_on_sample = True
+        elif self.target_source is not None:
             self.binding.bind(self.target_source())
 
     def release_target(self) -> None:
+        self._bind_on_sample = False
         self.binding.release()
 
     # -- start permission (D5, \u00a77.6) - governs BEGINNING to drive only ------
@@ -232,8 +340,17 @@ class CoexistenceGuard:
         """Call once, before the first write of a session. Raises
         `HaltedError` if a human is already detected AND `drive_anyway` is
         False. This is the ONLY method `drive_anyway` affects - it never
-        reaches `before_event()`'s halt check (\u00a76.0 is unconditional)."""
-        if self.presence.state is PresenceState.HUMAN_ACTIVE and not self.drive_anyway:
+        reaches `before_event()`'s halt check. The separate finite operator
+        policy (\u00a76.0a) applies to START and continuing live classifications."""
+        self._poll_durable_halt()
+        if self._halted:
+            assert self._halt_snapshot is not None
+            self.release_all("halted")
+            raise HaltedError(self._halt_snapshot)
+        overridden = self._presence_override_active()
+        if self.presence.state is PresenceState.HUMAN_ACTIVE and not (
+            self.drive_anyway or overridden
+        ):
             assert self.presence.last_snapshot is not None
             raise HaltedError(self.presence.last_snapshot)
         if self.presence.state is PresenceState.HUMAN_ACTIVE and self.drive_anyway:
@@ -297,6 +414,7 @@ class CoexistenceGuard:
                 self.release_all("halted")
             assert self._halt_snapshot is not None
             raise HaltedError(self._halt_snapshot)
+        self._presence_override_active()
         try:
             snap = self.presence.sample()
         except IdleUnreadableError:
@@ -305,7 +423,9 @@ class CoexistenceGuard:
             raise
         checkpoint(self, "before_next_write")
         self._notify_presence_sample(snap)
-        if snap.state is PresenceState.HUMAN_ACTIVE:
+        # Recheck after a potentially slow sample; expiry is not quiet.
+        overridden = self._presence_override_active()
+        if snap.state is PresenceState.HUMAN_ACTIVE and not overridden:
             self._halted = True
             self._halt_snapshot = snap
         if self._halted:
@@ -321,12 +441,21 @@ class CoexistenceGuard:
         if coord is not None:
             excluded = self.exclusion.contains(coord[0], coord[1])
             if excluded is not None:
+                if overridden:
+                    with without_target_clock():
+                        self.release_all("excluded")
                 raise ExcludedCoordinateError(excluded, coord[0], coord[1])
         resolved_target = (
             self.target_source()
             if current_target is _UNSET and self.target_source is not None
             else (None if current_target is _UNSET else current_target)
         )
+        if overridden:
+            if resolved_target in (None, "", "0"):
+                self._halt_target_failure("operator_presence_target_unverified")
+            if self._bind_on_sample or self.binding.status == "not_bound":
+                self.binding.bind(resolved_target)
+                self._bind_on_sample = False
         try:
             self.binding.check(resolved_target)  # type: ignore[arg-type]
         except TargetChangedError:
@@ -364,6 +493,7 @@ class CoexistenceGuard:
         it can only ever add a halt, never remove one.
         """
         self._halted = True
+        self._operator_presence_override_active = False
         self._halt_snapshot = snapshot
         checkpoint(self, "halt")
 
@@ -403,7 +533,7 @@ class CoexistenceGuard:
             yield
             return
         try:
-            condition = self.presence.target_condition()
+            condition = self.target_condition()
         except ValueError:
             self._halt_target_failure("target_clock_unreadable")
         checkpoint(self, "condition_constructed")
@@ -423,6 +553,38 @@ class CoexistenceGuard:
             # receipt, and never allow a retry to hide uncertain input.
             self._halt_target_failure("target_clock_unacknowledged")
 
+    def target_condition(self) -> dict[str, Any]:
+        """Rebuild invocation condition after receipts and before forwarding."""
+        self._poll_durable_halt()
+        if self._halted:
+            with without_target_clock():
+                self.release_all("halted")
+            assert self._halt_snapshot is not None
+            raise HaltedError(self._halt_snapshot)
+        overridden = self._presence_override_active()
+        condition = self.presence.target_condition()
+        if overridden:
+            # Preserve the pause check without adding a sample or binding RPC.
+            # Existing before_event checks retain target binding per unit.
+            try:
+                self.pause.check()
+            except PausedError:
+                with without_target_clock():
+                    self.release_all("operator_condition_aborted")
+                raise
+            policy = self.operator_presence_override
+            assert policy is not None
+            if self.binding.status != "bound":
+                self._halt_target_failure("operator_presence_target_unverified")
+            condition.update(
+                version=2,  # Old bridges refuse BEFORE input; no fallback.
+                operator_presence_override=True,
+                operator_presence_channel=policy.channel,
+                operator_presence_expires_at=policy.expires_at,
+                operator_presence_target=self.binding.bound_target,
+            )
+        return condition
+
     def accept_target_result(
         self,
         result: Any,
@@ -441,7 +603,13 @@ class CoexistenceGuard:
             self._halt_target_failure("target_clock_unreadable")
         checkpoint(self, "receipt", result=result)
         self._notify_presence_sample(snap)
-        if snap.state is PresenceState.HUMAN_ACTIVE:
+        overridden = self._presence_override_active()
+        if overridden and (
+            self.presence.target_condition().get("foreground")
+            != self.binding.bound_target
+        ):
+            self._halt_target_failure("operator_presence_target_changed")
+        if snap.state is PresenceState.HUMAN_ACTIVE and not overridden:
             self.seed_halted(snap)
         elif result.get("ok") is not True:
             self._halt_target_failure("target_precondition_rejected")
@@ -494,6 +662,12 @@ class CoexistenceGuard:
             "paused": self.pause.is_paused,
             "target_binding": self.binding.status,
         }
+        if self.operator_presence_override is not None:
+            out["operator_presence_override"] = {
+                **self.operator_presence_override.config(),
+                "active": not self._halted and self.operator_presence_override.active(),
+                "authority_verified": False,
+            }
         if snap is not None:
             out["presence"] = snap.to_dict()
         return out

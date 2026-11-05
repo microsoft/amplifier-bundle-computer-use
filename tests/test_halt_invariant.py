@@ -1,18 +1,9 @@
-"""The halt invariant (`docs/designs/coexistence.md` \u00a76.0):
+"""Default halt invariant and intentional operator policy revision (\u00a76.0a).
 
-> A detected human halts writes before the next one - every platform, every
-> mode, and no configuration key disables it.
-
-This test file exists to prove exactly that property, two ways:
-
-1. **By construction** - inspect `CoexistenceGuard.__init__`'s signature and
-   confirm there is no parameter whose name or documented purpose is "disable
-   the halt". `drive_anyway` exists (\u00a77.6/D5) but is proven, functionally, to
-   affect only whether driving may *begin* - never whether a detected human
-   stops it.
-2. **Functionally** - construct a guard with every combination of
-   `drive_anyway`, detect a human mid-session, and confirm `before_event()`
-   still raises `HaltedError` regardless.
+Human classification halts by default. drive_anyway still affects START only.
+The sole explicit policy exception is default None, scoped and finite; its
+functional contract is in test_operator_presence_override.py. It never clears
+a latched halt. No blanket disabling parameter is accepted.
 """
 
 from __future__ import annotations
@@ -62,7 +53,7 @@ def _detect_human(guard: CoexistenceGuard, clock: FakeClock) -> None:
 # -- 1. by construction: no disabling parameter exists ----------------------
 
 
-def test_init_signature_has_no_halt_disabling_parameter():
+def test_init_signature_has_only_the_explicit_default_off_operator_exception():
     params = set(inspect.signature(CoexistenceGuard.__init__).parameters)
     # The only names ever allowed to exist here are the ones this test
     # enumerates and accepts BY NAME - anything else added later must be
@@ -72,6 +63,8 @@ def test_init_signature_has_no_halt_disabling_parameter():
         "presence",
         "release_all",
         "drive_anyway",
+        # Intentional operator-approved policy change, not a boolean bypass.
+        "operator_presence_override",
         "target_source",
         # Defect 2 fix: consulted every before_event() call for a durable,
         # cross-session halt record - can only ever ESCALATE via
@@ -89,8 +82,14 @@ def test_init_signature_has_no_halt_disabling_parameter():
     }
     assert params <= allowed, (
         f"CoexistenceGuard.__init__ gained new parameter(s) {params - allowed} - "
-        "verify none of them can disable the \u00a76.0 halt invariant before adding "
+        "review against the default invariant and narrow \u00a76.0a exception before adding "
         "them to `allowed` here"
+    )
+    assert (
+        inspect.signature(CoexistenceGuard)
+        .parameters["operator_presence_override"]
+        .default
+        is None
     )
     # None of the allowed names read as a halt disable/override.
     forbidden_substrings = ("disable_halt", "skip_halt", "ignore_human", "no_halt")

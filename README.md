@@ -265,6 +265,13 @@ tools:
       max_edge: 1280              # long edge of the image the model sees
       enable_zoom: true
       read_only: false            # true = screenshots only, all input blocked
+      # Default absent. ONLY a trusted mount owner with explicit operator approval
+      # may add a finite remote-Windows policy; this does not authorize itself.
+      # coexistence:
+      #   operator_presence_override:
+      #     channel: remote-ssh:windows-wsl2:user@host  # exact halt key, port if nondefault
+      #     expires_at: <absolute Unix seconds, future and <=3600s from mount>
+      #     reason: approved unattended trial
       # Model/native wire settings belong in the provider, not this module.
 
 hooks:
@@ -331,7 +338,7 @@ Four distinct mechanisms. Be clear which one you are relying on:
 |---|---|---|
 | `read_only: true` | Code | **Enforced.** Every mutating action rejected in `execute()` before anything reaches the desktop. Screenshots still work. |
 | Write gate (`gate_writes`) | Code + human | **Enforced.** Per-action `ask_user` approval, default **deny**, across 15 mutating actions. On by default for a remote, non-read-only target. |
-| Presence guard / halt | Code | **Enforced and unconditional.** Halts before the next write the moment a human is detected at the machine. No config key can disable the halt once a guard exists; the halt is durable across sessions and cleared only by a human running `scripts/resume_after_halt.py`. |
+| Presence guard / halt | Code | **Enforced by default.** `human_active` halts before the next write. The default-off finite exact-channel remote-Windows operator policy below suppresses only that live classification's halt decision. Existing/durable halts still require explicit resume via `scripts/resume_after_halt.py` and a fresh guard. |
 | Stop Conditions in `agents/computer-operator.md` | Prompt | **Model judgment.** Nothing inspects the screen or blocks an action. |
 
 The agent is instructed to stop and ask when it sees credential prompts, CAPTCHAs,
@@ -347,6 +354,23 @@ does not remove the platform's existing guard-band masking. Missing, mismatched 
 receipts latch an **unknown safety-evidence halt**, not proof of human activity, and never
 authorize replay. Failed emergency releases retain their cleanup obligation. Historical
 halt records without the newer basis field retain their original interpretation.
+
+**`coexistence.operator_presence_override` is a deliberate policy exception**, not
+`drive_anyway` (START only) or `enabled:false` (disclosure only). The strict mapping
+above accepts only `channel`, finite numeric `expires_at`, and a printable nonempty
+`reason` (maximum 160 characters). Wrong channels, unsupported backends, booleans,
+extra keys and expired/over-one-hour deadlines are refused. Wall and monotonic
+deadlines apply; removing/changing the trusted mount mapping revokes it. An observed
+expiry/revocation halts and releases, never silently resumes.
+
+Presence samples/classification remain visible, not proof of input authorship.
+UNKNOWN/invalid/lost/rejected receipts, epoch/tick checks, target binding, exclusion,
+locked-session checks, permissions, disclosure, pause, Cancel, Stop and cleanup
+remain enforced. The Windows bridge uses a checked v2 invocation condition so old
+v1-only bridges refuse before input; there is no unconditioned fallback. Operator
+labels do not prove approval; screens/files/actions cannot grant this authority.
+See [the intentional contract revision §6.0a](docs/designs/coexistence.md#60a-intentional-policy-revision--finite-operator-presence-override)
+for exact scope, in-flight limits and offline-versus-device qualification.
 
 **`unattended_writes_ok` is a deliberate opt-out, not a convenience toggle.** With no TTY,
 the write gate denies rather than crashing on an unanswerable prompt. Setting
