@@ -87,7 +87,7 @@ apply safe auto-fixes, before committing.
 ### The ship gate
 
 `scripts/verify_coexistence.py` defaults to **conditional Linux boundary qualification**
-under policy `coexistence-boundary-v2` (2026-11-04), not a universal physical-input
+under policy `coexistence-boundary-v3` (2026-11-04), not a universal physical-input
 safety claim. Read `docs/designs/coexistence.md` §11.1 before interpreting it.
 Focused headless tests exercise the maintained classifier/guard and harness logic:
 
@@ -105,9 +105,11 @@ timeout 90s .venv/bin/python scripts/verify_coexistence.py --mode boundary \
   --display "$OWNED_TEST_DISPLAY" --output coexistence-boundary-NEW.json
 ```
 
-Six predeclared controls run at most once: 6 s quiet typing; nominal 2 ms inside;
-nominal 8/15/55 ms outside; and a forced post-sample/pre-write barrier. Allow roughly
-22 seconds plus native setup. The 60 ms interval is the **O5 reference cadence**,
+Five **required** controls run at most once: 6 s quiet typing; nominal 2 ms inside;
+and nominal 8/15/55 ms outside. A forced post-sample/pre-write barrier runs once
+as a **separate diagnostic**, not a sixth required mechanism control. Allow roughly
+22 seconds plus native setup. These are future harness instructions, not authority
+to resume a stopped native campaign. The 60 ms interval is the **O5 reference cadence**,
 not built-in production pacing. One independent XTEST child acknowledges readiness
 and each event, with matching IDs and send-before/sync-after monotonic intervals.
 Each case needs a fresh finite `QUIET`/high-confidence baseline above the quiet floor.
@@ -148,8 +150,8 @@ This brackets last input in server milliseconds as `[S0 − idle, S1 − idle]`,
 including the idle query **inside each actual production monitor sample**.
 Every acknowledged own unit also needs a separate bracketed raw idle query,
 without sampling/updating the monitor. The last delivered event's server timestamp
-must lie in this bracket, which must be later than preceding competing input; same-tick
-or otherwise ambiguous attribution is `INVALID`. Low-32-bit event timestamps are
+must lie in this bracket, which must be later than preceding competing input;
+ambiguous attribution in a **required** control remains `INVALID`. Low-32-bit event timestamps are
 unwrapped relative to the 64-bit server counter, never Python time. Regressing,
 broken, noninteger, missing or wrap-ambiguous evidence refuses qualification;
 there is no clock fallback or extra quantisation allowance.
@@ -159,8 +161,22 @@ the production injection anchor; sleep requests and server-to-Python inversion d
 not. This checks delivery plus idle-counter registration, not typed text, physical
 origin or general display semantics. Extra queries add harness overhead, not
 production changes. Proven outside-band quiet responses remain **FAIL**, even if
-later own registration fails. Unresolvable barrier advancement stays `INVALID`.
+later own registration fails.
 No retry, delay adjustment or latency fallback rescues an unplaceable 2 ms control.
+
+The artificial barrier's own pair can share the child's exact server tick.
+Only when both complete, correctly matched native batches, prior observations,
+child registration, counter consistency and independent monotonic ordering are
+valid may that diagnostic report `status: LIMIT` /
+`attribution: ATTRIBUTION_UNRESOLVED`. Its own counter bracket must equal the
+shared timestamp and exclude the pre-child observation; it cannot prove a
+**distinct reset**. The own counter is **not** marked corroborated. The diagnostic
+ends immediately, without another write to clear the ambiguity. This is not a
+catch-all for counter/receiver faults, missing/malformed/replayed input, or wider
+ambiguous intervals: those remain `INVALID`, making the run `UNQUALIFIED`.
+A completed diagnostic with distinct reset evidence reports `OBSERVED` /
+`ATTRIBUTION_RESOLVED`, not a required-control `PASS`. Safe detection in its
+follow-up is allowed; neither detection nor masking is prescribed.
 
 Quiet timing starts at the first acknowledged emission, not the first call's
 start. Each next unit is scheduled from the preceding acknowledgement: at least
@@ -178,11 +194,23 @@ an omitted first release. Invalid/straddling/missing evidence is retained, never
 retried or replaced. The first failure stops the run. The barrier is artificial,
 not a measurement of the natural race. An inside event may be masked or detected.
 
-The new JSON receipt binds schema `coexistence-qualification-v1`, policy, run ID,
-source hashes and bounded case timelines. Existing paths are refused before input.
-Exit 0 / `MECHANISM_CONTROLS_PASS` qualifies only these Linux controls, not adoption
-or general safety. A generic `PASS` is not a valid successful top-level verdict.
-Exit 2 / `UNQUALIFIED` does not qualify them.
+The additive JSON receipt retains schema `coexistence-qualification-v1`, policy,
+run ID, source hashes and bounded timelines. `required_case_ids` and
+`diagnostic_case_ids` declare the split: `cases` contains only required results;
+`diagnostics` contains the artificial barrier. `required_controls_status: PASS`
+reports all five required results independently, not overall acceptance.
+`diagnostic_status` is `OBSERVED`, `LIMIT`, or `UNQUALIFIED` (including not reached).
+Existing paths are refused before input.
+
+Exit 0 / `MECHANISM_CONTROLS_PASS` requires all five required controls passing,
+the diagnostic either validly observed or narrowly attribution-unresolved, and
+successful cleanup. It qualifies only the five Linux mechanism controls, not
+all six cases, universal input detection, adoption or general safety. A generic
+`PASS` is not a successful top-level verdict. Any required `FAIL`/`INVALID`,
+diagnostic safety failure, other invalid/unknown diagnostic evidence or cleanup
+failure gives exit 2 / `UNQUALIFIED`, even with five passing required results.
+Every observed-activity halt/release/refusal rule applies **unconditionally** to
+the diagnostic; no diagnostic label can conceal a safety failure.
 An external interruption can leave `INCOMPLETE` or a partial/unreadable final
 receipt; neither qualifies or authorizes automatic replay. Native child/connection
 cleanup is owned by independent finally paths: child close/reap, restore saved
@@ -207,6 +235,15 @@ old ±1 ms inverse interval end 0.432571 ms before emission. This invalidates
 that registration assumption, not production safety. The installed Xvfb clock
 choice was not traced. Policy v2 does not relabel this attempt or the 89/100.
 See §11.1 for pinned Xorg semantics and the headless numeric regression.
+
+Main's later retained run at **`7ea71f2` remains overall `UNQUALIFIED` / exit 2**:
+101 quiet units spanned 6.14 s and quiet/inside/8/15/55 ms controls passed, but
+the barrier's child motion and own release shared server timestamp `291045271`
+and the same last-input bracket. That does not prove a distinct reset or an
+observed-input halt violation. Policy v3 separates this diagnostic limitation
+for future receipts; it does **not** relabel that run or any prior `FAIL`,
+`INVALID`, `UNKNOWN` or incomplete evidence. The native campaign remains stopped;
+this revision adds only offline tests, not a new native acceptance claim.
 
 Optional **offline analysis only**, with a new receipt:
 

@@ -379,15 +379,15 @@ def test_integer_tick_full_controls_include_registration_and_fresh_sample(rig, c
 
 
 @pytest.mark.parametrize("unit_s", [0.00001, 0.0004])
-def test_integer_tick_barrier_ambiguous_advancement_stays_invalid(rig, unit_s):
+def test_integer_tick_barrier_shared_tick_is_diagnostic_limit(rig, unit_s):
     clock, _, _ = rig
     backend = IntegerTickBackend(clock)
     backend.unit_s = unit_s
     child = Child(backend)
     result = verify._run_case("post-sample", backend, child)
-    assert result["status"] == "INVALID"
-    assert "own counter registration" in result["reason"]
-    assert child.calls == 1
+    assert result["status"] == "LIMIT", result
+    assert result["attribution"] == "ATTRIBUTION_UNRESOLVED"
+    assert child.calls == 1 and len(backend.writes) == 2
 
 
 @pytest.mark.parametrize("case", ["quiet", "inside-2ms", "outside-15ms", "post-sample"])
@@ -1043,7 +1043,10 @@ def test_actual_monitor_idle_query_is_between_same_connection_server_reads(
 
 
 @pytest.mark.parametrize("failure", ["oracle", "child-close", "receiver-close"])
-def test_cleanup_paths_independent_and_cannot_qualify(rig, monkeypatch, failure):
+@pytest.mark.parametrize("diagnostic_status", ["OBSERVED", "LIMIT"])
+def test_cleanup_paths_independent_and_cannot_qualify(
+    rig, monkeypatch, failure, diagnostic_status
+):
     from amplifier_module_tool_computer_use import linux_x11
 
     _, backend, child = rig
@@ -1052,7 +1055,13 @@ def test_cleanup_paths_independent_and_cannot_qualify(rig, monkeypatch, failure)
     monkeypatch.setattr(
         verify,
         "_run_case",
-        lambda case, *_args: {"case": case, "status": "PASS"},
+        lambda case, *_args: {
+            "case": case,
+            "status": diagnostic_status if case == "post-sample" else "PASS",
+            "attribution": "ATTRIBUTION_RESOLVED"
+            if diagnostic_status == "OBSERVED"
+            else "ATTRIBUTION_UNRESOLVED",
+        },
     )
     if failure == "oracle":
         monkeypatch.setattr(
@@ -1117,7 +1126,7 @@ def test_exact_guard_boundary_uses_production_classifier_and_guard(
 def test_each_predeclared_control_once_with_production_objects(rig, case):
     _, backend, child = rig
     result = verify._run_case(case, backend, child)
-    assert result["status"] == "PASS", result
+    assert result["status"] == ("OBSERVED" if case == "post-sample" else "PASS"), result
     assert child.calls == (0 if case == "quiet" else 1)
     if case.startswith("outside"):
         assert result["placement"] == "OUTSIDE"
@@ -1506,13 +1515,262 @@ def test_own_counter_read_does_not_sample_monitor_and_remains_bounded(rig):
     assert child.calls == 0
 
 
-def test_barrier_own_advance_unresolvable_at_counter_quantisation_is_invalid(rig):
+def test_barrier_own_advance_shared_tick_has_no_registration_claim(rig):
     _, backend, child = rig
     backend.unit_s = 0.00001
     result = verify._run_case("post-sample", backend, child)
-    assert result["status"] == "INVALID"
-    assert "own counter registration" in result["reason"]
+    assert result["status"] == "LIMIT"
+    assert not result["timeline"][-1]["own_counter"].get("corroborated")
     assert child.calls == 1
+
+
+@pytest.fixture
+def shared_barrier(rig):
+    clock, _, _ = rig
+    # Numeric server-tick pattern from Main; no private receipt or native run.
+    # Child motion and next own release both carry 291045271.
+    clock.ns = 291045211_100_000
+    backend = IntegerTickBackend(clock)
+    backend.unit_s = 0.00001
+    backend.receiver = RawReceiver()
+    return backend, Child(backend), Oracle(backend)
+
+
+def test_exact_shared_tick_is_separate_diagnostic_without_extra_write(shared_barrier):
+    backend, child, oracle = shared_barrier
+    result = verify._run_case("post-sample", backend, child, oracle)
+    assert result["category"] == "diagnostic"
+    assert result["status"] == "LIMIT", result
+    assert result["attribution"] == "ATTRIBUTION_UNRESOLVED"
+    assert result["attribution_evidence"] == {"shared_server_ms": 291045271}
+    row = result["timeline"][-1]
+    assert row["delivery"][-1]["server_ms"] == 291045271
+    assert verify._server_interval(row["own_counter"]) == (291045271, 291045271)
+    assert not row["own_counter"].get("corroborated")
+    assert "event_server_ms" not in row["own_counter"]
+    assert len(backend.writes) == 2 and len(result["timeline"]) == 3
+    assert child.calls == 1 and oracle.previous == 291045271
+    assert result["detected"] is False
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "missing-pair",
+        "wrong-key",
+        "foreign-window",
+        "SendEvent",
+        "extra",
+        "replay",
+        "bad-clock",
+        "backwards-clock",
+        "noninteger-idle",
+        "receiver-error",
+        "bad-child",
+        "child-not-registered",
+        "prior-observation",
+        "bad-order",
+        "wrong-stamp",
+        "broad-bracket",
+        "observed-activity",
+    ],
+)
+def test_diagnostic_errors_are_not_shared_tick_limits(
+    shared_barrier, monkeypatch, fault
+):
+    backend, child, oracle = shared_barrier
+    add = backend.receiver.add
+
+    def faulty_add(kind, timestamp, **kwargs):
+        is_second = len(backend.writes) == 2
+        if is_second and fault == "missing-pair":
+            return
+        add(kind, timestamp, **kwargs)
+        event = backend.receiver.conn.queue[-1]
+        if is_second:
+            if fault == "wrong-key":
+                event.detail = 39
+            elif fault == "foreign-window":
+                event.window.id = 100
+            elif fault == "SendEvent":
+                event.send_event = True
+            elif fault == "extra" and kind == 3:
+                add(3, timestamp, **kwargs)
+            elif fault == "wrong-stamp":
+                event.time = timestamp - 1
+            elif fault == "replay":
+                oracle.last_ordinal = 9
+        elif kind == 6 and fault == "bad-child":
+            event.event_x += 1
+
+    monkeypatch.setattr(backend.receiver, "add", faulty_add)
+    idle_read = backend.presence_idle_ms
+    clock_read = oracle.clock.read
+    reads = 0
+
+    def bad_clock():
+        nonlocal reads
+        if len(backend.writes) == 2:
+            reads += 1
+            if fault == "bad-clock":
+                raise verify.InvalidCase("server read failed")
+            if fault == "backwards-clock":
+                return backend.server_now() + (1 if reads == 1 else 0)
+            if fault == "broad-bracket":
+                return backend.server_now() + (0 if reads == 1 else 1)
+        return clock_read()
+
+    monkeypatch.setattr(oracle.clock, "read", bad_clock)
+    monkeypatch.setattr(
+        backend,
+        "presence_idle_ms",
+        lambda: (
+            0.5
+            if fault == "noninteger-idle" and len(backend.writes) == 2
+            else idle_read()
+        ),
+    )
+    drain = backend.receiver._drain
+
+    def bad_drain():
+        if fault == "receiver-error" and len(backend.writes) == 2:
+            raise OSError("receiver unreadable")
+        return drain()
+
+    monkeypatch.setattr(backend.receiver, "_drain", bad_drain)
+    confirm_own = verify._confirm_own
+
+    def corrupt_retained(backend, result, oracle, batch):
+        if len(backend.writes) == 2:
+            if fault == "prior-observation":
+                result["timeline"][-1]["snapshot"]["last_human_input_ago_ms"] += 1
+            elif fault == "bad-order":
+                result["human"]["sync_after_ns"] = (
+                    result["timeline"][-1]["emit_after_ns"] + 1
+                )
+            elif fault == "child-not-registered":
+                result["event_counter"]["corroborated"] = False
+            elif fault == "observed-activity":
+                result["timeline"][-1]["snapshot"]["state"] = "human_active"
+        return confirm_own(backend, result, oracle, batch)
+
+    monkeypatch.setattr(verify, "_confirm_own", corrupt_retained)
+    result = verify._run_case("post-sample", backend, child, oracle)
+    assert result["status"] in ("INVALID", "FAIL"), result
+    assert result.get("attribution") != "ATTRIBUTION_UNRESOLVED"
+    assert len(backend.writes) <= 2 and child.calls == 1
+
+
+@pytest.mark.parametrize("fault", ["ordinary-input", "release", "refusal"])
+def test_diagnostic_safety_failures_override_observation_labels(
+    rig, monkeypatch, fault
+):
+    _, backend, child = rig
+    classify = PresenceMonitor._classify
+    samples = 0
+
+    def active_followup(self, margin, idle):
+        nonlocal samples
+        samples += 1
+        if samples == 4:  # after the artificial barrier, safe earlier detection
+            return PresenceState.HUMAN_ACTIVE, Confidence.HIGH
+        return classify(self, margin, idle)
+
+    monkeypatch.setattr(PresenceMonitor, "_classify", active_followup)
+    instrument = verify._instrument
+
+    def broken_instrument(*args):
+        presence, guard, tracked, arm = instrument(*args)
+        if fault == "release":
+            guard.release_all = lambda reason: []
+        return presence, guard, tracked, arm
+
+    monkeypatch.setattr(verify, "_instrument", broken_instrument)
+    type_text = backend.type_text
+
+    def broken(text, guard):
+        try:
+            return type_text(text, guard)
+        except HaltedError:
+            if fault == "ordinary-input":
+                backend.receiver.add(4, backend.server_now(), detail=1)
+                backend.receiver.add(5, backend.server_now(), detail=1)
+            elif fault == "refusal" and samples >= 4 and len(backend.writes) == 2:
+                return  # suppress the halt without returning after_event
+            raise
+
+    monkeypatch.setattr(backend, "type_text", broken)
+    result = verify._run_case("post-sample", backend, child)
+    assert result["status"] == "FAIL", result
+    assert result.get("attribution") != "ATTRIBUTION_UNRESOLVED"
+
+
+@pytest.mark.parametrize(
+    "diagnostic",
+    [
+        ("OBSERVED", "ATTRIBUTION_RESOLVED", True),
+        ("LIMIT", "ATTRIBUTION_UNRESOLVED", True),
+        ("INVALID", None, False),
+        ("FAIL", None, False),
+        ("UNKNOWN", None, False),
+        ("PASS", None, False),
+        ("LIMIT", None, False),
+    ],
+)
+def test_boundary_separates_required_controls_and_diagnostic(
+    rig, monkeypatch, diagnostic
+):
+    from amplifier_module_tool_computer_use import linux_x11
+
+    _, backend, child = rig
+    monkeypatch.setattr(linux_x11, "LinuxX11Backend", lambda config: backend)
+    monkeypatch.setattr(verify, "EventChild", lambda display: child)
+    status, attribution, qualifies = diagnostic
+    seen = []
+
+    def run(case, *args):
+        seen.append(case)
+        return {
+            "case": case,
+            "status": status if case == "post-sample" else "PASS",
+            "attribution": attribution,
+        }
+
+    monkeypatch.setattr(verify, "_run_case", run)
+    report = {}
+    verify._run_boundary(report, ":fake-only")
+    assert seen == list(verify.CASES)
+    assert len(report["cases"]) == 5 and len(report["diagnostics"]) == 1
+    assert report["required_controls_status"] == "PASS"
+    assert report["status"] == (
+        verify.MECHANISM_CONTROLS_PASS if qualifies else "UNQUALIFIED"
+    )
+    assert report["diagnostic_status"] == (status if qualifies else "UNQUALIFIED")
+
+
+@pytest.mark.parametrize("case", verify.REQUIRED_CASES)
+@pytest.mark.parametrize("status", ["INVALID", "FAIL"])
+def test_required_failure_cannot_be_hidden_by_diagnostic(
+    rig, monkeypatch, case, status
+):
+    from amplifier_module_tool_computer_use import linux_x11
+
+    _, backend, child = rig
+    seen = []
+    monkeypatch.setattr(linux_x11, "LinuxX11Backend", lambda config: backend)
+    monkeypatch.setattr(verify, "EventChild", lambda display: child)
+
+    def run(current, *args):
+        seen.append(current)
+        return {"case": current, "status": status if current == case else "PASS"}
+
+    monkeypatch.setattr(verify, "_run_case", run)
+    report = {}
+    verify._run_boundary(report, ":fake-only")
+    assert seen[-1] == case and "post-sample" not in seen
+    assert report["status"] == "UNQUALIFIED"
+    assert report["required_controls_status"] == "UNQUALIFIED"
+    assert report["diagnostics"] == []
 
 
 @pytest.mark.parametrize(
@@ -1536,16 +1794,32 @@ def test_placement_requires_complete_intervals(change):
     assert verify.placement("outside-8ms", prior, sample, human, 5) == "INVALID"
 
 
-def test_boundary_runner_owns_cleanup_and_has_no_retries(rig, monkeypatch):
+@pytest.mark.parametrize(
+    "diagnostic_unit_s,status", [(0.0021, "OBSERVED"), (0.00001, "LIMIT")]
+)
+def test_boundary_runner_owns_cleanup_and_has_no_retries(
+    rig, monkeypatch, diagnostic_unit_s, status
+):
     from amplifier_module_tool_computer_use import linux_x11
 
     _, backend, child = rig
     monkeypatch.setattr(linux_x11, "LinuxX11Backend", lambda config: backend)
     monkeypatch.setattr(verify, "EventChild", lambda display: child)
+    run_case = verify._run_case
+
+    def run(case, *args):
+        if case == "post-sample":
+            backend.unit_s = diagnostic_unit_s
+        return run_case(case, *args)
+
+    monkeypatch.setattr(verify, "_run_case", run)
     report = {}
     verify._run_boundary(report, ":fake-owned")
     assert report["status"] == verify.MECHANISM_CONTROLS_PASS
-    assert [r["case"] for r in report["cases"]] == list(verify.CASES)
+    assert [r["case"] for r in report["cases"]] == list(verify.REQUIRED_CASES)
+    assert report["required_case_ids"] == list(verify.REQUIRED_CASES)
+    assert [r["case"] for r in report["diagnostics"]] == ["post-sample"]
+    assert report["diagnostic_status"] == status
     assert child.calls == 5 and backend.closed
     assert report["backend_close_returned"] and report["child_cleanup"]["reaped"]
 

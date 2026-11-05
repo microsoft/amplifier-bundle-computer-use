@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Conditional coexistence qualification, policy coexistence-boundary-v2 (2026-11-04).
+"""Conditional coexistence qualification, policy coexistence-boundary-v3 (2026-11-04).
 
 Default `--mode boundary` needs an explicitly owned Linux X11 display. It runs
-six predeclared controls once, using the shipped backend, monitor and guard and
-one independent, readiness-acknowledged XTEST child. Requested delays are NOT
-placement evidence. Unplaceable controls invalidate the run; there are no retries.
-The artificial post-sample barrier exposes a limitation, not the natural race's size.
+five required controls and one separate diagnostic once, using the shipped backend,
+monitor and guard and one independent, readiness-acknowledged XTEST child.
+Requested delays are NOT
+placement evidence. Invalid evidence blocks qualification; there are no retries.
+Only a fully evidenced shared-tick post-sample diagnostic may report an attribution
+limit instead of distinct counter advancement. Safety violations always block.
 
 `--mode random-model --misses K` is OFFLINE analysis of supplied counts only.
 Its exact binomial tail is conditional on assumptions it cannot establish; it
@@ -35,20 +37,21 @@ from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "modules" / "tool-computer-use"))
-POLICY = "coexistence-boundary-v2"
+POLICY = "coexistence-boundary-v3"
 SCHEMA = "coexistence-qualification-v1"
 CADENCE_S = 0.060  # O5 reference cadence; production type_text has no such pacing.
 WINDOW_S = 6.0
 QUIET_MAX_GAP_S = 0.080  # Fixed harness scheduling limit, not a production bound.
 MECHANISM_CONTROLS_PASS = "MECHANISM_CONTROLS_PASS"
-CASES = (
+REQUIRED_CASES = (
     "quiet",
     "inside-2ms",
     "outside-8ms",
     "outside-15ms",
     "outside-55ms",
-    "post-sample",
 )
+DIAGNOSTIC_CASES = ("post-sample",)
+CASES = REQUIRED_CASES + DIAGNOSTIC_CASES
 IPC_TIMEOUT_S = 3.0
 MAX_MESSAGE = 4096
 RECEIVER_CAPTURE_LIMIT = 16  # Evidence cap, never an input allowance.
@@ -74,6 +77,10 @@ class UnexpectedInput(InvalidCase):
             "count": len(batch) if count is None else count,
             "batch": batch,
         }
+
+
+class SharedServerTick(InvalidCase):
+    """Valid timestamp consistency, but no evidence of a distinct reset."""
 
 
 def _sync_requests():
@@ -550,6 +557,15 @@ class RegistrationOracle:
         ]
         if stamps != sorted(stamps) or not low <= stamps[-1] <= high:
             raise InvalidCase("native delivery inconsistent with idle counter")
+        if (
+            low == high == stamps[-1] == self.previous
+            and prior is not None
+            and _server_interval(prior)[1] < low
+        ):
+            raise SharedServerTick(
+                "own counter registration: shared server tick cannot prove a distinct reset",
+                {"shared_server_ms": low},
+            )
         if (self.previous is not None and low <= self.previous) or (
             prior is not None and low <= _server_interval(prior)[1]
         ):
@@ -813,6 +829,9 @@ def _confirm_own(backend: Any, result: dict[str, Any], oracle, batch) -> None:
     _counter_read(backend, counter, oracle.clock)
     try:
         oracle.confirm(counter, batch, row["sample_counter"])
+    except SharedServerTick:
+        _validate_shared_barrier(result, oracle)
+        raise
     except InvalidCase as exc:
         raise InvalidCase(f"own counter registration: {exc}") from exc
 
@@ -1084,12 +1103,105 @@ def _assess(result: dict[str, Any], guard_ms: float) -> None:
             and result["human"]["sync_after_ns"] > rows[1]["emit_before_ns"]
         ):
             raise InvalidCase("barrier did not finish before emission")
-        result["status"] = "PASS"
+        result.update(status="OBSERVED", attribution="ATTRIBUTION_RESOLVED")
         result["limitation"] = (
             "Artificial IPC barrier; either outcome retained, not a natural blind-window measurement or a must-detect/must-miss assertion."
         )
     else:
         result["status"] = "PASS"  # masking OR earlier detection, never require a miss
+
+
+def _validate_shared_barrier(result, oracle):
+    """The sole diagnostic exception: two valid deliveries sharing one server tick.
+
+    Called only after the ordinary oracle consumed/matched the own pair and
+    rejected distinct advancement with SharedServerTick, never on arbitrary errors.
+    No new input or counter read; all checks use this attempt's retained evidence.
+    """
+    from amplifier_module_tool_computer_use.presence import GUARD_MS
+
+    if result.get("case") != "post-sample" or len(result["timeline"]) != 3:
+        raise InvalidCase("shared tick outside the single post-sample diagnostic")
+    baseline, first, current = result["timeline"]
+    human, child_counter = result["human"], result["event_counter"]
+    own_counter = current["own_counter"]
+    tick, high = _server_interval(own_counter)
+    child_tick = child_counter["event_server_ms"]
+    if (
+        _halt_violation(result)
+        or not first["own_counter"].get("corroborated")
+        or not child_counter.get("corroborated")
+        or own_counter.get("corroborated")
+        or not tick == high == child_tick == oracle.previous
+        or not first["own_counter"]["event_server_ms"] < tick
+        or type(human["id"]) is not int
+        or not 1 <= human["id"] <= 5
+        or placement("post-sample", first, current, human, GUARD_MS["linux-x11"])
+        != "BARRIER"
+    ):
+        raise InvalidCase("incomplete/unsafe shared-tick diagnostic")
+    batches = (
+        _match_batch(
+            first["delivery"], "own", oracle.receiver.window.id, oracle.receiver.keycode
+        ),
+        _match_batch(
+            human["delivery"],
+            "child",
+            oracle.receiver.window.id,
+            oracle.receiver.keycode,
+            human["id"],
+        ),
+        _match_batch(
+            current["delivery"],
+            "own",
+            oracle.receiver.window.id,
+            oracle.receiver.keycode,
+        ),
+    )
+    events = [event for batch in batches for event in batch]
+    if any(
+        b["ordinal"] != a["ordinal"] + 1
+        for a, b in zip(events, events[1:], strict=False)
+    ):
+        raise InvalidCase("shared-tick diagnostic has missing/replayed delivery")
+    if any(
+        _event_time(e["server_ms"], own_counter["server_after_ms"]) != tick
+        for e in batches[1] + batches[2]
+    ):
+        raise InvalidCase("shared-tick diagnostic has inconsistent native timestamps")
+    for row in (baseline, first, current):
+        sample = row["sample_counter"]
+        _server_interval(sample)
+        if (
+            row["snapshot"]["state"] != "quiet"
+            or row["snapshot"]["last_human_input_ago_ms"] != sample["idle_ms"]
+            or not row["sample_entry_ns"]
+            <= sample["entry_ns"]
+            <= sample["return_ns"]
+            <= row["sample_return_ns"]
+        ):
+            raise InvalidCase("shared-tick diagnostic lacks valid prior observation")
+    sample_low, sample_high = _server_interval(current["sample_counter"])
+    child_low, child_high = _server_interval(child_counter)
+    if (
+        not sample_low <= first["own_counter"]["event_server_ms"] <= sample_high < tick
+        or not child_low <= tick <= child_high
+        or not first["emit_after_ns"]
+        <= first["injection_anchor_ns"]
+        <= current["sample_entry_ns"]
+        or not human["sync_after_ns"]
+        <= child_counter["entry_ns"]
+        <= child_counter["return_ns"]
+        <= current["guard_return_ns"]
+        or not current["guard_return_ns"]
+        <= current["emit_before_ns"]
+        <= current["emit_after_ns"]
+        <= own_counter["entry_ns"]
+        <= own_counter["return_ns"]
+    ):
+        raise InvalidCase(
+            "shared-tick diagnostic has inconsistent counter/time ordering"
+        )
 
 
 def _outside_miss(result, guard_ms):
@@ -1117,6 +1229,7 @@ def _run_case(case: str, backend: Any, child: Any, oracle) -> dict[str, Any]:
 
     result: dict[str, Any] = {
         "case": case,
+        "category": "diagnostic" if case in DIAGNOSTIC_CASES else "required",
         "status": "INVALID",
         "timeline": [],
         "releases": [],
@@ -1207,6 +1320,16 @@ def _run_case(case: str, backend: Any, child: Any, oracle) -> dict[str, Any]:
             )
             result["latch_call_id"] = result["timeline"][-1]["guard_call_id"]
         _assess(result, GUARD_MS["linux-x11"])
+    except SharedServerTick as exc:
+        # _confirm_own already validated the complete, narrowly typed pattern.
+        # Stop here: no later write to try to manufacture distinct advancement.
+        result.update(
+            status="LIMIT",
+            attribution="ATTRIBUTION_UNRESOLVED",
+            attribution_evidence=exc.evidence,
+            reason=str(exc),
+            limitation="Artificial IPC barrier; distinct counter reset unresolved, not a natural blind-window measurement.",
+        )
     except Exception as exc:  # noqa: BLE001 - retain failed evidence, never a miss
         result["status"] = "INVALID"
         result["reason"] = repr(exc)[:MAX_MESSAGE]
@@ -1242,7 +1365,10 @@ def _run_case(case: str, backend: Any, child: Any, oracle) -> dict[str, Any]:
             result.update(
                 status="FAIL", reason="proven outside event permitted ordinary input"
             )
-        if result["status"] == "PASS" and result["false_positive_samples_before_event"]:
+        if (
+            result["status"] in ("PASS", "OBSERVED", "LIMIT")
+            and result["false_positive_samples_before_event"]
+        ):
             result["status"] = "FAIL"
     return result
 
@@ -1262,7 +1388,10 @@ def _run_boundary(report: dict[str, Any], display_name: str) -> None:
         guard_ms=GUARD_MS["linux-x11"],
         reference_cadence_ms=CADENCE_S * 1000,
         predeclared_cases=list(CASES),
+        required_case_ids=list(REQUIRED_CASES),
+        diagnostic_case_ids=list(DIAGNOSTIC_CASES),
         cases=[],
+        diagnostics=[],
     )
     try:
         probe = backend.probe()
@@ -1277,7 +1406,9 @@ def _run_boundary(report: dict[str, Any], display_name: str) -> None:
         for case in CASES:
             time.sleep(QUIET_FLOOR_SECONDS + 0.5)
             result = _run_case(case, backend, child, oracle)
-            report["cases"].append(result)
+            report["diagnostics" if case in DIAGNOSTIC_CASES else "cases"].append(
+                result
+            )
             if result["status"] != "PASS":
                 break  # preserve the first failure, no replacement or retry
     finally:
@@ -1296,19 +1427,30 @@ def _run_boundary(report: dict[str, Any], display_name: str) -> None:
                 # Production contains close errors; return is not closure proof.
                 report["backend_close_returned"] = True
     cleanup = report.get("child_cleanup", {})
-    complete = len(report["cases"]) == len(CASES) and all(
+    complete = [r["case"] for r in report["cases"]] == list(REQUIRED_CASES) and all(
         r["status"] == "PASS" for r in report["cases"]
+    )
+    diagnostic_ok = [r["case"] for r in report["diagnostics"]] == list(
+        DIAGNOSTIC_CASES
+    ) and (
+        report["diagnostics"][0]["status"],
+        report["diagnostics"][0].get("attribution"),
+    ) in (("OBSERVED", "ATTRIBUTION_RESOLVED"), ("LIMIT", "ATTRIBUTION_UNRESOLVED"))
+    report["required_controls_status"] = "PASS" if complete else "UNQUALIFIED"
+    report["diagnostic_status"] = (
+        report["diagnostics"][0]["status"] if diagnostic_ok else "UNQUALIFIED"
     )
     report["status"] = (
         MECHANISM_CONTROLS_PASS
         if complete
+        and diagnostic_ok
         and cleanup.get("returncode") == 0
         and not cleanup.get("forced", True)
         and report.get("receiver_cleanup", {}).get("closed") is True
         else "UNQUALIFIED"
     )
     report["scope"] = (
-        "Conditional Linux mechanism controls only; not physical-input universality, real ledger release, Windows/macOS qualification, permissions/Stop or release adoption."
+        "Five required conditional Linux mechanism controls; artificial barrier diagnostic reported separately. Not physical-input universality, real ledger release, Windows/macOS qualification, permissions/Stop or release adoption."
     )
 
 
