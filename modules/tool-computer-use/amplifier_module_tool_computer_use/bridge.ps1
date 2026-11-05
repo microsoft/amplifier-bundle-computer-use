@@ -121,6 +121,8 @@ public static class CU {
     static bool operatorPresenceOverride;
     static double operatorExpiry, operatorDeadline;
     static string operatorTarget;
+    static string focusTarget;
+    public static bool FocusTransition { get { return focusTarget != null; } }
     static double UnixSeconds() {
         return (DateTime.UtcNow - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalSeconds;
     }
@@ -138,6 +140,12 @@ public static class CU {
         operatorTarget = target;
         operatorDeadline = (double)GetTickCount64() + remaining * 1000;
         operatorPresenceOverride = true;
+    }
+    public static void ConfigureFocus(string destination) {
+        if (!operatorPresenceOverride || String.IsNullOrEmpty(destination) ||
+            destination == "0" || destination.Length > 256)
+            throw new InvalidOperationException("Malformed focus transition condition");
+        focusTarget = destination;
     }
     static IntPtr inputMarker;
     public static void ConfigureMarker(long marker) {
@@ -162,8 +170,12 @@ public static class CU {
         expectedEpoch = expected; baselineNow = now; baselineLast = last;
         injectBefore = injection; guardMs = guard; Guarded = true;
         operatorPresenceOverride = false;
+        focusTarget = null;
     }
     public static void Check() {
+        CheckTarget(operatorTarget);
+    }
+    static void CheckTarget(string target, string pendingSource = null) {
         if (!Guarded) return;
         Latest = Observe();
         if (Latest.epoch != expectedEpoch || Latest.now_ms < baselineNow ||
@@ -172,7 +184,8 @@ public static class CU {
         if (operatorPresenceOverride &&
             (UnixSeconds() >= operatorExpiry || (double)GetTickCount64() >= operatorDeadline))
             throw new InvalidOperationException("Operator presence condition expired");
-        if (operatorPresenceOverride && Latest.foreground != operatorTarget)
+        if (operatorPresenceOverride && Latest.foreground != target &&
+            (pendingSource == null || Latest.foreground != pendingSource))
             throw new InvalidOperationException("Operator presence target changed");
         // Only this aggregate last-input predicate is overridden. Observation,
         // epoch/regression, checked SendInput count and receipts remain mandatory.
@@ -182,6 +195,44 @@ public static class CU {
         } else if (!operatorPresenceOverride && Latest.last_input_ms != baselineLast) {
             throw new InvalidOperationException("Windows initial input precondition rejected");
         }
+    }
+    public static void ActivateFocus(IntPtr handle) {
+        if (FocusTransition && handle.ToString() != focusTarget)
+            throw new InvalidOperationException("Focus destination differs from condition");
+        // Source stays pinned until the first activation call. SW_RESTORE can
+        // itself activate: no source check may run between restore and focus.
+        Check();
+        ulong settleStart = FocusTransition ? GetTickCount64() : 0;
+        if (FocusTransition && IsIconic(handle)) ShowWindow(handle, 9);
+        SetForegroundWindow(handle);
+        if (FocusTransition) {
+            // Activation can finish on another input queue after the call returns.
+            // Observe only: never retry activation or emit input while settling.
+            ulong previousTick = settleStart, previousNow = Latest.now_ms,
+                previousLast = Latest.last_input_ms;
+            for (int poll = 0; ; poll++) {
+                CheckTarget(focusTarget, operatorTarget);
+                ulong tick = GetTickCount64();
+                if (tick < previousTick || Latest.now_ms < previousNow ||
+                    Latest.last_input_ms < previousLast)
+                    throw new InvalidOperationException("Windows target-clock epoch/ticks changed");
+                if (tick - settleStart >= 500)
+                    throw new InvalidOperationException("Focus activation settlement timed out");
+                if (Latest.foreground == focusTarget) {
+                    // Only a valid exact destination can rebind normal Alt-up.
+                    operatorTarget = focusTarget;
+                    break;
+                }
+                // Also finite if the target tick stops advancing.
+                if (poll == 50)
+                    throw new InvalidOperationException("Focus activation settlement timed out");
+                previousTick = tick; previousNow = Latest.now_ms; previousLast = Latest.last_input_ms;
+                System.Threading.Thread.Sleep(10);
+            }
+        }
+    }
+    public static void VerifyFocus() {
+        if (FocusTransition) Check();
     }
     public static void Emit(INPUT[] inputs) {
         EmissionAttempted = false;
@@ -502,7 +553,7 @@ try {
         throw "Malformed Windows target-clock integer"
       }
     }
-    if ($condition.version -notin @(1, 2) -or $condition.epoch -isnot [string]) {
+    if ($condition.version -notin @(1, 2, 3) -or $condition.epoch -isnot [string]) {
       throw "Malformed Windows target-clock version/epoch"
     }
     $injection = $condition.inject_before_ms
@@ -520,7 +571,7 @@ try {
       $injection, $condition.guard_ms)
     $operatorFields = @('operator_presence_override', 'operator_presence_channel', 'operator_presence_expires_at', 'operator_presence_target')
     $presentOperatorFields = @($condition.PSObject.Properties.Name | Where-Object { $_ -in $operatorFields })
-    if ($condition.version -eq 2) {
+    if ($condition.version -in @(2, 3)) {
       if ($presentOperatorFields.Count -ne 4 -or
           $condition.operator_presence_override -isnot [bool] -or
           $condition.operator_presence_override -ne $true -or
@@ -536,6 +587,16 @@ try {
       [CU]::ConfigureOperatorPresence($condition.operator_presence_channel, $expiry, $condition.operator_presence_target)
     } elseif ($presentOperatorFields.Count -ne 0) {
       throw "Operator presence override requires Windows condition v2"
+    }
+    if ($condition.version -eq 3) {
+      if ($action -ne 'focus_window' -or $condition.focus_target -isnot [string] -or
+          $condition.focus_target -cne "$($req.handle)" -or
+          $condition.focus_target -cne ([IntPtr][int64]"$($req.handle)").ToString()) {
+        throw "Focus transition requires the exact requested handle"
+      }
+      [CU]::ConfigureFocus($condition.focus_target)
+    } elseif ('focus_target' -in $condition.PSObject.Properties.Name) {
+      throw "Focus transition requires Windows condition v3"
     }
   }
 
@@ -688,29 +749,40 @@ try {
       $out.windows = $list.ToArray(); $out.foreground = $fg.ToString()
     }
     'focus_window' {
+      $focusStage = 'preflight'
       $h = [IntPtr][int64]"$($req.handle)"
       [CU]::Check()
-      if ([CU]::IsIconic($h)) { [void][CU]::ShowWindow($h, 9) }   # SW_RESTORE
+      # Preserve the default path. V3 restores only at the checked activation
+      # boundary after Alt-down, since SW_RESTORE may also change foreground.
+      if (-not [CU]::FocusTransition -and [CU]::IsIconic($h)) { [void][CU]::ShowWindow($h, 9) }
       # ALT nudge defeats Windows' foreground-lock heuristic
       $released = $false; $pressed = $false
       $altUp = [CU+INPUT[]]@((New-KeyInput 0x12 $KEYUP))
       try {
+        $focusStage = 'alt_down'
         [CU]::Emit([CU+INPUT[]]@((New-KeyInput 0x12))); $pressed = $true
-        [CU]::Check()
-        [void][CU]::SetForegroundWindow($h)
+        $focusStage = 'activate'
+        [CU]::ActivateFocus($h)
+        $focusStage = 'alt_up'
         [CU]::Emit($altUp); $released = $true
       } finally {
         if (-not $released -and ($pressed -or [CU]::EmissionAttempted)) { [CU]::Release($altUp) }
       }
       Start-Sleep -Milliseconds 250
+      $focusStage = 'verify'
+      [CU]::VerifyFocus()
       $out.focused = ([CU]::GetForegroundWindow()).ToString()
       $out.requested = $h.ToString()
+      $out.focus_stage = 'complete'
     }
     default { throw "unknown action '$($req.action)'" }
   }
 }
 catch {
   $out = @{ ok = $false; error = "$($_.Exception.Message)" }
+  if ($action -eq 'focus_window') {
+    $out.focus_stage = if ($focusStage) { $focusStage } else { 'preflight' }
+  }
 }
 
 if ($null -ne $req.target_clock_condition) {

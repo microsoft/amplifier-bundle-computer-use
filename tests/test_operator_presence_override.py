@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import sys
 import time
 from copy import deepcopy
@@ -28,6 +29,9 @@ from amplifier_module_tool_computer_use.target_binding import TargetChangedError
 from amplifier_module_tool_computer_use.target_clock import (
     CURRENT_TARGET_CLOCK,
     TargetClockExchange,
+    TargetClockFailure,
+    target_clock_exchange,
+    without_target_clock,
 )
 
 CHANNEL = "remote-ssh:windows-wsl2:operator@synthetic-wsl"
@@ -432,3 +436,95 @@ def test_forwarded_condition_refuses_invalid_override_without_os_effects(rig, mu
         condition["operator_presence_expires_at"] = True
     with pytest.raises(ValueError):
         TargetClockExchange(condition)
+
+
+def test_focus_scope_is_one_shot_nested_and_restores_cleanup_context(rig):
+    rig.guard.before_event()
+    original = rig.guard.target_condition()
+    with rig.guard.target_clock_event(focus_target="window-b"):
+        focus = CURRENT_TARGET_CLOCK.get()
+        assert focus.prepare()["focus_target"] == "window-b"
+        assert focus.condition["operator_presence_target"] == "window-a"
+        with target_clock_exchange(original) as nested:
+            assert nested.focus_target is None
+            assert "focus_target" not in nested.prepare()
+        assert CURRENT_TARGET_CLOCK.get() is focus
+        with without_target_clock():
+            assert CURRENT_TARGET_CLOCK.get() is None
+        result = receipt()
+        result["focused"] = "window-b"
+        result["target_clock"]["observation"]["foreground"] = "window-b"
+        focus.finish(result, require_injection=True)
+        assert focus.focus_target is None
+        assert focus.focus_check is None
+        assert focus.prepare()["operator_presence_target"] == "window-b"
+        assert focus.condition["version"] == 2 and "focus_target" not in focus.condition
+    assert CURRENT_TARGET_CLOCK.get() is None
+
+
+def test_forwarding_focus_scope_is_concurrent_and_cannot_authorize_a_second_call(rig):
+    rig.guard.before_event()
+    condition = rig.guard.target_condition()
+
+    async def scenario():
+        ready = [asyncio.Event(), asyncio.Event()]
+
+        async def invoke(index):
+            destination = f"window-{index}"
+            with target_clock_exchange(
+                {**condition, "version": 3, "focus_target": destination}
+            ) as exchange:
+                ready[index].set()
+                await ready[1 - index].wait()
+                assert CURRENT_TARGET_CLOCK.get() is exchange
+                assert exchange.prepare()["focus_target"] == destination
+                exchange.finish({"ok": True}, require_injection=True)
+                assert exchange.focus_target is None
+                with pytest.raises(TargetClockFailure):
+                    exchange.prepare()
+            assert CURRENT_TARGET_CLOCK.get() is None
+
+        await asyncio.gather(invoke(0), invoke(1))
+
+    asyncio.run(scenario())
+    assert CURRENT_TARGET_CLOCK.get() is None
+
+
+@pytest.mark.parametrize("destination", [None, "", "0", True, 10, "x" * 257])
+def test_v3_focus_condition_requires_exact_nonzero_destination(rig, destination):
+    rig.guard.before_event()
+    condition = {
+        **rig.guard.target_condition(),
+        "version": 3,
+        "focus_target": destination,
+    }
+    with pytest.raises(ValueError):
+        TargetClockExchange(condition)
+
+
+def test_focus_field_cannot_be_silently_ignored_in_older_conditions(rig):
+    rig.guard.before_event()
+    condition = rig.guard.target_condition()
+    with pytest.raises(ValueError):
+        TargetClockExchange({**condition, "focus_target": "window-b"})
+    with pytest.raises(ValueError):
+        TargetClockExchange(
+            {**condition, "version": 3, "focus_target": "window-b"},
+            focus_target="window-c",
+        )
+
+
+def test_default_focus_does_not_acquire_operator_transition_authority(rig):
+    # This is the normal, default Windows guard, not an override. Keep its v1
+    # condition and existing classifier; passing an explicit handle adds no grant.
+    rig.guard.operator_presence_override = None
+    rig.state.observation = observation(10000, 1000)
+    rig.guard.before_event()
+    with rig.guard.target_clock_event(focus_target="window-b"):
+        exchange = CURRENT_TARGET_CLOCK.get()
+        assert exchange.focus_target is None
+        assert exchange.prepare()["version"] == 1
+        result = receipt(last=10010)
+        exchange.finish(result, require_injection=True)
+        assert exchange.prepare()["version"] == 1
+    assert CURRENT_TARGET_CLOCK.get() is None

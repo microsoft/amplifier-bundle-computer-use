@@ -123,6 +123,8 @@ TARGET_CLOCK_FAILURE_BASES = frozenset(
         "target_clock_unreadable",
         "target_clock_unacknowledged",
         "target_precondition_rejected",
+        "operator_presence_target_changed",
+        "focus_transition_unverified",
     }
 )
 
