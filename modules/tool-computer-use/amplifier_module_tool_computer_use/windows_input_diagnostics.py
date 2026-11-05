@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 import re
-import struct
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -69,7 +68,8 @@ class ProbeRequest:
 
 def prepare_probe(marker: int, duration_ms: int = 35000) -> ProbeRequest:
     """Prepare, never launch. Send stdin only to the owned helper, not a log."""
-    _integer(marker, 1, (1 << (struct.calcsize("P") * 8 - 1)) - 1)
+    # Match WindowsBackend's cross-architecture marker, not host Python width.
+    _integer(marker, 1, (1 << 31) - 1)
     _integer(duration_ms, 1, 35000)
     return ProbeRequest(
         PROBE_PS1,

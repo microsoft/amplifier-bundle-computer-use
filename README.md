@@ -188,7 +188,9 @@ No file log, background collector, payload hash, replay or remote protocol is ad
 ### Opt-in Windows input correlation (diagnostic only)
 
 Each `WindowsBackend` now supplies a private random backend-scoped marker to its
-one-shot bridge processes. All actual `SendInput` calls stamp it, including emergency
+one-shot bridge processes. The marker is nonzero positive 31-bit, compatible with
+both 32-bit and 64-bit PowerShell even when WSL Python has a different pointer width.
+All actual `SendInput` calls stamp it, including emergency
 releases. Legacy direct bridge requests without the marker remain untagged.
 No public action, target-clock receipt, guard decision, pacing or halt policy changes.
 `SetCursorPos` and clipboard operations are **not** `SendInput` and are not tagged.

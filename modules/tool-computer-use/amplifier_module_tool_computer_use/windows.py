@@ -18,7 +18,6 @@ import json
 import logging
 import secrets
 import shutil
-import struct
 import subprocess
 import tempfile
 from pathlib import Path
@@ -198,9 +197,9 @@ class WindowsBackend:
         self._timeout = float(cfg.get("timeout", 90.0))
         # Diagnostic correlation only: stable across this backend's one-shot
         # bridge processes. Never part of public action/guard/receipt state.
-        self._input_marker = (
-            secrets.randbelow((1 << (struct.calcsize("P") * 8 - 1)) - 1) + 1
-        )
+        # WSL Python and the configured PowerShell executable can differ in
+        # pointer width. Stay positive on both native IntPtr architectures.
+        self._input_marker = secrets.randbelow((1 << 31) - 1) + 1
 
     def prepare_input_probe(self, duration_ms: int = 35000):
         """Prepare private stdin for an explicitly owned passive helper.

@@ -5,7 +5,6 @@ from __future__ import annotations
 import ctypes
 import io
 import json
-import struct
 import sys
 import tarfile
 from copy import deepcopy
@@ -318,7 +317,7 @@ def test_backend_marker_stable_distinct_private_and_preparation_is_inert(monkeyp
     marker = json.loads(one.stdin)["marker"]
     assert one == again
     assert marker != json.loads(other.stdin)["marker"]
-    assert type(marker) is int and 0 < marker < (1 << (struct.calcsize("P") * 8 - 1))
+    assert type(marker) is int and 0 < marker <= (1 << 31) - 1
     assert str(marker) not in repr(one) and str(marker) not in repr(first)
     assert one.script == PROBE_PS1
     for bad in (0, -1, 35001, True, "100"):
@@ -327,9 +326,48 @@ def test_backend_marker_stable_distinct_private_and_preparation_is_inert(monkeyp
 
 
 def test_private_marker_validation():
-    for bad in (None, True, 0, -1, "123", 1 << 64):
+    for bad in (None, True, 0, -1, "123", 1 << 31, 1 << 64):
         with pytest.raises(ValueError):
             prepare_probe(bad)
+
+
+@pytest.mark.parametrize("native_bits", [32, 64])
+def test_mixed_width_max_marker_tags_input_and_unconditioned_release(
+    monkeypatch, native_bits
+):
+    # Model a 64-bit controller's maximum RNG result, not a lucky small draw.
+    # The target's pointer width is independent of the WSL Python interpreter.
+    monkeypatch.setattr(windows.secrets, "randbelow", lambda upper: upper - 1)
+    backend = windows.WindowsBackend({"powershell_path": "inert-32-or-64-bit"})
+    backend._ps = "inert-powershell"
+    prepared = json.loads(backend.prepare_input_probe().stdin)
+    seen = []
+    finished = []
+
+    def bridge(argv, **kwargs):
+        payload = json.loads(Path(argv[-1]).read_text())
+        marker = payload["_input_marker"]
+        assert 0 < marker <= (1 << (native_bits - 1)) - 1
+        seen.append(payload)
+        return SimpleNamespace(stdout='{"ok":true}', stderr="", returncode=0)
+
+    monkeypatch.setattr(windows, "_translate", lambda path, flag: path)
+    monkeypatch.setattr(windows.subprocess, "run", bridge)
+    exchange = SimpleNamespace(
+        condition={"unchanged": True}, finish=lambda *a, **k: finished.append((a, k))
+    )
+    token = CURRENT_TARGET_CLOCK.set(exchange)
+    try:
+        assert backend.raw("key", key="shift") == {"ok": True}
+    finally:
+        CURRENT_TARGET_CLOCK.reset(token)
+    # Safety release stays unconditioned, but uses the exact same marker.
+    assert backend.raw("left_mouse_up") == {"ok": True}
+    assert prepared["marker"] == seen[0]["_input_marker"] == seen[1]["_input_marker"]
+    assert prepared["marker"] == (1 << 31) - 1
+    assert seen[0]["target_clock_condition"] == exchange.condition
+    assert "target_clock_condition" not in seen[1]
+    assert len(finished) == 1
 
 
 def test_backend_private_payload_keeps_exchange_and_public_result_unchanged(
