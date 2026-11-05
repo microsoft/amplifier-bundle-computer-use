@@ -260,7 +260,7 @@ class WindowsBackend:
             payload["_input_marker"] = self._input_marker
         exchange = CURRENT_TARGET_CLOCK.get() if action in _INPUT_ACTIONS else None
         if exchange is not None:
-            payload["target_clock_condition"] = exchange.condition
+            payload["target_clock_condition"] = exchange.prepare()
         with tempfile.NamedTemporaryFile(
             "w", suffix=".json", delete=False, encoding="utf-8"
         ) as fh:

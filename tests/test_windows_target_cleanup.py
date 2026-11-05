@@ -13,6 +13,7 @@ import json
 import subprocess
 import sys
 import threading
+import time
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
@@ -69,7 +70,9 @@ def make_rig(monkeypatch):
         SimpleNamespace(RLock=threading.RLock, Timer=InertTimer),
     )
 
-    def make(*, remote=False, agent_owned=False, local_ledger=True):
+    def make(
+        *, remote=False, agent_owned=False, local_ledger=True, operator_override=False
+    ):
         state = SimpleNamespace(
             now=10000,
             last=1000,
@@ -97,6 +100,7 @@ def make_rig(monkeypatch):
                 "epoch": EPOCH,
                 "now_ms": state.now,
                 "last_input_ms": state.last,
+                "foreground": "inert-owned-window",
             }
 
         def custody():
@@ -204,6 +208,9 @@ def make_rig(monkeypatch):
         ledgers["target"] = agent._ledger
 
         class Transport:
+            user_host = "inert-target"
+            port = None
+
             def send(self, line):
                 req = json.loads(line)
                 wires.append(deepcopy(req))
@@ -253,7 +260,31 @@ def make_rig(monkeypatch):
             monitor,
             release_all=release_all,
             on_presence_sample=samples.append,
+            target_source=lambda: "inert-owned-window",
         )
+        if operator_override:
+            assert remote
+            controller_backend.name = "remote-ssh:windows-wsl2"
+            controller_backend.presence_platform = "windows-wsl2"
+            monkeypatch.setattr(cu, "load_halt", lambda key: None)
+            monkeypatch.setattr(cu, "_durable_halt_poll_for", lambda backend: None)
+            monkeypatch.setattr(
+                cu, "_get_channel_ledger", lambda key: ledgers["controller"]
+            )
+            guard = cu._build_coexistence_guard(
+                controller_backend,
+                {
+                    "coexistence": {
+                        "operator_presence_override": {
+                            "channel": cu._halt_key(controller_backend),
+                            "expires_at": time.time() + 600,
+                            "reason": "synthetic offline policy",
+                        }
+                    },
+                },
+            )
+            monitor = guard.presence
+            guard.on_presence_sample = samples.append
         tool._coexistence_guard = guard
         monkeypatch.setattr(
             cu, "record_halt", lambda *args, **kwargs: halts.append((args, kwargs))
@@ -497,3 +528,117 @@ def test_local_uncertain_down_still_sends_safety_up_without_ledger(
     assert emergency[0]["context"] is None
     assert rig.emitted == ["left_mouse_down", "left_mouse_up"]
     assert CURRENT_TARGET_CLOCK.get() is None
+
+
+def test_remote_operator_condition_reaches_actual_bridge_payload_and_retains_cleanup(
+    make_rig,
+):
+    rig = make_rig(remote=True, operator_override=True)
+    rig.state.down_result = "human"
+    assert run(rig.tool.execute(DOWN)).success
+    assert rig.monitor.last_snapshot.state is presence.PresenceState.HUMAN_ACTIVE
+    assert not rig.guard.halted
+    assert rig.ledgers["controller"].held_tokens == [TOKEN]
+    assert rig.agent._ledger.held_tokens == [TOKEN]
+    assert run(rig.tool.execute(UP)).success
+    writes = [
+        call
+        for call in rig.calls
+        if call["payload"]["action"].startswith("left_mouse_")
+    ]
+    assert len(writes) == 2
+    for call in writes:
+        condition = call["payload"]["target_clock_condition"]
+        assert condition["version"] == 2
+        assert condition["operator_presence_override"] is True
+        assert condition["operator_presence_target"] == "inert-owned-window"
+        assert (
+            condition["operator_presence_channel"]
+            == "remote-ssh:windows-wsl2:inert-target"
+        )
+        assert condition["operator_presence_expires_at"] > time.time()
+    forwarded = [
+        req["args"]["_target_clock_condition"]
+        for req in rig.wires
+        if req["op"] in {"mouse_down", "mouse_up"}
+    ]
+    assert forwarded == [call["payload"]["target_clock_condition"] for call in writes]
+    assert not emergency_calls(rig) and not rig.guard.halted
+    assert rig.ledgers["controller"].held_tokens == rig.agent._ledger.held_tokens == []
+
+
+@pytest.mark.parametrize("fail_cleanup", [False, True])
+def test_remote_operator_policy_still_halts_unknown_and_keeps_failed_cleanup(
+    make_rig, fail_cleanup
+):
+    rig = make_rig(remote=True, operator_override=True)
+    rig.state.down_result = "unacknowledged"
+    rig.state.fail_cleanup = fail_cleanup
+    result = run(rig.tool.execute(DOWN))
+    assert_halted_public_result(rig, result, presence.PresenceState.UNKNOWN)
+    assert_emergency_is_no_motion_and_unconditioned(rig, "target")
+    ledger = rig.agent._ledger
+    if fail_cleanup:
+        assert ledger.held_tokens == [TOKEN]
+        rig.state.fail_cleanup = False
+        assert rig.tool._backend._call("release_all") == {"released": [TOKEN]}
+    assert ledger.held_tokens == []
+
+
+def test_operator_policy_does_not_authorize_read_only_input(make_rig):
+    rig = make_rig(remote=True, operator_override=True)
+    rig.tool._read_only = True
+    result = run(rig.tool.execute(DOWN))
+    assert not result.success
+    assert "read_only" in result.error["message"]
+    assert rig.emitted == []
+
+
+def test_operator_policy_does_not_suppress_public_cancellation_or_schedule_next_input(
+    make_rig,
+):
+    rig = make_rig(remote=True, operator_override=True)
+    entered, release, settled = (threading.Event() for _ in range(3))
+    original = rig.tool._backend._call
+
+    def blocking(op, **args):
+        value = original(op, **args)
+        if op == "mouse_down":
+            entered.set()
+            assert release.wait(3)
+        return value
+
+    rig.tool._backend._call = blocking
+    rig.tool._band_enter = lambda: "inert-band"
+    rig.tool._band_exit = lambda token: settled.set()
+
+    async def scenario():
+        task = asyncio.create_task(
+            rig.tool.execute(
+                {
+                    "version": 1,
+                    "actions": [DOWN, UP],
+                    "capture_after": False,
+                }
+            )
+        )
+        assert await asyncio.to_thread(entered.wait, 1)
+        try:
+            task.cancel()
+            result = await task
+            assert not result.success and result.error["type"] == "CancelledError"
+            assert not settled.is_set()
+        finally:
+            release.set()
+        assert await asyncio.to_thread(settled.wait, 1)
+
+    run(scenario())
+    ordinary = [
+        call
+        for call in rig.calls
+        if call["payload"]["action"].startswith("left_mouse_")
+        and "target_clock_condition" in call["payload"]
+    ]
+    assert [call["payload"]["action"] for call in ordinary] == ["left_mouse_down"]
+    # Test cleanup owns the possibly completed hold; no normal UP was replayed.
+    rig.tool._ledger.release_all(reason="inert-test-cleanup")

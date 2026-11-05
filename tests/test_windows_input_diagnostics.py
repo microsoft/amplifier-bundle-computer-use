@@ -356,6 +356,7 @@ def test_mixed_width_max_marker_tags_input_and_unconditioned_release(
     exchange = SimpleNamespace(
         condition={"unchanged": True}, finish=lambda *a, **k: finished.append((a, k))
     )
+    exchange.prepare = lambda: exchange.condition
     token = CURRENT_TARGET_CLOCK.set(exchange)
     try:
         assert backend.raw("key", key="shift") == {"ok": True}
@@ -390,6 +391,7 @@ def test_backend_private_payload_keeps_exchange_and_public_result_unchanged(
     exchange = SimpleNamespace(
         condition={"original": True}, finish=lambda *a, **k: finishes.append((a, k))
     )
+    exchange.prepare = lambda: exchange.condition
     token = CURRENT_TARGET_CLOCK.set(exchange)
     try:
         assert backend.raw("key", text="x", _input_marker=99) == result

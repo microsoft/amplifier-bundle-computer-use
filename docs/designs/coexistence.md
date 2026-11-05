@@ -20,7 +20,7 @@
 | Piece | Where | Status |
 |---|---|---|
 | Presence detector (per-event inject-timestamp reconciliation) | Target-side, in the agent process, all three platforms | Build first. **O5 proves it survives sustained typing; the ±250 ms guard band did not.** |
-| Halt-on-observed-human-activity (`yield`) | All three platforms, **not configurable off** | Build first — stop on observation, with the physical-input limits in §6.0 |
+| Halt-on-observed-human-activity (`yield`) | All three platforms by default; finite remote-Windows operator exception §6.0a | Stop on observation unless that explicit policy is active; never clear a latched halt |
 | Target binding (abort on focus change mid-op) | All three platforms | **New in revision 2.** Closes a gap no indicator speed can fix (§8.6) |
 | Persistent overlay + click-to-pause | Linux X11 now; Windows with transport Phase 4 | Proven on Linux (U4/U5/U6) |
 | macOS announcement (system dialog) | macOS now, **zero install** | **New in revision 2.** O1 proves `osascript display dialog` renders and returns the button from a Background-domain SSH process |
@@ -260,15 +260,29 @@ That is historical evidence for measuring the live path, not a benchmark, ratio,
 
 ## 6. The handoff protocol
 
-### 6.0 The console user's veto — an invariant, not a mode
+### 6.0 The console user's veto — default invariant
 
 Revision 1 modelled consent entirely as the operator's decision. The person physically at the machine had no stated veto. That is corrected here, at mechanism level:
 
-> **Once the guard observes `human_active`, it prevents the next task-directed emission, invokes the existing release path, and retains the halt, in every mode and on every platform. No configuration or controller action bypasses that halt. Required safety-release emissions are not task-directed writes.**
+> **By default, once the guard observes `human_active`, it prevents the next task-directed emission, invokes the existing release path, and retains the halt, in every mode and on every platform. The sole live-classification exception is §6.0a. No configuration or controller action clears an already-latched halt. Required safety-release emissions are not task-directed writes.**
 
-Concretely: the halt is enforced in the same guard as pause and target binding, at the injection call site (§8.6). There is no configuration key that disables it, no operator opt-out that bypasses it, and no controller op that overrides it. The per-target opt-out described in §7.6 governs whether driving may *begin* on a machine with no announcement channel; it has no power over a human who then shows up.
+Concretely: the halt is enforced in the same guard as pause and target binding, at the injection call site (§8.6). `drive_anyway` in §7.6 still governs START only; `enabled:false` still declines disclosure only. Neither is a continuing-presence override. The intentional policy revision below replaces the earlier absolute “no configuration” claim, not the default behavior.
 
-The invariant is unconditional **after observation**, not after every physical input event. If the product requires every physical event to prevent the next ordinary emission, that stronger requirement is **UNMET** by the timestamp mechanism. It needs future mechanism work (for example §5.6), not a lower acceptance threshold. Explicit Stop, pause, authority and durable-halt behavior are unchanged.
+Outside §6.0a the invariant is unconditional **after observation**, not after every physical input event. If the product requires every physical event to prevent the next ordinary emission, that stronger requirement is **UNMET** by the timestamp mechanism. It needs future mechanism work (for example §5.6), not a lower acceptance threshold. Explicit Stop, pause, authority and durable-halt behavior are unchanged.
+
+### 6.0a Intentional policy revision — finite operator presence override
+
+An operator may explicitly authorize unattended input on one remote Windows channel even when aggregate idle reconciliation classifies other activity. `coexistence.operator_presence_override` is **absent/default-off**, not inferred from quiet, a screen, a file, a tool result, or an agent's claim of approval. Only the trusted mount/configuration owner supplies it after obtaining actual operator authorization. Its reason is an operator label, **not authenticated proof of authority or input authorship**. A warning logs the channel, deadline and reason at guard construction.
+
+The mapping has exactly three keys: `channel` (the exact `_halt_key(backend)`, including SSH user/host and nondefault port), `expires_at` (finite absolute Unix seconds, strictly future and at most 3600 seconds from construction), and a printable nonempty `reason` (at most 160 characters). Booleans, strings as numbers, unknown keys, local/non-Windows backends, wrong channels and missing target binding are refused. Controller wall and monotonic deadlines both apply. Removing/changing that mount mapping or changing the backend channel invalidates the current policy. Observed expiry/revocation latches an unknown safety halt and invokes release before another write; adding it back cannot resume that guard.
+
+Only the live `HUMAN_ACTIVE` halt decision in `before_event` and receipt acceptance is suppressed. Initial and post-result samples, classification, latches, margins and transport reporting remain unchanged. The policy never credits a foreign input as an own injection. UNKNOWN/unreadable observations, malformed/lost/rejected receipts, epoch or tick regression, failed SendInput counts, locked/missing GUI sessions, target binding, geometric exclusion, permission/read-only/write gates, disclosure, explicit pause, Cancel and host Stop are **not overridden**. The policy cannot ignore or clear a current, durable, legacy or newly polled halt; the existing explicit resume procedure and a fresh guard are still required.
+
+The invocation-local Windows condition uses **condition version 2**, `operator_presence_override:true`, exact `operator_presence_channel`, `operator_presence_expires_at`, and `operator_presence_target`. The existing Windows clock observation includes its foreground-window identity; the operator policy binds on the first fresh sample of each operation and checks subsequent samples/receipts against it. This works with the real `RemoteBackend`, which has no `current_target` method, without adding a window-read RPC. Missing/zero foreground identity refuses input. The bridge validates types and the finite future deadline, retains epoch/tick checks, rechecks the bound foreground, and skips **only** the last-input-versus-own-baseline predicate while the policy is active. It checks wall and target-tick expiry immediately before each physical write. Condition/receipt forwarding remains mandatory; it is refreshed before controller forwarding and after each receipt so composites retain the flag, binding and deadline. An older v1-only bridge refuses v2 **before input** (or lacks required foreground evidence), without an unconditioned retry. Observation/receipt version stays 1. No new RPC, threshold widening, baseline reset, attribution guess or foreign-event credit is introduced.
+
+Revocation and Stop cannot undo input already in transit or in a native call. Controller revocation is enforced before its next forwarded request; target expiry bounds already-forwarded composites. Existing target emergency-release/finally and retained-on-failure ledger paths remain in force, even when the policy expires. This is not a general target-side instantaneous Stop protocol.
+
+`as_dict` reports the configured scope/deadline/reason and currently active fact, explicitly `authority_verified:false`. Cached diagnostics report only the active-at-enforcement boolean beside the unchanged classification; reading them samples no clock or target and does not assert current activity. Focused offline tests qualify policy, real forwarding and inert C# 5 predicate behavior only. Actual Windows PowerShell 5.1/native input and the user's task still need the separately owned device trial. Historical qualification receipts and the stopped Linux campaign are unchanged.
 
 ### 6.1 `yield` — halt and stay halted (default)
 
@@ -577,7 +591,7 @@ Evidence required to call C1 done — item 2 follows the explicitly scoped accep
 3. After an observed `human_active`, `yield` prevents the next task-directed write, releases everything held (`RELEASED:` lines in agent stderr), and the model receives an error naming the observation, margin and guard. The boundary harness checks callback invocation only; real ledger release and mounted authority/Stop paths still need their own evidence.
 4. Windows presence read adds **zero** additional `powershell.exe` spawns per action — measured, not asserted.
 5. Idle unreadable → `state: unknown` → the dependent mode fails loud. No path treats it as `quiet`.
-6. The §6.0 halt invariant cannot be disabled by any configuration key — verified by attempting it.
+6. The default §6.0 halt invariant remains unchanged, including `drive_anyway`/`enabled:false`; verify the explicitly authorized, default-off remote-Windows §6.0a exception separately, including expiry/revocation, target forwarding and all independent refusal/release paths.
 
 ### 11.1 Acceptance correction — 2026-11-04, `coexistence-boundary-v3`
 
@@ -629,7 +643,7 @@ Evidence: dialog renders on the console user's screen; answered path returns the
 
 | Metric | Target |
 |---|---|
-| **Sessions in which the guard observed `human_active` and permitted a further task-directed write** | **Zero — with or without any opt-out.** §6.0 is unconditional after observation; required safety releases remain allowed. |
+| **Sessions outside §6.0a in which the guard observed `human_active` and permitted a further task-directed write** | **Zero.** Default §6.0 is unconditional after observation; required safety releases remain allowed. Finite operator exceptions remain explicitly reported, not relabelled quiet. |
 | Every physical input detected before the next ordinary write | **UNMET product requirement** with timestamp masking and a sample-to-write race. The conditional gate does not solve or silently waive it. |
 | Independently placed outside-band input, before a fresh sample | Every valid predeclared control halts before the next ordinary emission, invokes release and retains the halt. Missing/unplaceable evidence is unqualified. |
 | Human input detected during sustained typing, all phases / multiple correlated events | Record observations and platform limits; no universal 100% or unsupported 99% two-event claim. |
