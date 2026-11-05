@@ -175,7 +175,7 @@ public static class CU {
     public static void Check() {
         CheckTarget(operatorTarget);
     }
-    static void CheckTarget(string target) {
+    static void CheckTarget(string target, string pendingSource = null) {
         if (!Guarded) return;
         Latest = Observe();
         if (Latest.epoch != expectedEpoch || Latest.now_ms < baselineNow ||
@@ -184,7 +184,8 @@ public static class CU {
         if (operatorPresenceOverride &&
             (UnixSeconds() >= operatorExpiry || (double)GetTickCount64() >= operatorDeadline))
             throw new InvalidOperationException("Operator presence condition expired");
-        if (operatorPresenceOverride && Latest.foreground != target)
+        if (operatorPresenceOverride && Latest.foreground != target &&
+            (pendingSource == null || Latest.foreground != pendingSource))
             throw new InvalidOperationException("Operator presence target changed");
         // Only this aggregate last-input predicate is overridden. Observation,
         // epoch/regression, checked SendInput count and receipts remain mandatory.
@@ -201,13 +202,33 @@ public static class CU {
         // Source stays pinned until the first activation call. SW_RESTORE can
         // itself activate: no source check may run between restore and focus.
         Check();
+        ulong settleStart = FocusTransition ? GetTickCount64() : 0;
         if (FocusTransition && IsIconic(handle)) ShowWindow(handle, 9);
         SetForegroundWindow(handle);
         if (FocusTransition) {
-            // Exact destination only, with the same clock/expiry predicates.
-            // The normal Alt-up below is then checked against this destination.
-            CheckTarget(focusTarget);
-            operatorTarget = focusTarget;
+            // Activation can finish on another input queue after the call returns.
+            // Observe only: never retry activation or emit input while settling.
+            ulong previousTick = settleStart, previousNow = Latest.now_ms,
+                previousLast = Latest.last_input_ms;
+            for (int poll = 0; ; poll++) {
+                CheckTarget(focusTarget, operatorTarget);
+                ulong tick = GetTickCount64();
+                if (tick < previousTick || Latest.now_ms < previousNow ||
+                    Latest.last_input_ms < previousLast)
+                    throw new InvalidOperationException("Windows target-clock epoch/ticks changed");
+                if (tick - settleStart >= 500)
+                    throw new InvalidOperationException("Focus activation settlement timed out");
+                if (Latest.foreground == focusTarget) {
+                    // Only a valid exact destination can rebind normal Alt-up.
+                    operatorTarget = focusTarget;
+                    break;
+                }
+                // Also finite if the target tick stops advancing.
+                if (poll == 50)
+                    throw new InvalidOperationException("Focus activation settlement timed out");
+                previousTick = tick; previousNow = Latest.now_ms; previousLast = Latest.last_input_ms;
+                System.Threading.Thread.Sleep(10);
+            }
         }
     }
     public static void VerifyFocus() {
