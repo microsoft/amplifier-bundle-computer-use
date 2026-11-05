@@ -46,6 +46,10 @@ PAYLOAD_MODULES = (
     "linux_x11.py",
     "macos.py",
     "windows.py",
+    # Opt-in target-owner diagnostic preparation is lazy and starts nothing.
+    # Ship both siblings so it uses the SAME backend's marker after bootstrap.
+    "windows_input_diagnostics.py",
+    "input_probe.ps1",
     "target_clock.py",
     "wire.py",
     "ledger.py",

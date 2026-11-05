@@ -116,6 +116,21 @@ public static class CU {
     static ulong baselineNow, baselineLast;
     static ulong? injectBefore;
     static double guardMs;
+    static IntPtr inputMarker;
+    public static void ConfigureMarker(long marker) {
+        if (marker <= 0 || (IntPtr.Size == 4 && marker > Int32.MaxValue))
+            throw new InvalidOperationException("Malformed private input marker");
+        inputMarker = new IntPtr(marker);
+    }
+    static void Stamp(INPUT[] inputs) {
+        // Absent marker preserves one-shot CLI callers. This is neither a
+        // permission nor evidence that an injected event is physically ours.
+        if (inputMarker == IntPtr.Zero) return;
+        for (int i = 0; i < inputs.Length; i++) {
+            if (inputs[i].type == 1) inputs[i].ki.dwExtraInfo = inputMarker;
+            else if (inputs[i].type == 0) inputs[i].mi.dwExtraInfo = inputMarker;
+        }
+    }
     public static void Configure(string expected, ulong now, ulong last, ulong? injection, double guard) {
         if (String.IsNullOrEmpty(expected) || last > now ||
             now - last >= 0x100000000UL || (injection.HasValue && injection.Value > now) ||
@@ -139,6 +154,7 @@ public static class CU {
     }
     public static void Emit(INPUT[] inputs) {
         EmissionAttempted = false;
+        Stamp(inputs);
         Check();
         // No sleep, PowerShell startup or transport between this check and
         // SendInput. This narrows the race; it is NOT an atomic check+syscall.
@@ -156,6 +172,7 @@ public static class CU {
     }
     public static void Release(INPUT[] inputs) {
         // Cleanup after a refused/partial hold must not be gated or credited.
+        Stamp(inputs);
         uint count = SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(INPUT)));
         if (count != inputs.Length) throw new InvalidOperationException("SendInput release count mismatch");
     }
@@ -413,6 +430,11 @@ try {
       "a silently mis-scaled or mis-scoped monitor.")
   }
   $req = Get-Content -Raw -LiteralPath $RequestFile | ConvertFrom-Json
+  if ($null -ne $req._input_marker) {
+    if (($req._input_marker -isnot [int] -and $req._input_marker -isnot [long]) -or
+        $req._input_marker -le 0) { throw "Malformed private input marker" }
+    [CU]::ConfigureMarker($req._input_marker)
+  }
   $action = "$($req.action)".ToLower()
   $state = Get-SessionState
 
