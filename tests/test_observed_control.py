@@ -2,15 +2,18 @@
 
 import asyncio
 import io
+import threading
 import time
 from types import SimpleNamespace
 
 import pytest
 from amplifier_module_tool_computer_use import ComputerTool
+from amplifier_module_tool_computer_use.coexistence_guard import CoexistenceGuard
 from amplifier_module_tool_computer_use.observed_control import (
     CURRENT_PROOF,
     ObservedControl,
 )
+from amplifier_module_tool_computer_use.presence import PresenceMonitor
 from PIL import Image
 from test_computer_tool_coexistence import _FakeBackend
 
@@ -130,16 +133,160 @@ async def test_presence_wait_precedes_final_observation_check():
 
 
 @pytest.mark.asyncio
-async def test_expired_observation_unobserved_candidate_and_remote_target():
+async def test_unobserved_candidate_stays_refused():
     tool, backend = setup()
-    tool._observed_control.observations["proof"]["observation"]["created_at"] -= 20
-    assert (await act(tool)).output["status"] == "stale"
     assert (
         await tool.execute(
             {"action": "act", "revision": "invented", "candidate": "click"}
         )
     ).output["status"] == "stale"
     assert not backend.calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("age", [20, 3600])
+async def test_older_selection_uses_fresh_pixels_and_one_canonical_approval(age):
+    tool, backend = setup()
+    control = tool._observed_control
+    control.observations["proof"]["observation"]["created_at"] -= age
+    seen = []
+
+    def no_new_selection(*args):
+        raise AssertionError("fresh validation must not repeat OCR selection")
+
+    control.observe = no_new_selection
+
+    async def approve(prepared, binding):
+        seen.append(prepared)
+        return True
+
+    tool._write_approval = approve
+    assert (await act(tool)).output["status"] == "completed"
+    assert seen == [{"action": "left_click", "coordinate": [60, 35]}]
+    assert backend.calls == [("click", 60, 35, "left", 1)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["screen", "target", "read_only", "denied"])
+async def test_older_selection_does_not_renew_authority_or_changed_target(change):
+    tool, backend = setup()
+    tool._observed_control.observations["proof"]["observation"]["created_at"] -= 3600
+    if change == "screen":
+        backend.color = "black"
+    elif change == "target":
+        tool._backend = Backend()  # Identical pixels on a different target.
+    elif change == "read_only":
+        tool._read_only = True
+
+    async def approve(prepared, binding):
+        return change != "denied"
+
+    tool._write_approval = approve
+    assert (await act(tool)).output["status"] == (
+        "denied" if change == "denied" else "stale"
+    )
+    assert not backend.calls and not tool._backend.calls
+
+
+@pytest.mark.asyncio
+async def test_target_replacement_during_fresh_read_refuses_before_approval():
+    tool, backend = setup()
+    capture = backend.capture
+
+    def replaced_capture(region=None):
+        result = capture(region)
+        tool._backend = Backend()
+        return result
+
+    backend.capture = replaced_capture
+    tool._observed_control.observations["proof"]["observation"]["created_at"] -= 3600
+
+    async def no_approval(prepared, binding):
+        raise AssertionError("changed observation cannot reach approval")
+
+    tool._write_approval = no_approval
+    assert (await act(tool)).output["status"] == "stale"
+    assert not backend.calls and not tool._backend.calls
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_fresh_read_never_dispatches_input():
+    tool, backend = setup()
+    tool._observed_control.observations["proof"]["observation"]["created_at"] -= 3600
+    entered, release, finished = (threading.Event() for _ in range(3))
+    capture = backend.capture
+
+    def waiting_capture(region=None):
+        entered.set()
+        assert release.wait(2), "test failed to release capture"
+        try:
+            return capture(region)
+        finally:
+            finished.set()
+
+    backend.capture = waiting_capture
+    task = asyncio.create_task(act(tool))
+    try:
+        assert await asyncio.to_thread(entered.wait, 2)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    finally:
+        release.set()
+        assert await asyncio.to_thread(finished.wait, 2)
+    assert not backend.calls
+
+
+@pytest.mark.asyncio
+async def test_older_selection_does_not_replay_unknown_input():
+    tool, backend = setup({"gate_writes": False})
+    tool._observed_control.observations["proof"]["observation"]["created_at"] -= 3600
+    click = backend.click
+
+    def lost_reply(*args, **kwargs):
+        click(*args, **kwargs)
+        raise RuntimeError("input reply lost")
+
+    backend.click = lost_reply
+    assert (await act(tool)).output["status"] == "unknown"
+    assert backend.calls == [("click", 60, 35, "left", 1)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("control", ["human", "pause", "halt", "unreadable"])
+async def test_fresh_pixels_cannot_clear_existing_presence_controls(
+    control, monkeypatch, tmp_path
+):
+    import amplifier_module_tool_computer_use as cu
+    from amplifier_module_tool_computer_use import halt_state
+
+    monkeypatch.setattr(
+        cu,
+        "record_halt",
+        lambda platform, snapshot, *, reason: halt_state.record_halt(
+            platform, snapshot, reason=reason, state_dir=tmp_path / "halt"
+        ),
+    )
+    tool, backend = setup({"gate_writes": False})
+
+    def idle():
+        if control == "unreadable":
+            raise OSError("presence unavailable")
+        return 0 if control in {"human", "halt"} else 999_999
+
+    monitor = PresenceMonitor(idle_source=idle, platform="linux-x11")
+    guard = CoexistenceGuard(presence=monitor, release_all=lambda reason: [])
+    if control == "pause":
+        guard.pause.set("overlay_click", reason="user stopped input")
+    elif control == "halt":
+        guard.seed_halted(monitor.sample())
+    tool._coexistence_guard = guard
+    saved = tool._observed_control.observations["proof"]
+    saved["binding"] = tool._binding
+    saved["observation"]["created_at"] -= 3600
+    assert (await act(tool)).output["status"] == "unknown"
+    assert not backend.calls
+    assert control not in {"human", "halt"} or guard._halted
 
 
 def test_extension_is_absent_by_default():
