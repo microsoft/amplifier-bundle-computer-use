@@ -276,7 +276,11 @@ def _with_content(msg: Any, content: Any) -> Any:
 
 
 def _expand_tool_results(
-    messages: list[Any], max_inline: int, capture_for_message=None, *, image_witness=None
+    messages: list[Any],
+    max_inline: int,
+    capture_for_message=None,
+    *,
+    image_witness=None,
 ) -> list[Any]:
     """Generic recency projection retaining complete original error/reference text.
 
@@ -361,7 +365,9 @@ def _project_request(request, max_inline, capture_for_message, *, image_witness=
     )
     if projected is messages:
         return request
-    clone = request.model_copy() if hasattr(request, "model_copy") else copy.copy(request)
+    clone = (
+        request.model_copy() if hasattr(request, "model_copy") else copy.copy(request)
+    )
     clone.messages = projected
     return clone
 
@@ -377,7 +383,12 @@ def _capture_current(capture):
         ) as source:
             s = os.fstat(source.fileno())
             return stat.S_ISREG(s.st_mode) and identity == (
-                s.st_dev, s.st_ino, s.st_mode, s.st_size, s.st_mtime_ns, s.st_ctime_ns
+                s.st_dev,
+                s.st_ino,
+                s.st_mode,
+                s.st_size,
+                s.st_mtime_ns,
+                s.st_ctime_ns,
             )
     except (OSError, RuntimeError):
         return False
@@ -649,7 +660,12 @@ async def mount(
     provider_restores = []
     active = True
     projection_capability = "computer_use.prepare_request"
-    previous_projection = coordinator.get_capability(projection_capability)
+    get_capability = getattr(coordinator, "get_capability", None)
+    register_capability = getattr(coordinator, "register_capability", None)
+    supports_preparation = callable(get_capability) and callable(register_capability)
+    previous_projection = (
+        get_capability(projection_capability) if supports_preparation else None
+    )
 
     def prepare_request(request):
         """Optional pre-fit host integration; ordinary provider wrappers remain."""
@@ -657,26 +673,35 @@ async def mount(
             raise ValueError("Computer screenshot projection has been closed")
         witnesses = []
         projected = _project_request(
-            request, max_inline, capture_for_message,
-            image_witness=lambda captures, capture: witnesses.append((captures, capture)),
+            request,
+            max_inline,
+            capture_for_message,
+            image_witness=lambda captures, capture: witnesses.append(
+                (captures, capture)
+            ),
         )
 
         def validate():
             if not active or any(
-                not capture_for_message.current(captures) or not _capture_current(capture)
+                not capture_for_message.current(captures)
+                or not _capture_current(capture)
                 for captures, capture in witnesses
             ):
                 raise ValueError("Prepared computer screenshot is no longer current")
 
         return projected, validate if witnesses else None
 
-    coordinator.register_capability(projection_capability, prepare_request)
+    if supports_preparation:
+        register_capability(projection_capability, prepare_request)
 
     async def cleanup() -> None:
         nonlocal active
         active = False
-        if coordinator.get_capability(projection_capability) is prepare_request:
-            coordinator.register_capability(projection_capability, previous_projection)
+        if (
+            supports_preparation
+            and get_capability(projection_capability) is prepare_request
+        ):
+            register_capability(projection_capability, previous_projection)
         for unregister in reversed(unregisters):
             if callable(unregister):
                 unregister()

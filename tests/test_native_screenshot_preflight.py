@@ -176,7 +176,7 @@ def test_error_marker_never_inlines_an_image_or_becomes_success(monkeypatch):
 
     monkeypatch.setattr(hook, "_image_block", no_image)
     result = hook._expand_tool_results([msg], 3)[0]
-    assert result is not msg
+    assert result is msg  # Failed unchanged results retain identity as well as text.
     assert result["content"] == msg["content"]
 
 
