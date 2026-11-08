@@ -250,6 +250,13 @@ def _make_capture_authority(coordinator: Any, max_inline: int):
             return captures
         return None
 
+    def current(captures):
+        return any(
+            saved is captures and coordinator.get("tools", name) is tool
+            for name, _, tool, _, saved in records
+        )
+
+    lookup.current = current
     return post, lookup
 
 
@@ -269,7 +276,11 @@ def _with_content(msg: Any, content: Any) -> Any:
 
 
 def _expand_tool_results(
-    messages: list[Any], max_inline: int, capture_for_message=None
+    messages: list[Any],
+    max_inline: int,
+    capture_for_message=None,
+    *,
+    image_witness=None,
 ) -> list[Any]:
     """Generic recency projection retaining complete original error/reference text.
 
@@ -277,6 +288,7 @@ def _expand_tool_results(
     particular this hook does not make image-only results or extra user turns.
     """
     rewritten = []
+    changed = False
     budget = max_inline
     for msg in reversed(messages):
         original = _read_content(msg)
@@ -298,7 +310,7 @@ def _expand_tool_results(
             or envelope.get("isError") is True
             or bool(envelope.get("error"))
         ):
-            rewritten.append(_with_content(msg, copy.deepcopy(original)))
+            rewritten.append(msg)
             continue
         captures = capture_for_message(msg, payload) if capture_for_message else None
         if captures is None:
@@ -316,6 +328,8 @@ def _expand_tool_results(
                     missing = True
                 else:
                     blocks.append(block)
+                    if image_witness is not None:
+                        image_witness(captures, capture)
             if blocks:
                 budget -= 1
         # Keep the full envelope (success/error/progress), including any text
@@ -335,9 +349,49 @@ def _expand_tool_results(
                 else ""
             )
             content = text + note
-        rewritten.append(_with_content(msg, content))
+        projected = _with_content(msg, content)
+        changed = changed or projected is not msg
+        rewritten.append(projected)
     rewritten.reverse()
-    return rewritten
+    return rewritten if changed else messages
+
+
+def _project_request(request, max_inline, capture_for_message, *, image_witness=None):
+    messages = getattr(request, "messages", None)
+    if not isinstance(messages, list):
+        return request
+    projected = _expand_tool_results(
+        messages, max_inline, capture_for_message, image_witness=image_witness
+    )
+    if projected is messages:
+        return request
+    clone = (
+        request.model_copy() if hasattr(request, "model_copy") else copy.copy(request)
+    )
+    clone.messages = projected
+    return clone
+
+
+def _capture_current(capture):
+    """Revalidate issuance without rereading or encoding image bytes."""
+    issued_path, canonical, identity = capture
+    try:
+        if str(Path(issued_path).resolve()) != canonical:
+            return False
+        with os.fdopen(
+            os.open(issued_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), "rb"
+        ) as source:
+            s = os.fstat(source.fileno())
+            return stat.S_ISREG(s.st_mode) and identity == (
+                s.st_dev,
+                s.st_ino,
+                s.st_mode,
+                s.st_size,
+                s.st_mtime_ns,
+                s.st_ctime_ns,
+            )
+    except (OSError, RuntimeError):
+        return False
 
 
 def _has_neutral_intent(tool: Any) -> bool:
@@ -388,21 +442,7 @@ def _wrap_provider(
         return False
 
     def project_request(request: Any) -> Any:
-        messages = getattr(request, "messages", None)
-        if not isinstance(messages, list):
-            return request
-        clone = (
-            request.model_copy(deep=True)
-            if hasattr(request, "model_copy")
-            else copy.deepcopy(request)
-        )
-        clone.messages = _expand_tool_results(
-            clone.messages, max_inline, capture_for_message
-        )
-        _trace(
-            f"request projection: markers={sum(_parse_marker(_read_content(m)) is not None for m in messages)} messages_with_blocks={sum(isinstance(_read_content(m), list) for m in clone.messages)}"
-        )
-        return clone
+        return _project_request(request, max_inline, capture_for_message)
 
     original_budget = getattr(provider, "request_budget", None)
     if callable(original_budget):
@@ -618,8 +658,50 @@ async def mount(
     capture_post, capture_for_message = _make_capture_authority(coordinator, max_inline)
     unregisters = []
     provider_restores = []
+    active = True
+    projection_capability = "computer_use.prepare_request"
+    get_capability = getattr(coordinator, "get_capability", None)
+    register_capability = getattr(coordinator, "register_capability", None)
+    supports_preparation = callable(get_capability) and callable(register_capability)
+    previous_projection = (
+        get_capability(projection_capability) if supports_preparation else None
+    )
+
+    def prepare_request(request):
+        """Optional pre-fit host integration; ordinary provider wrappers remain."""
+        if not active:
+            raise ValueError("Computer screenshot projection has been closed")
+        witnesses = []
+        projected = _project_request(
+            request,
+            max_inline,
+            capture_for_message,
+            image_witness=lambda captures, capture: witnesses.append(
+                (captures, capture)
+            ),
+        )
+
+        def validate():
+            if not active or any(
+                not capture_for_message.current(captures)
+                or not _capture_current(capture)
+                for captures, capture in witnesses
+            ):
+                raise ValueError("Prepared computer screenshot is no longer current")
+
+        return projected, validate if witnesses else None
+
+    if supports_preparation:
+        register_capability(projection_capability, prepare_request)
 
     async def cleanup() -> None:
+        nonlocal active
+        active = False
+        if (
+            supports_preparation
+            and get_capability(projection_capability) is prepare_request
+        ):
+            register_capability(projection_capability, previous_projection)
         for unregister in reversed(unregisters):
             if callable(unregister):
                 unregister()
