@@ -6,6 +6,26 @@ unchanged, sync or awaitable budgets and named request options are preserved, an
 screenshots collapse to text under `max_inline_screenshots`. Full error/progress/reference
 text is retained; no vendor image-only projection or extra user-reference turn is created.
 
+A no-op projection preserves the request, messages list and message identities. A
+changed projection copies only the request shell and changed messages; it does not
+mutate the caller or copy unrelated prompt content.
+
+Hosts that fit and bind requests before provider dispatch can use the optional
+`computer_use.prepare_request` coordinator capability. Its synchronous callable
+returns `(projected_request, validate_or_none)`. Invoke it before fitting, then keep
+the exact projected representation. For images, call the returned validator after
+awaited metadata/admission and immediately before provider entry. It rechecks
+original capture issuance, mounted tool identity, hook lifetime and file identity
+without rereading image bytes. Failure must refuse that prepared dispatch, even
+without diagnostics or numeric budget capture. It is not execution permission or
+a budget receipt. Request/options equality and task/dispatch binding remain the
+host's responsibility. Replacing the capability invalidates prepared host work.
+
+The ordinary CLI/Agent provider wrappers remain available without this capability
+consumer. Already-projected typed blocks and collapsed reference text are naturally
+idempotent, so these wrappers do not replace the host's prepared object. No request
+metadata, provider name, public token or skip flag grants a projection bypass.
+
 Local image reads additionally require a successful capture genuinely emitted by the
 mounted tool, transferred once through the coordinator's `tool:post` call/result
 association. Role/name/call-id/marker text and arbitrary paths grant no authority.
