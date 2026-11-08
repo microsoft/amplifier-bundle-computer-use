@@ -66,7 +66,11 @@ def test_prepared_image_source_validation_and_idempotence(computer, revocation):
     run(mount("tools", computer, "my_desktop"))
     run(mount("providers", provider, "test-provider"))
     cleanup = run(hook.mount(coordinator))
-    run(coordinator.hooks.emit("provider:request", {"provider": "test-provider"}))
+
+    async def ready():
+        await coordinator.hooks.emit("provider:request", {"provider": "test-provider"})
+
+    run(ready())
     message = run(captured_message(coordinator, computer))
     ordinary = Message(role="user", content="keep identity")
     request = ChatRequest(messages=[ordinary, Message(**message)])
