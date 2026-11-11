@@ -121,6 +121,19 @@ def accept(rig, result, *, require_injection=True):
         exchange.finish(result, require_injection=require_injection)
 
 
+def test_recorded_31ms_send_interval_does_not_credit_its_completion(make_rig):
+    """Keep the real recurrence's conservative refusal, not an after-time fix."""
+    rig = make_rig(now=37738250, last=37631281)
+    raw = receipt(before=37738890, now=37738968, last=37738921)
+    raw["target_clock"]["injection"]["after_ms"] = 37738921
+    raw["target_clock"]["injection"]["count"] = 1
+    with pytest.raises(HaltedError) as error:
+        accept(rig, raw)
+    assert error.value.snapshot.margin_ms == 31
+    assert rig.guard.halted
+    assert rig.monitor.target_condition()["inject_before_ms"] == 37738890
+
+
 def assert_sticky_unknown(rig, error, *, baseline=10010):
     snapshot = error.value.snapshot
     assert snapshot.state is presence.PresenceState.UNKNOWN

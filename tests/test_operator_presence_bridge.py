@@ -78,7 +78,12 @@ def test_actual_bridge_csharp5_predicates_with_inert_native_boundaries(tmp_path)
     assert count == 1
     source, count = re.subn(
         r'\[DllImport\("user32.dll"\)\] public static extern uint SendInput\(uint n, INPUT\[\] inputs, int size\);',
-        "public static uint? FakeCount; public static int Sends; public static uint SendInput(uint n, INPUT[] inputs, int size) { Sends++; return FakeCount.HasValue ? FakeCount.Value : n; }",
+        """public static uint? FakeCount; public static int Sends;
+        public static ulong SendDelay; public static INPUT[] Sent;
+        public static uint SendInput(uint n, INPUT[] inputs, int size) {
+            Sends++; Sent = inputs; FakeTick += SendDelay;
+            return FakeCount.HasValue ? FakeCount.Value : n;
+        }""",
         source,
     )
     assert count == 1
@@ -110,6 +115,7 @@ public static class OfflineChecks {
     }
     static void Fresh(ulong? injection) {
         CU.FakeWall = 1000; CU.FakeTick = 10100; CU.FakeCount = null;
+        CU.SendDelay = 0;
         CU.Configure("boot/session", 10000, 1000, injection, 20);
         CU.FakeObservation = new CU.Observation { epoch="boot/session", now_ms=10100, last_input_ms=10090, foreground="window-a" };
     }
@@ -145,6 +151,37 @@ public static class OfflineChecks {
         CU.Configure("boot/session", 10000, 1000, null, 20); Refuses(CU.Check); // no policy leakage
         Refuses(delegate { CU.Configure("", 10000, 1000, null, 20); });
         Refuses(delegate { CU.Configure("boot/session", 10000, 10001, null, 20); });
+        // Actual incident interval: a 31ms SendInput receipt with last-input at
+        // its end is indistinguishable from an external event to the old
+        // before-tick classifier. Keep that classifier unchanged; stamp our
+        // keyboard AND mouse events at the same target tick as the receipt.
+        Fresh(null);
+        CU.FakeObservation.last_input_ms = 1000;
+        CU.SendDelay = 31;
+        var inputs = new CU.INPUT[2];
+        inputs[0].type = 0; inputs[1].type = 1;
+        CU.Emit(inputs);
+        Assert(CU.Injection.before_ms == 10100 && CU.Injection.after_ms == 10131);
+        Assert(CU.Sent[0].mi.time == 10100 && CU.Sent[1].ki.time == 10100);
+        CU.FakeObservation.now_ms = 10178;
+        CU.FakeObservation.last_input_ms = CU.Sent[1].ki.time;
+        CU.Check(); // own stamped event; no later input manufactured
+        CU.FakeObservation.last_input_ms = 10121;
+        Refuses(CU.Check); // genuine outside-band input STILL refuses
+        // DWORD wrapping follows the target clock, not controller/wall time.
+        Fresh(null);
+        CU.FakeObservation.last_input_ms = 1000;
+        CU.FakeTick = 0x100002774UL;
+        CU.Emit(inputs);
+        Assert(CU.Sent[0].mi.time == 10100 && CU.Sent[1].ki.time == 10100);
+        // Unguarded one-shot calls retain the Windows default timestamp.
+        Fresh(null); CU.Guarded = false;
+        inputs = new CU.INPUT[2]; inputs[0].type = 0; inputs[1].type = 1;
+        CU.Emit(inputs);
+        Assert(CU.Sent[0].mi.time == 0 && CU.Sent[1].ki.time == 0);
+        // Cleanup must not acquire or falsify ordinary emission credit.
+        Fresh(null); var receiptBefore = CU.Injection;
+        CU.Release(inputs); Assert(CU.Injection == receiptBefore);
         Console.WriteLine("CSharp5 inert bridge checks=" + checks);
     }
 }
@@ -176,4 +213,4 @@ public static class OfflineChecks {
         timeout=120,
     )
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "CSharp5 inert bridge checks=22" in result.stdout
+    assert "CSharp5 inert bridge checks=28" in result.stdout
