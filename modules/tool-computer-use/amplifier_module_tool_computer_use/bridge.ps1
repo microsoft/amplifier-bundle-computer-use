@@ -190,6 +190,20 @@ public static class CU {
         // No sleep, PowerShell startup or transport between this check and
         // SendInput. This narrows the race; it is NOT an atomic check+syscall.
         ulong before = GetTickCount64();
+        if (Guarded) {
+            // INPUT.time defaults to the time Windows processes an event, not
+            // necessarily this call's start. A delayed SendInput can therefore
+            // put our own event outside the unchanged presence guard. Stamp
+            // the documented DWORD event time from the SAME target clock as
+            // the receipt. Do not credit after/LastInputInfo or widen the band.
+            // At DWORD zero Windows retains its documented default-time rule;
+            // an ambiguous result still fails closed through the normal guard.
+            uint eventTime = unchecked((uint)before);
+            for (int i = 0; i < inputs.Length; i++) {
+                if (inputs[i].type == 1) inputs[i].ki.time = eventTime;
+                else if (inputs[i].type == 0) inputs[i].mi.time = eventTime;
+            }
+        }
         EmissionAttempted = true;
         uint count = SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(INPUT)));
         ulong after = GetTickCount64();

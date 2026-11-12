@@ -256,6 +256,26 @@ That is historical evidence for measuring the live path, not a benchmark, ratio,
 4. **The fixed threshold reports; it does not control.** `REMOTE_TRANSPORT_WARNING_MS = 2000.0` lives in the tool composition/reporting layer. The first successful remote sample above it logs one concise measured warning per physical channel per controller process. Samples at or below it, including remote guard construction, are quiet. This observer is called immediately after the existing successful sample and cannot alter classification, a halt, pause, or release.
 5. **What remains unproven.** The ordering fix removes a controller-side bias but cannot remove response transit after the target captures `idle_ms` without a target timestamp. `transport_latency_ms` remains the conservative full-call bound. No remote hardware was touched for this change; the historical 296-875ms result above was not re-measured.
 
+### 5.8 Windows synthetic event time and syscall duration
+
+The guarded Windows bridge sets both `KEYBDINPUT.time` and `MOUSEINPUT.time`
+to the low DWORD of the same target `GetTickCount64` value captured immediately
+before `SendInput`. Windows otherwise chooses the event time when `time=0`.
+A slow syscall must not date our own event later than its receipt's injection
+anchor and then classify that difference as outside input. The observed
+recurrence had `before=37738890`, `after=37738921`,
+`last_input=37738921`: a 31 ms interval against the unchanged 20 ms guard.
+That trace establishes the timing conflict, not the physical author of every event.
+
+This does not credit the syscall completion or a later `GetLastInputInfo`
+value as our injection. Later input beyond the existing band still refuses;
+count, epoch, tick regression, target, pause, durable halt and unknown-result
+checks remain unchanged. Unguarded one-shot calls and safety-release events
+retain their existing timestamp behavior. At low-DWORD zero, Windows still
+applies its documented default-time rule; ambiguity is not silently credited.
+Headless C# tests exercise stamping, delayed emission and later-input rejection.
+They are not native emission/readback or general Windows safety qualification.
+
 ---
 
 ## 6. The handoff protocol
