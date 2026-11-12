@@ -1228,6 +1228,7 @@ class ComputerTool:
         *,
         coord: tuple[int, int] | None = None,
         binding: _Binding | None = None,
+        focus_target: str | None = None,
     ):
         """Wrap one mutating action in the coexistence guard's before/after
         discipline (`docs/designs/coexistence.md` \u00a75.2/\u00a78.6), extended in
@@ -1286,7 +1287,12 @@ class ComputerTool:
                 check_observed_proof(binding)
             from .target_clock import guarded_target_call
 
-            with guarded_target_call(guard):
+            with guarded_target_call(guard, focus_target=focus_target) as exchange:
+                if (
+                    focus_target is not None
+                    and getattr(exchange, "focus_target", None) is not None
+                ):
+                    exchange.focus_check = _check_input_cancelled
                 yield
         finally:
             guard.after_event()
@@ -2257,9 +2263,12 @@ class ComputerTool:
             handle = params.get("handle")
             if not handle:
                 raise ValueError("action 'focus_window' requires 'handle'")
-            with self._guard_write(binding=binding):
-                backend.focus_window(str(handle))
-            note = self._focus_monitor_warning(str(handle), binding)
+            # Capture the validated/approved destination once, independently of
+            # mutable params or any receipt, on the already pinned backend.
+            handle = str(handle)
+            with self._guard_write(binding=binding, focus_target=handle):
+                backend.focus_window(handle)
+            note = self._focus_monitor_warning(handle, binding)
             return f"focused window {handle}{note}", None
 
         if action in _CLICK_ACTIONS:
@@ -3854,6 +3863,10 @@ class DesktopTool:
                 self._computer._run_flat_step, action, input, binding, approved
             )
             return ToolResult(success=True, output=summary)
+        except HaltedError as exc:
+            # Desktop mutations use the same guard as computer actions. Keep
+            # their halt durable too; a new mount must not omit a failed focus.
+            return self._computer._record_halt_result(action, exc, binding=binding)
         except (BackendError, ValueError) as exc:
             return ToolResult(
                 success=False, error={"message": str(exc), "type": type(exc).__name__}

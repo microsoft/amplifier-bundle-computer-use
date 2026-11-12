@@ -22,7 +22,7 @@ BRIDGE = (
 
 def test_powershell_override_condition_is_explicit_typed_and_old_peers_refuse_v2():
     source = BRIDGE.read_text()
-    assert "$condition.version -notin @(1, 2)" in source
+    assert "$condition.version -notin @(1, 2, 3)" in source
     assert "$condition.operator_presence_override -isnot [bool]" in source
     assert "$condition.operator_presence_override -ne $true" in source
     assert "$condition.operator_presence_channel -isnot [string]" in source
@@ -41,6 +41,33 @@ def test_powershell_override_condition_is_explicit_typed_and_old_peers_refuse_v2
     )
     # The pre-change bridge accepts ONLY v1: v2 cannot silently select unguarded input.
     assert "version=2" in (BRIDGE.parent / "coexistence_guard.py").read_text()
+    assert "$condition.focus_target -cne" in source
+    assert "$action -ne 'focus_window'" in source
+    assert 'throw "Focus transition requires Windows condition v3"' in source
+    focus = source.split("    'focus_window' {", 1)[1].split("    default {", 1)[0]
+    assert focus.index("::Emit([CU+INPUT[]]") < focus.index("::ActivateFocus($h)")
+    assert focus.index("::ActivateFocus($h)") < focus.index("::Emit($altUp)")
+    assert "if (-not [CU]::FocusTransition -and [CU]::IsIconic($h))" in focus
+    assert "finally {" in focus and "[CU]::Release($altUp)" in focus
+    assert "::VerifyFocus()" in focus
+
+
+def test_focus_settlement_is_private_to_v3_and_does_not_retry_activation():
+    source = BRIDGE.read_text()
+    activation = source.split(
+        "    public static void ActivateFocus(IntPtr handle) {", 1
+    )[1].split("    public static void VerifyFocus()", 1)[0]
+    assert activation.count("SetForegroundWindow(handle);") == 1
+    assert activation.index("Check();") < activation.index(
+        "SetForegroundWindow(handle);"
+    )
+    settlement = activation.split("SetForegroundWindow(handle);", 1)[1]
+    assert settlement.lstrip().startswith("if (FocusTransition) {")
+    assert "CheckTarget(focusTarget, operatorTarget);" in settlement
+    assert source.count("CheckTarget(focusTarget, operatorTarget);") == 1
+    assert "System.Threading.Thread.Sleep(10);" in settlement
+    assert "tick - settleStart >= 500" in settlement and "poll == 50" in settlement
+    assert "Emit(" not in activation and "Release(" not in activation
 
 
 def test_actual_bridge_csharp5_predicates_with_inert_native_boundaries(tmp_path):
@@ -68,11 +95,31 @@ def test_actual_bridge_csharp5_predicates_with_inert_native_boundaries(tmp_path)
         .split('Add-Type @"\n', 1)[1]
         .split('\n"@ -ReferencedAssemblies', 1)[0]
     )
-    # Replace ONLY OS acquisition and physical emission. Keep actual Configure,
-    # ConfigureOperatorPresence, Check, Emit, Release, receipt and count logic.
+    # Replace ONLY OS acquisition, physical emission and the polling sleep.
+    # Keep actual conditions, settlement, Emit, Release, receipt and count logic.
     source, count = re.subn(
         r'\[DllImport\("kernel32.dll"\)\] public static extern ulong GetTickCount64\(\);',
         "public static ulong FakeTick = 10000; public static ulong GetTickCount64() { return FakeTick; }",
+        source,
+    )
+    assert count == 1
+    # Native focus calls are inert too. Restore may activate immediately, and
+    # SetForegroundWindow can refuse, settle later or land on a third window.
+    source, count = re.subn(
+        r'\[DllImport\("user32.dll"\)\] public static extern bool IsIconic\(IntPtr h\);',
+        "public static bool FakeMinimized; public static bool IsIconic(IntPtr h) { return FakeMinimized; }",
+        source,
+    )
+    assert count == 1
+    source, count = re.subn(
+        r'\[DllImport\("user32.dll"\)\] public static extern bool ShowWindow\(IntPtr h, int cmd\);',
+        "public static int Restores; public static bool ShowWindow(IntPtr h, int cmd) { Restores++; FakeObservation.foreground = h.ToString(); return true; }",
+        source,
+    )
+    assert count == 1
+    source, count = re.subn(
+        r'\[DllImport\("user32.dll"\)\] public static extern bool SetForegroundWindow\(IntPtr h\);',
+        'public static string FakeDestination = "200"; public static int Activations; public static Action OnActivation; public static bool SetForegroundWindow(IntPtr h) { Activations++; FakeObservation.foreground = FakeDestination; if (OnActivation != null) OnActivation(); return FakeDestination == h.ToString(); }',
         source,
     )
     assert count == 1
@@ -87,7 +134,8 @@ def test_actual_bridge_csharp5_predicates_with_inert_native_boundaries(tmp_path)
     source = (
         source[:start]
         + """    public static Observation FakeObservation;
-    public static Observation Observe() { return FakeObservation; }
+    public static Action BeforeObserve;
+    public static Observation Observe() { if (BeforeObserve != null) BeforeObserve(); return FakeObservation; }
 """
         + source[end:]
     )
@@ -98,20 +146,142 @@ def test_actual_bridge_csharp5_predicates_with_inert_native_boundaries(tmp_path)
         flags=re.S,
     )
     assert count == 1
+    source, count = re.subn(
+        r"System\.Threading\.Thread\.Sleep\(10\);",
+        "FakeSleep(10);",
+        source,
+    )
+    assert count == 1
+    source = source.replace(
+        "    public static bool Guarded;",
+        """    public static int Sleeps;
+    public static bool FreezeTick;
+    public static Action OnSleep;
+    public static void FakeSleep(int ms) {
+        Sleeps++;
+        if (!FreezeTick) { FakeTick += (ulong)ms; FakeObservation.now_ms = FakeTick; }
+        if (OnSleep != null) OnSleep();
+    }
+    public static bool Guarded;""",
+        1,
+    )
     harness = r"""
 public static class OfflineChecks {
     static int checks;
     const string Channel = "remote-ssh:windows-wsl2:operator@synthetic";
     static void Assert(bool ok) { if (!ok) throw new Exception("offline check failed"); checks++; }
-    static void Refuses(Action action) {
+    static void Refuses(Action action, string message = null) {
         bool refused = false;
-        try { action(); } catch (InvalidOperationException) { refused = true; }
+        try { action(); } catch (InvalidOperationException ex) { refused = message == null || ex.Message == message; }
         Assert(refused);
     }
     static void Fresh(ulong? injection) {
         CU.FakeWall = 1000; CU.FakeTick = 10100; CU.FakeCount = null;
+        CU.Sleeps = 0; CU.FreezeTick = false;
+        CU.OnSleep = null; CU.OnActivation = null; CU.BeforeObserve = null;
         CU.Configure("boot/session", 10000, 1000, injection, 20);
         CU.FakeObservation = new CU.Observation { epoch="boot/session", now_ms=10100, last_input_ms=10090, foreground="window-a" };
+    }
+    static void FreshFocus(bool minimized) {
+        Fresh(null);
+        CU.FakeObservation.foreground = "100"; CU.FakeDestination = "200";
+        CU.FakeMinimized = minimized;
+        CU.ConfigureOperatorPresence(Channel, 1100, "100");
+        CU.ConfigureFocus("200");
+    }
+    // Mirrors the PowerShell try/finally whose ordering is source-checked above.
+    static void FocusWithAlt() {
+        bool released = false, pressed = false;
+        try {
+            CU.Emit(new CU.INPUT[1]); pressed = true;
+            CU.ActivateFocus(new IntPtr(200));
+            CU.Emit(new CU.INPUT[1]); released = true;
+        } finally {
+            if (!released && (pressed || CU.EmissionAttempted)) CU.Release(new CU.INPUT[1]);
+        }
+    }
+    static void SettlementRefuses(string message, int sleeps) {
+        int calls = CU.Activations, sends = CU.Sends;
+        Refuses(FocusWithAlt, message);
+        Assert(CU.Activations == calls + 1); // no activation retry
+        Assert(CU.Sends == sends + 2); // Alt-down + emergency release, no polling input
+        Assert(CU.Sleeps == sleeps);
+        Assert(CU.Injection.before_ms == 10100 && CU.Injection.after_ms == 10100 &&
+            CU.Injection.count == 1 && CU.Injection.epoch == "boot/session"); // failed settlement/release never credited
+    }
+    static void SettlementChecks() {
+        const string Changed = "Operator presence target changed";
+        const string Ticks = "Windows target-clock epoch/ticks changed";
+        const string Expired = "Operator presence condition expired";
+        const string Timeout = "Focus activation settlement timed out";
+        foreach (bool minimized in new bool[] { false, true }) {
+            FreshFocus(minimized); CU.FakeDestination = "100";
+            int calls = CU.Activations, sends = CU.Sends, restores = CU.Restores;
+            CU.OnSleep = delegate { if (CU.Sleeps == 3) CU.FakeObservation.foreground = "200"; };
+            FocusWithAlt(); CU.VerifyFocus();
+            Assert(CU.Activations == calls + 1 && CU.Restores == restores + (minimized ? 1 : 0));
+            Assert(CU.Sleeps == 3 && CU.Sends == sends + 2);
+            Assert(CU.Latest.foreground == "200" && CU.Injection.before_ms == 10130);
+            CU.FakeObservation.foreground = "100"; Refuses(CU.Check, Changed); // destination-only after adoption
+        }
+        FreshFocus(false); int immediate = CU.Activations;
+        FocusWithAlt(); Assert(CU.Activations == immediate + 1 && CU.Sleeps == 0);
+
+        FreshFocus(false); CU.FakeDestination = "100"; SettlementRefuses(Timeout, 50);
+        FreshFocus(false); CU.FakeDestination = "100"; CU.FreezeTick = true;
+        SettlementRefuses(Timeout, 50); // finite even with a frozen clock
+        FreshFocus(false); CU.FakeDestination = "100";
+        CU.OnSleep = delegate { if (CU.Sleeps == 50) CU.FakeObservation.foreground = "200"; };
+        SettlementRefuses(Timeout, 50); // exact destination at the deadline is too late
+        FreshFocus(false);
+        CU.OnActivation = delegate { CU.FakeTick += 500; CU.FakeObservation.now_ms = CU.FakeTick; };
+        SettlementRefuses(Timeout, 0); // activation time is inside the budget
+
+        foreach (string other in new string[] { null, "", "0", "300" }) {
+            FreshFocus(false); CU.FakeDestination = "100";
+            CU.OnSleep = delegate { CU.FakeObservation.foreground = CU.Sleeps == 1 ? other : "200"; };
+            SettlementRefuses(Changed, 1); // never wait through an invalid foreground
+        }
+        FreshFocus(false); CU.FakeDestination = "100";
+        CU.OnSleep = delegate { CU.FakeWall = 1100; CU.FakeObservation.foreground = "200"; };
+        SettlementRefuses(Expired, 1); // reaching destination does not override expiry
+        FreshFocus(false); CU.FakeDestination = "100";
+        CU.OnSleep = delegate { CU.FakeWall = 900; CU.FakeTick = 111100; };
+        SettlementRefuses(Expired, 1); // wall rollback cannot extend monotonic authority
+        FreshFocus(false); CU.FakeDestination = "100";
+        CU.OnSleep = delegate { CU.FakeObservation.epoch = "other"; };
+        SettlementRefuses(Ticks, 1);
+        FreshFocus(false); CU.FakeDestination = "100";
+        CU.OnSleep = delegate { if (CU.Sleeps == 2) CU.FakeObservation.now_ms = 10105; };
+        SettlementRefuses(Ticks, 2); // regression still ABOVE the original 10100 baseline
+        FreshFocus(false); CU.FakeDestination = "100";
+        CU.OnSleep = delegate { CU.FakeObservation.last_input_ms = CU.Sleeps == 1 ? 10095UL : 10094UL; };
+        SettlementRefuses(Ticks, 2); // regression still ABOVE the Alt-down 10090 baseline
+        FreshFocus(false); CU.FakeDestination = "100";
+        CU.OnSleep = delegate { if (CU.Sleeps == 2) CU.FakeTick = 10105; };
+        SettlementRefuses(Ticks, 2); // budget tick regression, not an observation regression
+
+        FreshFocus(true); int pinnedCalls = CU.Activations, pinnedRestores = CU.Restores, pinnedSends = CU.Sends;
+        int reads = 0;
+        CU.BeforeObserve = delegate { if (++reads == 2) CU.FakeObservation.foreground = "200"; };
+        Refuses(FocusWithAlt, Changed); // source must remain pinned AFTER Alt-down, before restore/activation
+        Assert(CU.Activations == pinnedCalls && CU.Restores == pinnedRestores && CU.Sends == pinnedSends + 2);
+        FreshFocus(false); CU.FakeDestination = "100"; int destinationReads = 0;
+        CU.OnSleep = delegate { CU.FakeObservation.foreground = "200"; };
+        CU.BeforeObserve = delegate {
+            if (CU.FakeObservation.foreground == "200" && ++destinationReads == 2) CU.FakeObservation.foreground = "100";
+        };
+        SettlementRefuses(Changed, 1); // normal Alt-up rechecks destination, not source-or-destination
+        FreshFocus(false); CU.FakeDestination = "100";
+        CU.OnSleep = delegate { CU.FakeWall = 1100; CU.FakeCount = 0; };
+        SettlementRefuses("SendInput release count mismatch", 1); // cleanup failure is not swallowed
+
+        Fresh(null); CU.FakeObservation.last_input_ms = 1000; int ordinaryCalls = CU.Activations;
+        CU.ActivateFocus(new IntPtr(200)); CU.VerifyFocus();
+        Assert(CU.Activations == ordinaryCalls + 1 && CU.Sleeps == 0 && !CU.FocusTransition);
+        Fresh(null); CU.ConfigureOperatorPresence(Channel, 1100, "window-a");
+        CU.ActivateFocus(new IntPtr(200));
+        Assert(CU.Sleeps == 0 && !CU.FocusTransition); Refuses(CU.Check, Changed); // v2 gets no settlement or transfer
     }
     public static void Main() {
         Fresh(null); Refuses(CU.Check);  // default initial aggregate change
@@ -145,7 +315,41 @@ public static class OfflineChecks {
         CU.Configure("boot/session", 10000, 1000, null, 20); Refuses(CU.Check); // no policy leakage
         Refuses(delegate { CU.Configure("", 10000, 1000, null, 20); });
         Refuses(delegate { CU.Configure("boot/session", 10000, 10001, null, 20); });
+        foreach (bool minimized in new bool[] { false, true }) {
+            FreshFocus(minimized); int restores = CU.Restores;
+            FocusWithAlt(); CU.VerifyFocus();
+            Assert(CU.Latest.foreground == "200");
+            Assert(CU.Restores == restores + (minimized ? 1 : 0));
+            Assert(CU.Injection.count == 1);
+            // Returning to the source after transition is NOT permitted.
+            CU.FakeObservation.foreground = "100"; Refuses(CU.Check);
+        }
+        FreshFocus(false); CU.FakeObservation.foreground = "200";
+        CU.ConfigureOperatorPresence(Channel, 1100, "200");
+        FocusWithAlt(); CU.VerifyFocus(); Assert(CU.Latest.foreground == "200"); // already focused
+        foreach (string destination in new string[] { "300", "0", "100", null }) {
+            FreshFocus(false); CU.FakeDestination = destination; int sends = CU.Sends;
+            Refuses(FocusWithAlt); Assert(CU.Sends == sends + 2); // down + unconditional emergency up
+        }
+        FreshFocus(true); CU.FakeObservation.foreground = "300";
+        int activations = CU.Activations; int restoreCount = CU.Restores;
+        Refuses(FocusWithAlt);
+        Assert(CU.Activations == activations && CU.Restores == restoreCount); // no early destination binding
+        FreshFocus(false); CU.FakeWall = 1100; Refuses(FocusWithAlt); // expired before down
+        FreshFocus(false); CU.Emit(new CU.INPUT[1]); CU.FakeWall = 1100;
+        Refuses(delegate { CU.ActivateFocus(new IntPtr(200)); });
+        CU.Release(new CU.INPUT[1]); // expiry does not gate emergency up
+        FreshFocus(false); CU.ActivateFocus(new IntPtr(200)); CU.FakeWall = 1100;
+        Refuses(delegate { CU.Emit(new CU.INPUT[1]); }); CU.Release(new CU.INPUT[1]);
+        FreshFocus(false); CU.ActivateFocus(new IntPtr(200)); CU.FakeCount = 0;
+        Refuses(delegate { CU.Emit(new CU.INPUT[1]); });
+        Refuses(delegate { CU.Release(new CU.INPUT[1]); }); // uncertain cleanup is not swallowed
+        FreshFocus(false); CU.ActivateFocus(new IntPtr(200)); CU.FakeObservation.epoch = "other";
+        Refuses(CU.VerifyFocus);
+        Fresh(null); Assert(!CU.FocusTransition); // no transition grant in a new request
         Console.WriteLine("CSharp5 inert bridge checks=" + checks);
+        int baseline = checks; SettlementChecks();
+        Console.WriteLine("CSharp5 inert settlement checks=" + (checks - baseline));
     }
 }
 """
@@ -176,4 +380,5 @@ public static class OfflineChecks {
         timeout=120,
     )
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "CSharp5 inert bridge checks=22" in result.stdout
+    assert "CSharp5 inert bridge checks=48" in result.stdout
+    assert "CSharp5 inert settlement checks=94" in result.stdout

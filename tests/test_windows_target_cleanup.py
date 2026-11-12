@@ -15,6 +15,7 @@ import sys
 import threading
 import time
 from copy import deepcopy
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -33,7 +34,12 @@ from amplifier_module_tool_computer_use.coexistence_guard import (
 from amplifier_module_tool_computer_use.ledger import HeldInputLedger
 from amplifier_module_tool_computer_use.remote_agent import RemoteAgent
 from amplifier_module_tool_computer_use.remote_backend import RemoteBackend
-from amplifier_module_tool_computer_use.target_clock import CURRENT_TARGET_CLOCK
+from amplifier_module_tool_computer_use.ssh_transport import SshConnectError
+from amplifier_module_tool_computer_use.target_clock import (
+    CURRENT_TARGET_CLOCK,
+    TargetClockFailure,
+    target_clock_exchange,
+)
 from amplifier_module_tool_computer_use.windows import WindowsBackend
 from amplifier_module_tool_computer_use.wire import Request
 
@@ -79,6 +85,10 @@ def make_rig(monkeypatch):
             fail_cleanup=False,
             reject_up=False,
             down_result="valid",
+            foreground="inert-owned-window",
+            focus_result="valid",
+            focus_hook=lambda: None,
+            write_foreground=None,
         )
         calls, emitted, wires, halts, releases, cleanup_runs, samples = (
             [] for _ in range(7)
@@ -100,7 +110,7 @@ def make_rig(monkeypatch):
                 "epoch": EPOCH,
                 "now_ms": state.now,
                 "last_input_ms": state.last,
-                "foreground": "inert-owned-window",
+                "foreground": state.foreground,
             }
 
         def custody():
@@ -137,8 +147,73 @@ def make_rig(monkeypatch):
                 }
             elif op == "screen_info":
                 result = {"ok": True, "width": 800, "height": 600, "screens": []}
+            elif op == "focus_window":
+                condition = payload["target_clock_condition"]
+                assert condition["version"] == 3
+                assert condition["operator_presence_target"] == state.foreground
+                assert condition["focus_target"] == payload["handle"]
+                call["source_binding"] = tool._coexistence_guard.binding.bound_target
+                state.foreground = payload["handle"]
+                emitted.append(op)
+                before = state.now
+                state.last = before
+                result = {
+                    "ok": True,
+                    "focused": state.foreground,
+                    "target_clock": {
+                        "observation": observation(),
+                        "injection": {
+                            "epoch": EPOCH,
+                            "before_ms": before,
+                            "after_ms": before,
+                            "count": 1,
+                        },
+                    },
+                }
+                mode = state.focus_result
+                if mode in {"third", "zero", "source", "missing-foreground"}:
+                    foreground = {
+                        "third": "999",
+                        "zero": "0",
+                        "source": condition["operator_presence_target"],
+                        "missing-foreground": None,
+                    }[mode]
+                    result["target_clock"]["observation"]["foreground"] = foreground
+                elif mode == "missing-focused":
+                    result.pop("focused")
+                elif mode == "wrong-focused":
+                    result["focused"] = "999"
+                elif mode == "rejected":
+                    result["ok"] = False  # desired focus alone is not success
+                elif mode == "native-catch":
+                    # Real PowerShell catch replaces, rather than mutates, out.
+                    result = {
+                        "ok": False,
+                        "focus_stage": "alt_up",
+                        "target_clock": result["target_clock"],
+                    }
+                elif mode == "missing":
+                    result.pop("target_clock")
+                elif mode == "missing-injection":
+                    result["target_clock"]["injection"] = None
+                elif mode == "count":
+                    result["target_clock"]["injection"]["count"] = 0
+                elif mode == "epoch":
+                    result["target_clock"]["injection"]["epoch"] = "other-boot"
+                elif mode == "tick":
+                    result["target_clock"]["injection"]["after_ms"] = before + 1
+                state.focus_hook()
+                call["result"] = deepcopy(result)
+                if mode == "lost":
+                    raise subprocess.TimeoutExpired(argv, 1)
             else:
-                assert op in {"left_mouse_down", "left_mouse_up"}, payload
+                assert op in {
+                    "left_mouse_down",
+                    "left_mouse_up",
+                    "key",
+                    "type",
+                    "left_click",
+                }, payload
                 condition = payload.get("target_clock_condition")
                 emergency = op == "left_mouse_up" and condition is None
                 if emergency and state.fail_cleanup:
@@ -163,6 +238,8 @@ def make_rig(monkeypatch):
                     before = state.now
                     state.last = before
                     emitted.append(op)
+                    if state.write_foreground is not None:
+                        state.foreground = state.write_foreground
                     if op == "left_mouse_down" and state.down_result == "human":
                         state.now += 50
                         state.last = state.now
@@ -218,9 +295,17 @@ def make_rig(monkeypatch):
                 # ContextVar. _dispatch installs only the wire condition.
                 token = CURRENT_TARGET_CLOCK.set(None)
                 try:
-                    return agent._dispatch(
+                    response = agent._dispatch(
                         Request(id=req["id"], op=req["op"], args=req["args"])
-                    ).encode()
+                    )
+                    if (
+                        req["op"] == "focus_window"
+                        and state.focus_result == "lost-remote"
+                    ):
+                        raise SshConnectError(
+                            "inert applied focus; lost acknowledgement"
+                        )
+                    return response.encode()
                 finally:
                     CURRENT_TARGET_CLOCK.reset(token)
 
@@ -642,3 +727,292 @@ def test_operator_policy_does_not_suppress_public_cancellation_or_schedule_next_
     assert [call["payload"]["action"] for call in ordinary] == ["left_mouse_down"]
     # Test cleanup owns the possibly completed hold; no normal UP was replayed.
     rig.tool._ledger.release_all(reason="inert-test-cleanup")
+
+
+@pytest.mark.parametrize("already_focused", [False, True])
+def test_public_explicit_focus_transfers_only_the_exact_approved_destination(
+    make_rig, already_focused
+):
+    rig = make_rig(remote=True, operator_override=True)
+    destination = "7209940"
+    source = destination if already_focused else rig.state.foreground
+    rig.state.foreground = source
+    transfers = []
+    original_bind = rig.guard.binding.bind
+
+    def bind(target):
+        transfers.append(target)
+        original_bind(target)
+
+    rig.guard.binding.bind = bind
+    finished_conditions = []
+    original_accept = rig.guard.accept_target_result
+
+    def accepted(result, **kwargs):
+        assert rig.guard.binding.bound_target == source
+        original_accept(result, **kwargs)
+        finished_conditions.append(rig.guard.target_condition())
+
+    rig.guard.accept_target_result = accepted
+    result = run(rig.tool.execute({"action": "focus_window", "handle": destination}))
+    assert result.success, result.error
+    assert transfers == [source, destination]
+    assert finished_conditions[0]["operator_presence_target"] == destination
+    assert finished_conditions[0]["version"] == 2
+    assert "focus_target" not in finished_conditions[0]
+    call = next(c for c in rig.calls if c["payload"]["action"] == "focus_window")
+    assert call["source_binding"] == source
+    wire = next(r for r in rig.wires if r["op"] == "focus_window")
+    assert (
+        wire["args"]["_target_clock_condition"]
+        == call["payload"]["target_clock_condition"]
+    )
+    assert rig.guard.binding.status == "not_bound"
+    assert CURRENT_TARGET_CLOCK.get() is None
+    # Next ordinary call uses only v2 and the new fresh foreground; no focus grant.
+    rig.guard.accept_target_result = original_accept
+    assert run(rig.tool.execute(DOWN)).success
+    condition = rig.calls[-1]["payload"]["target_clock_condition"]
+    assert condition["version"] == 2 and "focus_target" not in condition
+    assert condition["operator_presence_target"] == destination
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "third",
+        "zero",
+        "source",
+        "missing-foreground",
+        "missing-focused",
+        "wrong-focused",
+        "rejected",
+        "missing",
+        "missing-injection",
+        "count",
+        "epoch",
+        "tick",
+        "lost",
+        "lost-remote",
+    ],
+)
+def test_public_focus_failure_never_transfers_or_replays(make_rig, failure):
+    rig = make_rig(remote=True, operator_override=True)
+    source = rig.state.foreground
+    transfers = []
+    original_bind = rig.guard.binding.bind
+
+    def bind(target):
+        transfers.append(target)
+        original_bind(target)
+
+    rig.guard.binding.bind = bind
+    rig.state.focus_result = failure
+    result = run(rig.tool.execute({"action": "focus_window", "handle": "7209940"}))
+    assert_halted_public_result(rig, result, presence.PresenceState.UNKNOWN)
+    assert transfers == [source]
+    assert rig.guard.binding.status == "not_bound"
+    assert rig.emitted == ["focus_window"]
+    assert CURRENT_TARGET_CLOCK.get() is None
+
+
+@pytest.mark.parametrize(
+    "control", ["stop", "durable", "pause", "expiry", "revocation"]
+)
+def test_focus_receipt_cannot_transfer_after_independent_control(make_rig, control):
+    rig = make_rig(remote=True, operator_override=True)
+    transfers = []
+    bind = rig.guard.binding.bind
+    rig.guard.binding.bind = lambda target: (transfers.append(target), bind(target))[-1]
+    policy = rig.guard.operator_presence_override
+    controlled = {"wall": time.time(), "config": policy.config()}
+    rig.guard.operator_presence_override = replace(
+        policy,
+        wall_clock=lambda: controlled["wall"],
+        config_source=lambda: controlled["config"],
+    )
+
+    def interrupt():
+        if control == "stop":
+            rig.guard.seed_halted(rig.monitor.last_snapshot)
+        elif control == "durable":
+            rig.guard.durable_halt_poll = lambda: rig.monitor.last_snapshot
+        elif control == "pause":
+            rig.guard.pause.set("inert-focus-pause")
+        elif control == "expiry":
+            controlled["wall"] = policy.expires_at
+        else:
+            controlled["config"] = None
+
+    rig.state.focus_hook = interrupt
+    result = run(rig.tool.execute({"action": "focus_window", "handle": "7209940"}))
+    assert not result.success, result.output
+    assert transfers == ["inert-owned-window"]
+    assert rig.emitted == ["focus_window"]
+    assert CURRENT_TARGET_CLOCK.get() is None
+
+
+def test_public_focus_uses_approved_copy_not_mutable_request_or_approval_params(
+    make_rig,
+):
+    rig = make_rig(remote=True, operator_override=True)
+    rig.tool._binding = replace(rig.tool._binding, gate_writes=True)
+    request = {"action": "focus_window", "handle": "7209940"}
+    approvals = []
+
+    async def approve(params, binding):
+        approvals.append(deepcopy(params))
+        params["handle"] = request["handle"] = "999"
+        return True
+
+    rig.tool._write_approval = approve
+    result = run(rig.tool.execute(request))
+    assert result.success, result.error
+    assert approvals == [{"action": "focus_window", "handle": "7209940"}]
+    focus = next(
+        c["payload"] for c in rig.calls if c["payload"]["action"] == "focus_window"
+    )
+    assert (
+        focus["handle"] == focus["target_clock_condition"]["focus_target"] == "7209940"
+    )
+
+
+@pytest.mark.parametrize("action", ["type", "key", "left_click"])
+def test_public_ordinary_writes_cannot_select_focus_authority(make_rig, action):
+    rig = make_rig(remote=True, operator_override=True)
+    rig.state.write_foreground = "7209940"
+    result = run(
+        rig.tool.execute(
+            {
+                "action": action,
+                "text": "a",
+                "coordinate": [10, 20],
+                "focus_target": "7209940",  # ignored flat extra, never authority
+            }
+        )
+    )
+    assert_halted_public_result(rig, result, presence.PresenceState.UNKNOWN)
+    assert rig.guard._halt_snapshot.basis == "operator_presence_target_changed"
+    for call in rig.calls:
+        condition = call["payload"].get("target_clock_condition")
+        if condition:
+            assert condition["version"] == 2 and "focus_target" not in condition
+
+
+@pytest.mark.parametrize(
+    "action,params", [("key", {"text": "alt"}), ("focus_window", {"handle": "999"})]
+)
+def test_windows_forwarding_refuses_focus_scope_on_another_call(
+    make_rig, action, params
+):
+    rig = make_rig(remote=True, operator_override=True)
+    rig.guard.bind_target()
+    rig.guard.before_event()
+    condition = {
+        **rig.guard.target_condition(),
+        "version": 3,
+        "focus_target": "7209940",
+    }
+    before = len(rig.calls)
+    with target_clock_exchange(condition), pytest.raises(TargetClockFailure):
+        rig.agent.backend.raw(action, **params)
+    assert len(rig.calls) == before  # refused before any fake/native bridge
+    assert CURRENT_TARGET_CLOCK.get() is None
+
+
+@pytest.mark.parametrize("fail_cleanup", [False, True])
+def test_focus_lost_ack_retains_failed_existing_cleanup_and_never_replays(
+    make_rig, fail_cleanup
+):
+    rig = make_rig(remote=True, operator_override=True)
+    assert run(rig.tool.execute(DOWN)).success
+    rig.state.focus_result = "lost"
+    rig.state.fail_cleanup = fail_cleanup
+    result = run(rig.tool.execute({"action": "focus_window", "handle": "7209940"}))
+    assert_halted_public_result(rig, result, presence.PresenceState.UNKNOWN)
+    assert rig.emitted.count("focus_window") == 1
+    assert emergency_calls(rig)
+    for call in emergency_calls(rig):
+        assert call["context"] is None
+    assert rig.ledgers["controller"].held_tokens == ([TOKEN] if fail_cleanup else [])
+    assert rig.agent._ledger.held_tokens == ([TOKEN] if fail_cleanup else [])
+
+
+def test_public_cancel_during_focus_never_transfers_or_schedules_next_action(make_rig):
+    rig = make_rig(remote=True, operator_override=True)
+    entered, release, settled = (threading.Event() for _ in range(3))
+    transfers = []
+    bind = rig.guard.binding.bind
+    rig.guard.binding.bind = lambda target: (transfers.append(target), bind(target))[-1]
+
+    def in_flight():
+        entered.set()
+        assert release.wait(3)
+
+    rig.state.focus_hook = in_flight
+    rig.tool._band_enter = lambda: "inert-focus-band"
+    rig.tool._band_exit = lambda token: settled.set()
+
+    async def scenario():
+        task = asyncio.create_task(
+            rig.tool.execute(
+                {
+                    "version": 1,
+                    "actions": [{"action": "focus_window", "handle": "7209940"}, DOWN],
+                    "capture_after": False,
+                }
+            )
+        )
+        assert await asyncio.to_thread(entered.wait, 1)
+        try:
+            task.cancel()
+            result = await task
+            assert not result.success and result.error["type"] == "CancelledError"
+            assert not settled.is_set()
+        finally:
+            release.set()
+        assert await asyncio.to_thread(settled.wait, 1)
+
+    run(scenario())
+    assert rig.emitted == ["focus_window"]
+    assert transfers == ["inert-owned-window"]
+    assert rig.guard.halted and len(rig.halts) == 1
+    assert CURRENT_TARGET_CLOCK.get() is None
+
+
+def test_desktop_focus_halt_uses_shared_durable_recording(make_rig):
+    rig = make_rig(remote=True, operator_override=True)
+    rig.state.focus_result = "third"
+    desktop = cu.DesktopTool(rig.tool)
+    result = run(desktop.execute({"action": "focus_window", "handle": "7209940"}))
+    assert not result.success and result.error["type"] == "HaltedError"
+    assert rig.guard.halted
+    assert len(rig.halts) == 1
+    assert len(rig.tool.halt_notices) == 1
+    assert rig.tool.halt_notices[0]["action"] == "focus_window"
+    assert rig.guard.binding.status == "not_bound"
+    assert CURRENT_TARGET_CLOCK.get() is None
+
+
+def test_native_focus_catch_shape_retains_bounded_discriminator_and_halts(make_rig):
+    rig = make_rig(remote=True, operator_override=True)
+    rig.state.focus_result = "native-catch"
+    result = run(
+        cu.DesktopTool(rig.tool).execute(
+            {"action": "focus_window", "handle": "7209940"}
+        )
+    )
+    assert not result.success and rig.guard.halted
+    assert len(rig.halts) == 1
+    assert rig.guard.binding.status == "not_bound"
+    assert rig.emitted == ["focus_window"]
+    assert rig.guard.as_dict()["focus_transition_evidence"] == {
+        "bridge_ok": False,
+        "focused_present": False,
+        "focused_is_string": False,
+        "focused_matches": False,
+        "observed_present": True,
+        "observed_matches": True,
+        "bridge_stage": "alt_up",
+    }
+    assert CURRENT_TARGET_CLOCK.get() is None
