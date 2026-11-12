@@ -9,16 +9,32 @@ that live outside this repository:
 |---|---|---|
 | 1 | **Upstream module versions** — `loop-streaming`, `provider-anthropic` / `provider-openai` | Bundle refuses to mount, or silently degrades to a weaker function tool |
 | 2 | **An endpoint that accepts native computer use** | Server rejects the request |
-| 3 | **A target machine, and its per-platform prerequisites** — Windows **requires WSL2**; macOS requires **two** TCC grants; Linux requires **X11** (not Wayland) | Backend probe fails and tools never appear — or, on macOS and Linux, they appear and fail on first use |
+| 3 | **A target machine, and its per-platform prerequisites** — Windows **requires WSL2**; macOS requires **two** TCC grants; Linux requires **X11** (not Wayland) | Backend failure exposes `computer_use_unavailable` instead of `computer` / `desktop`; some OS/session failures are detected only on use |
 | 4 | **For remote targets: SSH, key auth, and `uv` on the far end** | Connect-time error (missing `uv`, untrusted host key, no key-based auth) |
 
-Work through them in that order. Each section tells you the exact check to run. **But
-first, register the bundle at all** — none of the above matters until Amplifier knows
-this bundle exists.
+Start with the path for your host below, then use the relevant sections to diagnose
+failures. Registration, mounted tools, and a successful desktop operation are three
+different states.
 
 ---
 
-## Install (do this first)
+## Start here: Unified or standalone
+
+- **Amplifier Unified:** the default setup already includes computer-use. Start in
+  **Settings → Desktop & browser → Check desktop and browser setup**, rather than
+  registering a second copy. Follow the owning
+  [Unified desktop-readiness guide](https://github.com/microsoft/amplifier-unified/blob/main/docs/DESKTOP-READINESS.md)
+  for the current checks and handoffs. Its readiness report does not mount worker
+  tools, activate a target, grant OS permissions, or prove physical capture/input.
+  The serving app's observation source and this conversation's mutable desktop
+  tools are separate capabilities.
+- **Standalone Amplifier bundle:** register the behavior below, use it for a
+  session, then inspect that session's actual tool list. For a look-only first
+  run, use the local `read_only: true` example in [§11](#11-minimal-working-config).
+  If `computer_use_unavailable` appears, use [target recovery](#recover-or-change-the-target-without-restarting);
+  reinstalling the bundle is not the first remedy for a target/backend failure.
+
+### Standalone registration
 
 Registering this behavior is ordinary Amplifier bundle management — the unusual part
 starts *after* registration, in the four rows above. The command below targets the
@@ -48,7 +64,7 @@ behavior manifest, so its registered name is `computer-use-behavior`:
    amplifier run "What's on my screen right now?"
    ```
 
-3. **Confirm it's actually there** before you rely on it:
+3. **Confirm registration**:
 
    ```bash
    amplifier bundle show computer-use-behavior
@@ -60,7 +76,10 @@ behavior manifest, so its registered name is `computer-use-behavior`:
 
 That's registration. It does **not** mean the tools will work yet — that depends on the
 four moving parts below (module versions, endpoint support, a reachable target machine,
-and, for remote targets, SSH). Read on for those.
+and, for remote targets, SSH). In the running session, inspect whether `computer` /
+`desktop` or the diagnostic `computer_use_unavailable` tool is mounted. Even a
+successful mount is not proof that capture or input reaches the intended desktop;
+verify the authorized operation and its visible result.
 
 ---
 
@@ -158,23 +177,67 @@ tools:
 
 | `target` | Behaviour |
 |---|---|
-| absent | Local backends are probed **in order**: Windows(WSL2) → Linux X11 → macOS. First one available wins. If none is available, **nothing is mounted**, the reason is logged, and the session continues without the tools. |
-| `ssh://user@host` or `ssh://host` | `RemoteBackend` is the **only** candidate. No fall-through to local. An unreachable target raises `RemoteTargetUnavailable`, which mount does **not** catch — deliberately, so an agent can never silently drive your own desktop when you asked for someone else's. |
-| anything else (e.g. `user@host`) | Parse error. Logged at **ERROR**, tool not mounted. This used to escape silently and a session improvised its own `ssh` + `screencapture` workaround instead. |
+| absent | Local backends are probed **in order**: Windows(WSL2) → Linux X11 → macOS. First one available wins. If none is available, mount registers `computer_use_unavailable` with the probe reasons instead of `computer` / `desktop`; this no-target, no-local-backend state is logged at DEBUG. |
+| `ssh://user@host` or `ssh://host` (optional `:port`) | `RemoteBackend` is the **only** candidate. No fall-through to local. Mount catches `RemoteTargetUnavailable`, logs the failed explicit target at ERROR, and registers `computer_use_unavailable` with the reason. Catching the failure does **not** select another machine. |
+| anything else (e.g. `user@host`) | Invalid target configuration. Mount logs it at ERROR and registers `computer_use_unavailable` with the parse reason instead of `computer` / `desktop`. |
+
+### Recover or change the target without restarting
+
+Use the tools actually mounted in the current session; ordinary screenshot/click/type
+calls have no per-call host parameter.
+
+- **Only `computer_use_unavailable` is mounted:** read its reason first. If the user
+  has asked to find a target, `computer_use_unavailable(action="discover")` surveys
+  SSH config, known hosts, and local Tailscale status without connecting to candidate
+  machines. Discovery is not reachability or authorization; do not guess an SSH
+  login user from a Tailscale account owner.
+  To bind an authorized target now, use
+  `computer_use_unavailable(action="activate", target="ssh://user@host[:port]")`,
+  substituting the confirmed user/host/optional port. Success mounts real `computer` /
+  `desktop` tools in this session and normally removes the diagnostic tool; failure
+  keeps it available and reports why.
+- **`desktop` is already mounted:** use
+  `desktop(action="retarget", target="ssh://user@host[:port]")` for the confirmed
+  new target. If it fails, the previous binding remains current; do not continue
+  as though the requested new machine were active.
+- **Intentionally select this controller's own desktop:** pass `target="local"` to
+  the applicable `activate` or `retarget` call. Omission also means local for these
+  calls, even if the previous configuration named a failed remote. This is an
+  explicit target change, never an automatic recovery fallback.
+- **Save a standalone target for future sessions only if requested:** while the
+  diagnostic tool is still mounted, call
+  `computer_use_unavailable(action="persist", target="ssh://user@host[:port]")`
+  **before** activation. This separately writes `config.tools[].config.target` in
+  `$AMPLIFIER_HOME/settings.yaml` (default `~/.amplifier/settings.yaml`) and reports
+  the change and undo instructions. `target="local"` removes that target key.
+  Persistence neither activates nor tests a target; discovery, activation, and
+  retargeting do not save it. For Unified-managed settings, follow its owning guide.
+
+After activation or retargeting, `desktop(action="doctor")` reports the current
+binding, effective policy, and available OS-permission facts without capturing
+screen pixels. It can enumerate monitors; remote permission facts are aged
+connection-time snapshots. Report success or an action classified as `works` is
+not a physical operation test. Unknown OS permission is not a grant.
+
+These paths do not bypass `read_only`, `gate_writes`, disclosure, presence/halt,
+or OS permissions. Retargeting recomputes policy from the session's existing
+configuration; it accepts a target, not policy overrides. Do not disable controls,
+clear a halt, or improvise shell/SSH capture/input to get around a refusal.
 
 ---
 
 ## 4. Per-platform prerequisites
 
-Each backend's `probe()` is cheap and never raises — it reports a reason. That reason is
-what you will see in the log when the tools do not appear.
+Backend probes report availability and a reason. On a known mount failure, inspect
+`computer_use_unavailable` for that reason, not just console output.
 
-**Read your platform's hard requirement first.** Only one of the three is caught at mount
-time; the other two let the tools mount and then fail on first use.
+**Read your platform's hard requirement first.** A probe or successful mount is
+not an end-to-end OS-permission/session test; some failures are detected only
+when the corresponding operation runs.
 
 | Platform | Hard requirement | Enforced at mount? |
 |---|---|---|
-| Windows | **WSL2 on the Windows machine.** Native Windows is **not supported** | **Yes** — probe fails, nothing mounts |
+| Windows | **WSL2 on the Windows machine.** Native Windows is **not supported** | **Yes** — failed probe leaves `computer_use_unavailable`, not usable desktop tools |
 | macOS | **Two separate TCC grants** — Screen Recording *and* Accessibility | **No** — mounts with neither; fails on first capture / first input |
 | Linux | **An X11 session.** Wayland is not supported | **No** — and there is no Wayland check at all. See below |
 
@@ -327,8 +390,9 @@ which is logged at WARNING.
 > **The SSH server must be running *inside WSL2* on the Windows machine.** A remote
 > Windows target is SSH → **the WSL2 side** → `powershell.exe` interop → Win32. Connecting
 > to **Windows OpenSSH** lands you in a native Windows shell where `wslpath` does not
-> exist, `probe()` returns `wslpath not on PATH (not running under WSL2?)`, and no tools
-> mount. See §4.
+> exist and the Windows backend probe reports
+> `wslpath not on PATH (not running under WSL2?)`. If no backend is usable,
+> `computer_use_unavailable` explains the failed target. See §4.
 
 So the full prerequisite list for a remote Windows desktop is: **WSL2 installed**, an
 **SSH server running inside WSL**, **WSL↔Windows interop enabled** (default), and **`uv`
@@ -772,12 +836,13 @@ locked-screen artifact, on a re-test that never compared pixel content.
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `computer` / `desktop` tools absent, no error | No backend available. Mount catches `NoBackendAvailable`, logs the reason, mounts nothing | Read the log line — it lists every candidate's own probe reason plus remediation |
+| `computer_use_unavailable` appears instead of `computer` / `desktop` | No usable backend, invalid config, failed explicit remote, or mount refusal; the diagnostic tool carries the reason | Read the reason and use [target recovery](#recover-or-change-the-target-without-restarting). No target plus no local backend is DEBUG; explicit failures are ERROR |
+| Neither the real tools nor `computer_use_unavailable` appears | A backend failure alone does not explain total absence; the module may not be included/loaded or may have an unexpected load failure | Check session tool selection, standalone registration or Unified readiness, then module-load diagnostics |
 | `wslpath not on PATH (not running under WSL2?)` | You are on native Windows, or SSH'd into **Windows OpenSSH** rather than into WSL | Not a misconfiguration — native Windows is unsupported. Install WSL2 and (for remote) run sshd inside it. §4 |
 | `could not find 'uv' on <host>` | `uv` missing on the remote target. It is **mandatory**, not optional | Install `uv` for the SSH user on the target. §5 |
 | Tools mount on macOS, then first screenshot or first click fails | Neither TCC grant is checked at mount — both are lazy | Grant Screen Recording **and** Accessibility. §4 |
 | Tools mount on a Wayland desktop, input does not behave | The probe has no Wayland check; it attached to XWayland | Use a real X11 session. §4 |
-| `tool-computer-use: NOT MOUNTING - invalid configuration` | Malformed `target` (e.g. `user@host` instead of `ssh://user@host`) | Fix the config. Logged at ERROR because it is a mistake someone can fix |
+| `tool-computer-use: NOT MOUNTING computer/desktop - invalid configuration` | Malformed `target` (e.g. `user@host` instead of `ssh://user@host`) | Read `computer_use_unavailable`; correct the target via the appropriate setup path. Logged at ERROR |
 | `ComputerUseNativeToolPassthroughUnsupportedError` at mount | `loop-streaming` predates PR #36 | Upgrade — the error names the exact commit |
 | `ComputerUseHookIncompatibleProviderError` | Provider gained a `stream()` method. The hook only wraps `complete()`, and the orchestrator prefers `stream()` whenever present — wrapping would silently do nothing | Refuses to operate rather than degrade invisibly. Wrap both, or use an orchestrator that does not prefer `stream()` |
 | Log: `no provider found to wrap` | Provider lookup failed this turn; screenshots will not inline | Check the provider is mounted |

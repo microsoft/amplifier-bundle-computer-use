@@ -10,10 +10,14 @@ can and did drift, in the direction that makes an agent *understate* its
 own capability to a user. This test ties the prose to the table
 mechanically so that class of drift fails loud instead of only being
 caught by someone reading a diff.
+
+Setup recovery also drifted after the diagnostic stub shipped. Fake mount
+failures below tie the target table and recovery calls to the current tool API.
 """
 
 from __future__ import annotations
 
+import asyncio
 import re
 import sys
 from pathlib import Path
@@ -21,7 +25,14 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "modules" / "tool-computer-use"))
 
+import pytest
+from amplifier_core.testing import MockCoordinator
+from amplifier_module_tool_computer_use import (
+    ComputerUseUnavailableTool,
+    DesktopTool,
+)
 from amplifier_module_tool_computer_use.remote_agent import RemoteAgent
+from amplifier_module_tool_computer_use.remote_backend import RemoteTargetUnavailable
 
 # The doc-facing action name (what README.md/SETUP.md call it) mapped to the
 # wire-level op name `RemoteAgent._HANDLERS` actually dispatches on. This
@@ -51,6 +62,98 @@ BEHAVIOR_INSTALL_FRAGMENT = "#subdirectory=behaviors/computer-use.yaml"
 # Matches the family of stale phrasings this repo has actually used:
 # "is Phase 2", "Phase 2 — not implemented", "unimplemented", etc.
 STALE_CLAIM = re.compile(r"not implemented|unimplemented|phase[\s-]*2", re.IGNORECASE)
+
+# Strip Markdown emphasis before checking the known stale mount-failure claims.
+# These contradict the mounted diagnostic stub, not a real desktop capability.
+STALE_MOUNT_CLAIM = re.compile(
+    r"nothing is mounted|mounts nothing|nothing mounts|no tools mount"
+    r"|mount does not catch",
+    re.IGNORECASE,
+)
+
+
+def test_setup_does_not_claim_backend_failure_leaves_nothing_mounted():
+    text = DOCS["docs/SETUP.md"].read_text(encoding="utf-8").replace("*", "")
+    assert not STALE_MOUNT_CLAIM.search(text), (
+        "Backend failures mount computer_use_unavailable; setup must not describe "
+        "the old silent absence or uncaught RemoteTargetUnavailable path."
+    )
+
+
+@pytest.mark.parametrize(
+    "stale",
+    [
+        "If none is available, nothing is mounted",
+        "Mount catches NoBackendAvailable, logs the reason, mounts nothing",
+        "An unreachable target raises RemoteTargetUnavailable, which mount does not catch",
+    ],
+)
+def test_stale_mount_detector_matches_the_original_setup_claims(stale):
+    assert STALE_MOUNT_CLAIM.search(stale)
+
+
+@pytest.mark.parametrize(
+    ("target", "error", "row_prefix"),
+    [
+        (None, "local", "| absent |"),
+        ("ssh://user@host", "remote", "| `ssh://user@host`"),
+        ("user@host", "invalid", "| anything else"),
+    ],
+)
+def test_setup_target_failure_rows_match_the_mounted_tool(
+    monkeypatch, target, error, row_prefix
+):
+    """Exercise the actual mount handler with fake failures, never a desktop/SSH."""
+    import amplifier_module_tool_computer_use as cu
+
+    errors = {
+        "local": cu.NoBackendAvailable([("fake-local", "no display")]),
+        "remote": RemoteTargetUnavailable("fake target unreachable"),
+        "invalid": ValueError("invalid target"),
+    }
+
+    def fail_selection(cfg):
+        raise errors[error]
+
+    monkeypatch.setattr(cu, "select_backend", fail_selection)
+    coordinator = MockCoordinator()
+    # An owned loop avoids changing the thread's current event loop, which
+    # older synchronous tests in this suite still use via get_event_loop().
+    with asyncio.Runner(loop_factory=asyncio.new_event_loop) as runner:
+        manifest = runner.run(
+            cu.mount(coordinator, {"target": target} if target else {})
+        )
+    stub = coordinator.mount_history[0]["module"]
+    assert isinstance(stub, ComputerUseUnavailableTool)
+    assert manifest["provides"] == [stub.name]
+
+    text = DOCS["docs/SETUP.md"].read_text(encoding="utf-8")
+    row = next(line for line in text.splitlines() if line.startswith(row_prefix))
+    assert stub.name in row, f"Setup target row must name the actual tool: {row}"
+
+
+def test_setup_recovery_calls_match_advertised_tool_actions():
+    """Check the recovery recipe's API names, not its exact prose."""
+    text = DOCS["docs/SETUP.md"].read_text(encoding="utf-8")
+    recipe = text.split("### Recover or change the target without restarting", 1)[1]
+    recipe = recipe.split("\n---", 1)[0]
+    schemas = {
+        "computer_use_unavailable": ComputerUseUnavailableTool("test").input_schema,
+        "desktop": DesktopTool(None).input_schema,
+    }
+    calls = re.findall(
+        r'(computer_use_unavailable|desktop)\(action="([a-z_]+)"', recipe
+    )
+    assert calls, "Setup must give a callable recovery recipe"
+    for tool, action in calls:
+        assert action in schemas[tool]["properties"]["action"]["enum"]
+    assert {action for tool, action in calls if tool == "computer_use_unavailable"} == {
+        "discover",
+        "persist",
+        "activate",
+    }
+    assert ("desktop", "retarget") in calls
+    assert ("desktop", "doctor") in calls
 
 
 def test_behavior_install_commands_use_the_behavior_registered_name():
