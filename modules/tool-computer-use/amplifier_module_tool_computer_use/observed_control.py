@@ -225,16 +225,12 @@ class ObservedControl:
     def validate(self, proof, binding):
         self.validate_authority(proof, binding)
         saved = proof["saved"]
-        if (
-            not proof.get("validated")
-            and time.monotonic() - saved["observation"]["created_at"] > 15
-        ):
-            raise StaleObservation("Observation expired")
-        if self.capture(binding)[1] != saved["digest"]:
+        # Age is not authority. Revalidate the original pixels, including after
+        # selection/approval waits, without issuing another observation or input.
+        digest = self.capture(binding)[1]
+        self.validate_authority(proof, binding)
+        if digest != saved["digest"]:
             raise StaleObservation("Screen changed since selection")
-        # Subsequent checks surround an exact-action approval wait. Always
-        # recapture and compare pixels; do not expire solely while a human reads.
-        proof["validated"] = True
 
     async def execute(self, arguments):
         async with self.lock:
