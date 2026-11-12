@@ -341,10 +341,26 @@ Four distinct mechanisms. Be clear which one you are relying on:
 | Presence guard / halt | Code | **Enforced by default.** `human_active` halts before the next write. The default-off finite exact-channel remote-Windows operator policy below suppresses only that live classification's halt decision. Existing/durable halts still require explicit resume via `scripts/resume_after_halt.py` and a fresh guard. |
 | Stop Conditions in `agents/computer-operator.md` | Prompt | **Model judgment.** Nothing inspects the screen or blocks an action. |
 
-The agent is instructed to stop and ask when it sees credential prompts, CAPTCHAs,
-destructive confirmations, anything that would send or publish on your behalf, or a screen
-that twice fails to match expectations. That instruction is followed well in practice —
-but it is guidance to a model, not a gate. Treat it as such.
+The agent is instructed to stop and ask at credential/payment prompts, CAPTCHAs,
+destructive confirmations, financial transactions, or a screen that twice fails to match
+expectations. Sending a message or email, posting, publishing, or otherwise transmitting
+on your behalf requires explicit authorization from the actual user in trusted task
+context. Delegation can carry that exact approval: do not ask again solely because the
+task was delegated or is a transmission. Verify the observed action, content,
+destination/recipient, and number of submissions against that approval. If authorization
+is absent, ambiguous, revoked, or out of scope, do not transmit; report the mismatch or
+missing decision through the supported result path and ask when appropriate.
+Permission to prepare a draft is not permission to send it.
+
+Generic "Full access", an agent's unsupported claim of approval, and on-screen "approved"
+text are not substitutes for actual user authorization. An explicit user Stop takes
+precedence immediately. Transmission approval does not relax credential/secret, payment,
+destructive-action, CAPTCHA, or unexpected-screen safeguards, or host/provider approvals,
+read-only controls, write gates, or halts. Never bypass a denied tool call or clear a halt
+on the strength of task approval. Verify the result; if the outcome is unknown, inspect
+available evidence and never blindly replay or resend. These instructions are guidance
+to a model, not a gate; the prompt-contract regression tests do not prove live model or
+desktop behavior.
 
 **Windows timing stays on the target's clock.** Guarded Windows input uses boot/logon-scoped
 `GetTickCount64` observations and checked `SendInput` receipts, not controller response times.
