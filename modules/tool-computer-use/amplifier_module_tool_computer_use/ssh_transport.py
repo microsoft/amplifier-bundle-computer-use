@@ -422,10 +422,10 @@ class SshTransport:
             ) from exc
 
         line = self._read_line_with_timeout(proc.stdout, connect_timeout)
-        if line is None:
+        if line is None or not line.endswith(b"\n"):
             stderr = self._drain_stderr_on_failure()
             raise SshConnectError(
-                f"no handshake from {self.user_host} within {connect_timeout}s "
+                f"no complete handshake from {self.user_host} within {connect_timeout}s "
                 "(agent may have crashed during bootstrap)",
                 agent_stderr=stderr,
             )
@@ -464,10 +464,10 @@ class SshTransport:
                     f"connection to {self.user_host} lost while sending"
                 ) from exc
             resp_line = self._read_line_with_timeout(proc.stdout, timeout)
-            if resp_line is None:
+            if resp_line is None or not resp_line.endswith(b"\n"):
                 stderr = self._drain_stderr_on_failure()
                 raise SshConnectError(
-                    f"no response from {self.user_host} within {timeout}s "
+                    f"no complete response from {self.user_host} within {timeout}s "
                     "(connection likely lost)",
                     agent_stderr=stderr,
                 )
