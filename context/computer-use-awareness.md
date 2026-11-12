@@ -23,6 +23,9 @@ first-class path. Verify current state before recovery; never replay unknown inp
 session; `computer_use_unavailable(action="activate")` mounts tools when none are mounted.
 Ordinary actions have no host parameter; use these helpers rather than concluding
 the capability is local-only.
+For a retired SSH connection, retarget the same authorized target to rebuild it.
+This repairs transport only: inspect current state, never replay the failed input,
+and never treat reconnect as clearing a human Stop.
 
 **If unavailable.** If `computer_use_unavailable` appears instead of `computer`/`desktop`,
 relay its explanation and stop; do not improvise a workaround such as remote shell control.
