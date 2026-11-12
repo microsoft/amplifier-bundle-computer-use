@@ -49,7 +49,7 @@ from .announce_macos import announce as macos_announce
 from .backend import Backend, BackendError, MonitorInfo
 from .coexistence_guard import CoexistenceGuard, HaltedError, OperatorPresenceOverride
 from .exclusion import Rect
-from .geometry import Display, ImageSpace, compute_display
+from .geometry import Display, ImageSpace, InvalidDisplayGeometryError, compute_display
 from .guard_diagnostics import (
     DiagnosticLog,
     checkpoint,
@@ -909,7 +909,17 @@ class ComputerTool:
             origin_x, origin_y = chosen.x, chosen.y
             width, height = chosen.width, chosen.height
 
-        mw, mh = compute_display(width, height, self._max_edge, self._max_pixels)
+        try:
+            mw, mh = compute_display(width, height, self._max_edge, self._max_pixels)
+        except InvalidDisplayGeometryError as exc:
+            # Only bad desktop dimensions are an operational readiness failure.
+            # Do not reclassify unrelated math/config/programming exceptions, or
+            # substitute another monitor/desktop for an invalid selected target.
+            raise BackendError(
+                f"backend {target_backend.name!r} reported invalid geometry for "
+                f"target {target!r}: {exc}. Check the target desktop session; "
+                "no alternate display dimensions or target were substituted."
+            ) from exc
         disp = Display(width, height, mw, mh, origin_x, origin_y)
         logger.info(
             "computer-use display: target=%r screen %dx%d at (%d,%d) -> model %dx%d",
