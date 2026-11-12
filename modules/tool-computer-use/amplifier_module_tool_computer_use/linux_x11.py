@@ -404,6 +404,17 @@ class LinuxX11Backend:
     def screen_geometry(self) -> ScreenGeometry:
         self._ensure_connected()
         geom = self._root.get_geometry()
+        if geom.width <= 0 or geom.height <= 0:
+            # The connection's screen size can be positive while the actual
+            # capture/input root is 0x0 (reported on XWayland). It is not a safe
+            # fallback: reject the root before scaling or issuing GetImage.
+            raise BackendError(
+                f"X11 root window has invalid geometry {geom.width}x{geom.height}; "
+                "width and height must be positive. This can occur with XWayland "
+                "on a Wayland desktop; native Wayland desktop control is not "
+                "supported. Use a supported X11 desktop session or a supported "
+                "remote target. Connection screen dimensions are not a fallback."
+            )
         return ScreenGeometry(geom.width, geom.height, 0, 0)
 
     # -- coexistence: presence + target binding (docs/designs/coexistence.md) ----
@@ -561,14 +572,15 @@ class LinuxX11Backend:
 
     def capture(self, region: tuple[int, int, int, int] | None = None) -> bytes:
         """In-process `GetImage` - no `import`/ImageMagick subprocess."""
-        self._ensure_connected()
+        # Recheck even a regional capture: the root may have become unusable
+        # since mount-time resolution (e.g. desktop/session reconfiguration).
+        geom = self.screen_geometry()
         from PIL import Image
 
         if region:
             x1, y1, x2, y2 = region
             x, y, w, h = x1, y1, max(1, x2 - x1), max(1, y2 - y1)
         else:
-            geom = self._root.get_geometry()
             x, y, w, h = 0, 0, geom.width, geom.height
         raw = self._root.get_image(x, y, w, h, X.ZPixmap, 0xFFFFFFFF)
         # Depth-24 TrueColor X servers pack pixels as B, G, R, padding - "BGRX" in

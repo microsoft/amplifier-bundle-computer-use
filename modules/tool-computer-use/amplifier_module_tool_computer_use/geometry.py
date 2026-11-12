@@ -16,6 +16,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 
+class InvalidDisplayGeometryError(ValueError):
+    """Nonpositive desktop dimensions cannot define a coordinate mapping."""
+
+
 class CoordinateOutOfRangeError(ValueError):
     """Raised by `Display.to_screen` when a MODEL-space coordinate lies well
     outside the screenshot the model was actually shown.
@@ -164,6 +168,10 @@ def compute_display(
     screen_w: int, screen_h: int, max_edge: int, max_pixels: int
 ) -> tuple[int, int]:
     """Largest model-space size that preserves aspect ratio and respects both budgets."""
+    if screen_w <= 0 or screen_h <= 0:
+        raise InvalidDisplayGeometryError(
+            f"display dimensions must be positive; got {screen_w}x{screen_h}"
+        )
     scale = min(
         1.0,
         max_edge / max(screen_w, screen_h),

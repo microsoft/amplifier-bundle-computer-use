@@ -14,14 +14,16 @@ import os
 import socket
 import subprocess
 import uuid
+from types import SimpleNamespace
 
 import amplifier_module_tool_computer_use as cu
 import pytest
 from amplifier_core.testing import MockCoordinator
 from amplifier_core.validation.base import ValidationResult
 from amplifier_core.validation.tool import ToolValidator
-from amplifier_module_tool_computer_use import registry, shared_transport
-from amplifier_module_tool_computer_use.backend import BackendError
+from amplifier_module_tool_computer_use import linux_x11, registry, shared_transport
+from amplifier_module_tool_computer_use.backend import BackendError, MonitorInfo
+from amplifier_module_tool_computer_use.linux_x11 import LinuxX11Backend
 from amplifier_module_tool_computer_use.ssh_transport import SshConnectError
 from amplifier_module_tool_computer_use.wire import Response, validate_handshake
 
@@ -37,9 +39,12 @@ def _run(awaitable):
 
 
 class Wire:
-    def __init__(self, mode="display-error", *, close_fails=False):
+    def __init__(
+        self, mode="display-error", *, close_fails=False, geometry=(1920, 1080)
+    ):
         self.mode = mode
         self.close_fails = close_fails
+        self.geometry = geometry
         self.calls = []
         self.closed = 0
 
@@ -83,8 +88,9 @@ class Wire:
                 error_type="BackendError",
                 error_message="synthetic monitor enumeration unavailable",
             ).encode()
+        width, height = self.geometry
         return Response(
-            req["id"], True, result={"width": 1920, "height": 1080, "x": 0, "y": 0}
+            req["id"], True, result={"width": width, "height": height, "x": 0, "y": 0}
         ).encode()
 
     def close(self):
@@ -471,3 +477,207 @@ def test_local_display_readiness_has_same_failure_contract(harness, monkeypatch)
         in tools(coordinator)["computer_use_unavailable"].description
     )
     assert backend.closed == 1
+
+
+@pytest.fixture
+def x11_geometry(monkeypatch):
+    """Real X11/registry/mount paths; no native connection, capture, or input."""
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Real external or desktop action prohibited")
+
+    monkeypatch.setattr(socket.socket, "connect", forbidden)
+    monkeypatch.setattr(subprocess, "Popen", forbidden)
+    monkeypatch.setattr(os, "system", forbidden)
+    monkeypatch.setattr(cu, "_build_announcement", forbidden)
+    monkeypatch.setattr(cu, "_build_coexistence_guard", lambda backend, cfg: None)
+    monkeypatch.setattr(linux_x11, "xtest", SimpleNamespace(fake_input=forbidden))
+    monkeypatch.setattr(linux_x11, "_IMPORT_ERROR", None)
+    monkeypatch.setattr(linux_x11, "_reference_session_display", lambda: ":fixture")
+    monkeypatch.setattr(linux_x11, "_resolve_xauthority", lambda: None)
+    monkeypatch.setenv("DISPLAY", ":fixture")
+    root = SimpleNamespace(
+        width=0,
+        height=0,
+        get_image=forbidden,
+        query_pointer=forbidden,
+        xrandr_get_monitors=lambda **kwargs: SimpleNamespace(monitors=[]),
+        xrandr_get_screen_resources=lambda: SimpleNamespace(outputs=[]),
+    )
+    root.get_geometry = lambda: root
+    connections = []
+
+    class Connection:
+        def __init__(self, name):
+            assert name == ":fixture"
+            self.closed = 0
+            connections.append(self)
+
+        def query_extension(self, name):
+            assert name == "XTEST"
+            return SimpleNamespace(present=True)
+
+        def screen(self):
+            # Exact reported contradiction: healthy connection screen, invalid
+            # root, and zero RandR monitors. Never use screen as a guess.
+            return SimpleNamespace(
+                root=root, width_in_pixels=3440, height_in_pixels=1440
+            )
+
+        def close(self):
+            self.closed += 1
+
+    monkeypatch.setattr(linux_x11, "xlib_display", SimpleNamespace(Display=Connection))
+    monkeypatch.setattr(
+        cu,
+        "select_backend",
+        lambda cfg: registry.select_backend(cfg, factories=(LinuxX11Backend,)),
+    )
+    return root, connections
+
+
+@pytest.mark.parametrize(
+    "width,height", [(0, 0), (0, 1440), (3440, 0), (-1, 1440), (3440, -1), (-1, -1)]
+)
+@pytest.mark.parametrize("cfg", [{}, {"target_monitor": "virtual-desktop"}])
+def test_x11_invalid_root_mounts_unavailable_and_releases(
+    x11_geometry, width, height, cfg
+):
+    root, connections = x11_geometry
+    root.width, root.height = width, height
+    coordinator = MockCoordinator()
+    manifest = _run(cu.mount(coordinator, cfg))
+    assert manifest["provides"] == ["computer_use_unavailable"]
+    stub = tools(coordinator)["computer_use_unavailable"]
+    assert set(tools(coordinator)) == {"computer_use_unavailable"}
+    assert f"{width}x{height}" in stub.description
+    assert "X11 root window" in stub.description
+    assert "Wayland" in stub.description
+    assert "remote target" in stub.description
+    assert stub._cfg == cfg
+    assert connections[0].closed == 1
+    assert not _run(stub.execute({"action": "status"})).success
+    _run(manifest())
+    assert connections[0].closed == 1
+
+
+def test_x11_invalid_root_passes_actual_core_validation(x11_geometry):
+    _, connections = x11_geometry
+    result = ValidationResult(module_type="tool", module_path="fixture")
+    _run(ToolValidator()._check_protocol_compliance(result, cu.mount, config={}))
+    assert result.passed, result.summary()
+    assert connections
+    assert all(connection.closed == 1 for connection in connections)
+
+
+def test_valid_x11_without_monitors_keeps_real_root_and_cleans_up(x11_geometry):
+    root, connections = x11_geometry
+    root.width, root.height = 1920, 1080
+    coordinator = MockCoordinator()
+    manifest = _run(cu.mount(coordinator, {}))
+    assert set(tools(coordinator)) == {"computer", "desktop"}
+    computer = tools(coordinator)["computer"]
+    disp = computer.resolve_display()
+    assert (disp.screen_width, disp.screen_height) == (1920, 1080)
+    assert (disp.model_width, disp.model_height) == (1280, 720)
+    assert connections[0].closed == 0
+    _run(manifest())
+    assert connections[0].closed == 1
+
+
+def test_x11_geometry_change_rejected_before_capture(x11_geometry):
+    root, connections = x11_geometry
+    root.width, root.height = 1920, 1080
+    backend = LinuxX11Backend({})
+    assert backend.probe().available
+    assert backend.screen_geometry().width == 1920
+    root.width, root.height = 0, 0
+    try:
+        with pytest.raises(BackendError, match="X11 root window"):
+            backend.screen_geometry()
+        with pytest.raises(BackendError, match="X11 root window"):
+            backend.capture()
+        with pytest.raises(BackendError, match="X11 root window"):
+            backend.capture((0, 0, 10, 10))
+    finally:
+        backend.close()
+    assert connections[0].closed == 1
+
+
+@pytest.mark.parametrize(
+    "dimensions", [(0, 0), (0, 1080), (1920, 0), (-1, 1080), (1920, -1), (-1, -1)]
+)
+def test_remote_nonpositive_geometry_never_falls_back_to_local(
+    harness, monkeypatch, dimensions
+):
+    wires, handles, _ = harness
+    wire = Wire("healthy", geometry=dimensions)
+    wires.append(wire)
+
+    def forbidden_local(*args, **kwargs):
+        raise AssertionError("Explicit remote failure must not select a local target")
+
+    monkeypatch.setattr(registry.LinuxX11Backend, "probe", forbidden_local)
+    coordinator = MockCoordinator()
+    cfg = config()
+    manifest = _run(cu.mount(coordinator, cfg))
+    assert manifest["provides"] == ["computer_use_unavailable"]
+    stub = tools(coordinator)["computer_use_unavailable"]
+    assert stub._cfg == cfg
+    assert "invalid geometry" in stub.description
+    assert f"{dimensions[0]}x{dimensions[1]}" in stub.description
+    assert "No other computer was selected" in stub.description
+    assert handles[0]._released
+    assert wire.closed == 1
+
+
+@pytest.mark.parametrize("width,height", [(0, 1080), (1920, -1), (-1, -1)])
+def test_explicit_invalid_monitor_never_uses_valid_root(
+    x11_geometry, monkeypatch, width, height
+):
+    root, connections = x11_geometry
+    root.width, root.height = 1920, 1080
+    monkeypatch.setattr(
+        LinuxX11Backend,
+        "list_monitors",
+        lambda self: [MonitorInfo("broken", 0, 0, width, height, True)],
+    )
+    coordinator = MockCoordinator()
+    cfg = {"target_monitor": "broken"}
+    manifest = _run(cu.mount(coordinator, cfg))
+    assert manifest["provides"] == ["computer_use_unavailable"]
+    stub = tools(coordinator)["computer_use_unavailable"]
+    assert "target 'broken'" in stub.description
+    assert "invalid geometry" in stub.description
+    assert connections[0].closed == 1
+
+
+def test_invalid_monitor_refresh_preserves_current_mapping(x11_geometry, monkeypatch):
+    root, _ = x11_geometry
+    root.width, root.height = 1920, 1080
+    backend = LinuxX11Backend({})
+    computer = cu.ComputerTool(backend, {})
+    original = computer.resolve_display()
+    monkeypatch.setattr(
+        backend, "list_monitors", lambda: [MonitorInfo("broken", 0, 0, 0, 1080, True)]
+    )
+    try:
+        with pytest.raises(BackendError, match="invalid geometry"):
+            computer.select_monitor("broken")
+        assert computer.display is original
+        assert computer._target_monitor == "primary"
+    finally:
+        backend.close()
+
+
+def test_geometry_programming_error_is_not_backend_readiness(x11_geometry, monkeypatch):
+    root, connections = x11_geometry
+    root.width, root.height = 1920, 1080
+
+    def broken_math(*args):
+        raise ZeroDivisionError("synthetic implementation defect")
+
+    monkeypatch.setattr(cu, "compute_display", broken_math)
+    with pytest.raises(ZeroDivisionError, match="synthetic implementation defect"):
+        _run(cu.mount(MockCoordinator(), {}))
+    assert connections[0].closed == 1

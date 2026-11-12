@@ -24,6 +24,14 @@ from amplifier_module_tool_computer_use.geometry import (
 # -- compute_display -----------------------------------------------------------
 
 
+@pytest.mark.parametrize(
+    "width,height", [(0, 0), (0, 1080), (1920, 0), (-1, 1080), (1920, -1), (-1, -1)]
+)
+def test_compute_display_rejects_nonpositive_dimensions(width, height):
+    with pytest.raises(ValueError, match="display dimensions must be positive"):
+        compute_display(width, height, max_edge=1280, max_pixels=1_150_000)
+
+
 def test_compute_display_preserves_aspect_ratio_when_downscaling():
     mw, mh = compute_display(3840, 2160, max_edge=1280, max_pixels=1_150_000)
     assert mw <= 1280
