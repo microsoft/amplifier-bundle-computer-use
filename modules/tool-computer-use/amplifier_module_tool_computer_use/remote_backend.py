@@ -138,6 +138,10 @@ class RemoteBackend:
 
     # -- connection lifecycle (used by registry.select_backend) -------------
 
+    @property
+    def transport_retired(self) -> bool:
+        return bool(getattr(self._transport, "retired", False))
+
     def connect(
         self,
         *,

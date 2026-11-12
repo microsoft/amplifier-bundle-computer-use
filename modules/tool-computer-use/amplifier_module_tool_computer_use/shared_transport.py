@@ -111,10 +111,10 @@ class _SharedEntry:
         return SshConnectError(
             f"shared SSH transport for {self.host!r} already failed earlier "
             "in this process and was retired (see the original error in the "
-            "log above) - this handle cannot be reused. A NEW mount()/"
-            "connect() for this target will build a fresh transport and "
-            "agent process; it will not silently reconnect this one, which "
-            "would lose any inputs the old agent process was still holding."
+            "log above) - this handle cannot be reused. Use desktop(action="
+            "'retarget', target='ssh://...') with the same target to rebuild "
+            "the connection. This does not retry the failed operation or "
+            "clear a human halt/pause; inspect current state before new input."
         )
 
     def connect(
@@ -181,6 +181,11 @@ class SharedTransportHandle:
     @property
     def handshake(self) -> dict[str, Any] | None:
         return self._entry.handshake
+
+    @property
+    def retired(self) -> bool:
+        """Cached lifecycle fact; reading it never reconnects or sends input."""
+        return self._entry.broken
 
     def connect(
         self,
