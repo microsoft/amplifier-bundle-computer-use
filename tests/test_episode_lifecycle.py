@@ -947,3 +947,83 @@ def test_fault_settlement_cannot_retire_unconfirmed_held_input():
         episode.begin(identity)
     result = episode.close(identity)
     assert not result["release_confirmed"] and not result["indicator_settled"]
+
+
+@pytest.mark.parametrize("late_count", [1, 3])
+def test_old_already_entered_drains_cannot_release_new_owner_hold(rig, late_count):
+    tool, _ = rig
+    ledger = HeldInputLedger(deadman_seconds=100)
+    tool._ledger = ledger
+    tool.begin_episode()
+    episode, identity = tool._episode, tool._episode_identity
+    episode.fence(identity)
+    entered = [threading.Event() for _ in range(late_count)]
+    proceed = threading.Event()
+    transition = episode._transition
+
+    class Gate:
+        def __enter__(self):
+            name = threading.current_thread().name
+            if name.startswith("old-drain-"):
+                entered[int(name.rsplit("-", 1)[1])].set()
+                assert proceed.wait(3)
+            transition.acquire()
+
+        def __exit__(self, *_):
+            transition.release()
+
+    episode._transition = Gate()
+    late = [
+        threading.Thread(
+            target=episode.end, args=(identity,), name=f"old-drain-{index}"
+        )
+        for index in range(late_count)
+    ]
+    for thread in late:
+        thread.start()
+    assert all(event.wait(2) for event in entered)
+    assert tool.end_episode(interrupted=True)["indicator_settled"]
+    fresh = tool.begin_episode(explicit=True)["identity"]
+    released = []
+    ledger.hold("mouse", "new-owner", lambda: released.append(True))
+    try:
+        proceed.set()
+        for thread in late:
+            thread.join(2)
+            assert not thread.is_alive()
+        assert fresh != identity
+        assert released == [] and ledger.held_tokens == ["new-owner"]
+    finally:
+        proceed.set()
+        ledger.stop()
+
+
+@pytest.mark.parametrize("settled", [False, True])
+def test_retarget_from_interrupted_requires_full_settlement(rig, monkeypatch, settled):
+    from test_retarget import _FakeLocalBackend
+
+    tool, indicator = rig
+    tool.begin_episode()
+    tool.fence_episode(tool._episode_identity["generation"])
+    close = indicator.close
+    if not settled:
+        indicator.close = lambda: {"closed": False, "process_settled": False}
+    else:
+        assert tool.end_episode(interrupted=True)["indicator_settled"]
+    old_backend = tool._backend
+    new_backend = _FakeLocalBackend("retarget-settled-interrupted")
+    selected = []
+
+    def select(config):
+        selected.append(config)
+        return new_backend
+
+    monkeypatch.setattr(cu, "select_backend", select)
+    result = tool.retarget("local")
+    assert result.success is settled
+    if settled:
+        assert tool._backend is new_backend
+        assert tool._binding.read_only is False
+    else:
+        assert not selected and tool._backend is old_backend
+        indicator.close = close

@@ -1640,11 +1640,11 @@ class ComputerTool:
         normalized = str(target).strip() if target else ""
         if self._episode_enabled and self._episode_identity is not None:
             result = self.end_episode()
-            if result["state"] != "released" or result["workers"]:
+            if not settled_terminal(result) or self._episode_workers:
                 return ToolResult(
                     success=False,
                     error={
-                        "message": "retarget refused: old episode not released",
+                        "message": "retarget refused: old episode custody not settled",
                         "type": "RetargetRefused",
                     },
                 )

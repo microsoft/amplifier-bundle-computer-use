@@ -218,6 +218,9 @@ class Episode:
             interrupted = self._state == "interrupted"
             self.fence(identity, interrupted=interrupted)
         with self._transition:
+            with self._condition:
+                if self._closed:
+                    return self.status(identity)
             self._display("interrupted" if interrupted else "stopping")
             deadline = time.monotonic() + timeout
             with self._condition:
@@ -298,6 +301,13 @@ class Episode:
         result = self.end(identity)
         if result["workers"] or not result["release_confirmed"]:
             return result
+        # Linearize custody retirement with every already-entered end/drain.
+        # An old waiter must observe _closed under this same transition before
+        # it can invoke the channel's release callback against a new owner.
+        with self._transition:
+            return self._settle_indicator(identity, result)
+
+    def _settle_indicator(self, identity, result):
         with self._render_lock:
             if self._indicator is None:
                 self._closed = True  # Start was fenced before allocating a helper.
