@@ -23,8 +23,10 @@ up across calls. End the bounded task with `desktop(action="episode_status")`,
 then `desktop(action="end_episode", generation=<that exact generation>)` unless
 the host already owns that boundary. Report released only from confirmed release
 status, separately from task success. Stopping, expiry, disconnect or helper loss
-means pending/interrupted, never Done. Do not auto-begin after an interruption or
-retry uncertain input. Other platforms retain their existing disclosure behavior;
+means pending/interrupted, never Done. A fresh explicit begin under current
+authority requires zero workers, confirmed input release and settled indicator
+custody; it never revives the old token, clears Stop/halts or retries input.
+Do not auto-begin after interruption. Other platforms retain their disclosure behavior;
 this episode is cooperative channel/agent ownership, not desktop-wide exclusion.
 
 **Targeting.** `config.target` selects the mount target (unset is this machine;

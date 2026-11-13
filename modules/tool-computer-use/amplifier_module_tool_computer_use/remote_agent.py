@@ -61,7 +61,13 @@ from .agent_scratch_lease import (
     sweep_stale_agent_dirs,
 )
 from .backend import Backend, BackendError
-from .episode import Episode, EpisodeError, OverlayIndicator
+from .episode import (
+    Episode,
+    EpisodeError,
+    OverlayIndicator,
+    episode_order,
+    settled_terminal,
+)
 from .exclusion import ExclusionZone
 from .ledger import DEFAULT_DEADMAN_SECONDS, HeldInputLedger
 from .overlay_linux import LinuxOverlay
@@ -208,6 +214,7 @@ class RemoteAgent:
         self._disconnected = threading.Event()
         self._episode_control_lock = threading.RLock()
         self._revoked_generations: set[tuple[str, str]] = set()
+        self._episode_highwater = 0
 
     def _make_indicator(self):
         if self._indicator_factory:
@@ -224,18 +231,41 @@ class RemoteAgent:
 
     def _op_episode_begin(self, args):
         identity = args["identity"]
-        if not isinstance(identity, dict):
+        if (
+            not isinstance(identity, dict)
+            or set(identity) != {"owner", "target", "generation"}
+            or identity.get("target") != self._episode_target
+            or any(
+                not isinstance(v, str) or not v or len(v) > 128
+                for v in identity.values()
+            )
+        ):
             raise EpisodeError("invalid episode identity")
+        order = episode_order(identity.get("generation"))
         key = (identity.get("owner"), identity.get("generation"))
         with self._episode_control_lock:
-            if key in self._revoked_generations:
+            current = self._episode.status() if self._episode is not None else None
+            if current is not None and current["identity"] == identity:
+                # Idempotent query of an existing generation, never a restart.
+                if key in self._revoked_generations or not current["admission_open"]:
+                    raise EpisodeError("episode is already fenced")
+                return self._episode.begin(identity)
+            if order <= self._episode_highwater:
+                raise EpisodeError("stale episode generation order")
+            if current is not None and not settled_terminal(current):
+                raise EpisodeError("another episode retains target custody")
+            revoked = key in self._revoked_generations
+            # Begin dispatch consumes its ordered slot even if previously
+            # revoked. Old begins can never be replayed after compacting fences.
+            self._episode_highwater = order
+            self._revoked_generations = {
+                entry
+                for entry in self._revoked_generations
+                if episode_order(entry[1]) > order
+            }
+            if revoked:
                 raise EpisodeError("episode revoked before begin")
-            if (
-                self._episode is not None
-                and self._episode.status()["state"] == "released"
-            ):
-                if self._episode.status()["identity"] == identity:
-                    return self._episode.status(identity)
+            if current is not None:
                 self._episode = None
             if self._episode is None:
                 self._episode = Episode(
@@ -282,13 +312,18 @@ class RemoteAgent:
                 key = (identity.get("owner"), identity.get("generation"))
                 if any(not isinstance(v, str) or not v or len(v) > 128 for v in key):
                     raise EpisodeError("invalid episode generation")
+                order = episode_order(identity["generation"])
                 with self._episode_control_lock:
-                    # Keep bounded tombstones when revoke overtakes begin.
-                    # Overflow fences the connection rather than evicting one.
-                    if len(self._revoked_generations) >= 128:
-                        self._disconnected.set()
-                    else:
-                        self._revoked_generations.add(key)
+                    # Only future, not-yet-dispatched generations need a slot.
+                    # Retired begins are refused by the scalar high-water mark.
+                    if (
+                        order > self._episode_highwater
+                        and key not in self._revoked_generations
+                    ):
+                        if len(self._revoked_generations) >= 128:
+                            self._disconnected.set()
+                        else:
+                            self._revoked_generations.add(key)
             if self._episode is None:
                 raise EpisodeError("no episode")
             if req.op == "episode_heartbeat":
@@ -556,10 +591,14 @@ class RemoteAgent:
             # drop that never runs another line of Python here would leave
             # both a held key AND a stranded overlay - one guarantee, one
             # call site, for both.
-            if self._episode is not None:
-                self._episode.close(self._episode.status()["identity"])
-            self._ledger.stop()
-            self._teardown_overlay()
+            try:
+                if self._episode is not None:
+                    self._episode.close(self._episode.status()["identity"])
+            finally:
+                try:
+                    self._ledger.stop()
+                finally:
+                    self._teardown_overlay()
 
     # -- dispatch ---------------------------------------------------------------
 
@@ -604,7 +643,11 @@ class RemoteAgent:
         return RemoteAgent._dispatch_admitted(self, req)
 
     def _dispatch_admitted(self, req: Request) -> Response:
-        if getattr(self, "_require_episode", False) and self._disconnected.is_set():
+        if (
+            getattr(self, "_require_episode", False)
+            and self._disconnected.is_set()
+            and req.op not in {"episode_end", "episode_status", "release_all", "bye"}
+        ):
             return Response(
                 id=req.id,
                 ok=False,

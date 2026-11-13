@@ -48,7 +48,13 @@ from .announce_macos import AnnounceError, AnnounceResult
 from .announce_macos import announce as macos_announce
 from .backend import Backend, BackendError, MonitorInfo
 from .coexistence_guard import CoexistenceGuard, HaltedError, OperatorPresenceOverride
-from .episode import Episode, EpisodeError, OverlayIndicator
+from .episode import (
+    Episode,
+    EpisodeError,
+    OverlayIndicator,
+    new_episode_generation,
+    settled_terminal,
+)
 from .exclusion import Rect
 from .geometry import Display, ImageSpace, InvalidDisplayGeometryError, compute_display
 from .guard_diagnostics import (
@@ -2019,6 +2025,15 @@ class ComputerTool:
     # or clear a sticky refusal.
     def begin_episode(self, *, explicit=False) -> dict:
         """Lazy task sponsorship. Owner is this mounted instance, never model input."""
+        if not self._episode_enabled:
+            return {
+                "state": "unavailable",
+                "identity": None,
+                "reason": "platform_lifecycle_not_enabled",
+                "release_confirmed": False,
+                "indicator_settled": True,
+                "workers": 0,
+            }
         with self._episode_lock:
             scope = _episode_scope.get()
             if scope is not None and scope[0] is self:
@@ -2033,14 +2048,30 @@ class ComputerTool:
                 raise BackendError("computer-use cleanup has started")
             if self._episode_identity is not None:
                 status = self.episode_status()
-                if explicit and status["state"] == "released":
+                if explicit and settled_terminal(status):
+                    if (
+                        self._episode_workers
+                        or self._mouse_pending
+                        or (
+                            self._binding.ledger is not None
+                            and self._binding.ledger.held_tokens
+                        )
+                    ):
+                        raise BackendError(
+                            "prior episode still has controller input custody"
+                        )
+                    if not self._binding.is_remote:
+                        with _episode_registry_lock:
+                            key = _channel_identity(self._binding.backend)
+                            if _episode_registry.get(key) is self._episode:
+                                del _episode_registry[key]
                     self._episode_identity = None
                     self._episode = None
                     self._episode_fenced_status = None
                 else:
                     if status["state"] not in {"viewing", "controlling"}:
                         raise BackendError(
-                            "episode fenced; explicit begin required after confirmed release"
+                            "episode fenced; fresh explicit begin requires settled terminal custody"
                         )
                     if self._binding.is_remote:
                         self._episode.heartbeat_episode(self._episode_identity)
@@ -2055,7 +2086,7 @@ class ComputerTool:
                     if binding.is_remote
                     else binding.diagnostic_id
                 ),
-                "generation": uuid.uuid4().hex,
+                "generation": new_episode_generation(),
             }
             if binding.is_remote:
                 self._episode = binding.backend
@@ -2172,11 +2203,7 @@ class ComputerTool:
             else:
                 self._episode.fence(identity, interrupted=interrupted)
                 result = self._episode.close(identity)
-            if (
-                result["workers"] == 0
-                and result["state"] == "released"
-                and not self._binding.is_remote
-            ):
+            if settled_terminal(result) and not self._binding.is_remote:
                 with _episode_registry_lock:
                     key = _channel_identity(self._binding.backend)
                     if _episode_registry.get(key) is self._episode:
@@ -3980,6 +4007,10 @@ class DesktopTool:
                 success=False, error={"message": f"unknown action {action!r}"}
             )
         input["action"] = action
+        if action == "begin_episode" and not self._computer._episode_enabled:
+            return ToolResult(
+                success=True, output=self._computer.begin_episode(explicit=True)
+            )
         binding = self._computer._binding
         try:
             if action == "focus_window" and (
@@ -4075,7 +4106,7 @@ class DesktopTool:
                     sponsored["identity"],
                 )
             if action == "begin_episode":
-                return ToolResult(success=True, output=self._computer.episode_status())
+                return ToolResult(success=True, output=sponsored)
         except AnnouncementRefused as exc:
             return ToolResult(
                 success=False,

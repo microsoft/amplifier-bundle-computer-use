@@ -8,13 +8,16 @@ import json
 import queue
 import threading
 import time
-import uuid
 from functools import wraps
 
 import amplifier_module_tool_computer_use as cu
 import pytest
 from amplifier_core.testing import MockCoordinator
-from amplifier_module_tool_computer_use.episode import Episode, EpisodeError
+from amplifier_module_tool_computer_use.episode import (
+    Episode,
+    EpisodeError,
+    new_episode_generation,
+)
 from amplifier_module_tool_computer_use.ledger import HeldInputLedger
 from amplifier_module_tool_computer_use.remote_agent import RemoteAgent
 from amplifier_module_tool_computer_use.remote_backend import RemoteBackend
@@ -231,7 +234,7 @@ def test_remote_revocation_not_queued_behind_native_dispatch_and_no_replay():
     identity = {
         "owner": "owner",
         "target": agent._episode_target,
-        "generation": uuid.uuid4().hex,
+        "generation": new_episode_generation(),
     }
     assert agent._dispatch(Request(1, "episode_begin", {"identity": identity})).ok
     entered, proceed = threading.Event(), threading.Event()
@@ -428,7 +431,11 @@ def test_reader_revoke_overtaking_queued_begin_remains_fenced():
     agent = RemoteAgent(
         _FakeBackend(), require_episode=True, indicator_factory=lambda: indicator
     )
-    identity = {"owner": "o", "target": agent._episode_target, "generation": "g"}
+    identity = {
+        "owner": "o",
+        "target": agent._episode_target,
+        "generation": new_episode_generation(),
+    }
     lines = queue.Queue()
     entered, proceed, revoked = threading.Event(), threading.Event(), threading.Event()
     dispatch, notice = agent._dispatch, agent._episode_notice
@@ -490,6 +497,7 @@ def remote_rig():
             agent._episode_notice(Request(**json.loads(line)))
 
     backend = RemoteBackend({"_transport": Transport()})
+    backend._transport.agent = agent
     backend._connected = True
     backend.handshake = {"episode_target": agent._episode_target}
     tool = cu.ComputerTool(backend, {"read_only": False, "gate_writes": False})
@@ -656,3 +664,203 @@ async def test_remote_end_drains_controller_late_hold_registration(rig, monkeypa
     assert len(target.mouse_ups) == 1  # no stale cleanup can touch a new generation
     tool.end_episode()
     tool._ledger.stop()
+
+
+@run_async
+async def test_explicit_fresh_generation_after_settled_stop_not_old_token_revival(rig):
+    tool, _ = rig
+    controller = cu.EpisodeController(tool)
+    first = await controller.begin()
+    old = first["identity"]["generation"]
+    controller.fence(old, interrupted=True)
+    stopped = await controller.end(old, interrupted=True)
+    assert stopped["release_confirmed"] and stopped["indicator_settled"]
+    assert stopped["state"] == "interrupted"
+    assert not (await tool.execute({"action": "screenshot"})).success
+    # Host Resume supplies a fresh explicit begin, not a heartbeat/old binding.
+    resumed = await controller.begin()
+    assert resumed["identity"]["generation"] != old
+    with pytest.raises(cu.BackendError):
+        controller.fence(old)
+    with controller.bind(resumed["identity"]["generation"]):
+        assert (await tool.execute({"action": "screenshot"})).success
+
+
+def test_remote_more_than_129_normal_generations_do_not_disconnect():
+    tool, agent, _ = remote_rig()
+    for _ in range(132):
+        tool.begin_episode(explicit=True)
+        ended = tool.end_episode()
+        assert ended["state"] == "released"
+        assert not agent._disconnected.is_set()
+    tool._ledger.stop()
+
+
+@pytest.mark.parametrize("remote", [False, True])
+@pytest.mark.parametrize("failure", ["stop", "expiry", "failed_start"])
+@run_async
+async def test_fresh_explicit_recovery_after_terminal_failure(rig, remote, failure):
+    local, _ = rig
+    tool = remote_rig()[0] if remote else local
+    controller = cu.EpisodeController(tool)
+    original_factory = tool._cfg.get("_indicator_factory")
+    agent = None
+    if remote:
+        # Use the actual RemoteAgent owned by the in-memory transport.
+        agent = tool._backend._transport.agent
+    factories = []
+
+    def factory():
+        indicator = Indicator()
+        if failure == "failed_start" and not factories:
+            indicator.healthy = False
+        factories.append(indicator)
+        return indicator
+
+    if remote:
+        agent._indicator_factory = factory
+    else:
+        tool._cfg["_indicator_factory"] = factory
+    if failure == "failed_start":
+        with pytest.raises((cu.BackendError, EpisodeError)):
+            await controller.begin()
+    else:
+        await controller.begin()
+    old = tool._episode_identity["generation"]
+    if failure == "expiry":
+        episode = agent._episode if remote else tool._episode
+        episode._deadline = time.monotonic() - 1
+        assert episode.status()["state"] == "interrupted"
+    else:
+        controller.fence(old, interrupted=True)
+    ended = await controller.end(old, interrupted=True)
+    assert ended["state"] == "interrupted"
+    assert ended["release_confirmed"] and ended["indicator_settled"]
+    assert not (await tool.execute({"action": "key", "text": "A"})).success
+    resumed = await controller.begin()
+    fresh = resumed["identity"]["generation"]
+    assert fresh != old
+    with pytest.raises((cu.BackendError, EpisodeError)):
+        await controller.heartbeat(old)
+    with controller.bind(fresh):
+        if remote:
+            assert (
+                await cu.DesktopTool(tool).execute({"action": "get_clipboard"})
+            ).success
+        else:
+            assert (await tool.execute({"action": "screenshot"})).success
+    await controller.end(fresh)
+    if remote:
+        tool._ledger.stop()
+    elif original_factory is not None:
+        tool._cfg["_indicator_factory"] = original_factory
+
+
+@run_async
+async def test_recovery_requires_settlement_and_preserves_durable_halt(rig):
+    tool, _ = rig
+    controller = cu.EpisodeController(tool)
+    old = (await controller.begin())["identity"]["generation"]
+    controller.fence(old)
+    with pytest.raises(cu.BackendError):
+        await controller.begin()  # Terminal label alone isn't release evidence.
+    await controller.end(old, interrupted=True)
+    guard = object()
+    tool._coexistence_guard = guard
+    await controller.begin()
+    assert tool._coexistence_guard is guard  # No guard replacement/halt reset.
+
+
+def test_remote_highwater_refuses_retired_replays_and_late_wrong_owner_revokes():
+    tool, agent, _ = remote_rig()
+    old = tool.begin_episode()["identity"]
+    tool.end_episode()
+    current = tool.begin_episode(explicit=True)["identity"]
+    # Current target remains active; stale begin never recaptures a new panel.
+    assert not agent._dispatch(Request(100, "episode_begin", {"identity": old})).ok
+    for identity in (old, {**current, "owner": "other"}):
+        agent._episode_notice(Request(101, "episode_revoke", {"identity": identity}))
+    assert agent._episode.status()["admission_open"]
+    assert not agent._dispatch(Request(102, "key", {"combo": "A", "_episode": old})).ok
+    assert agent._dispatch(Request(103, "key", {"combo": "A", "_episode": current})).ok
+    assert len(agent._revoked_generations) == 0
+    tool.end_episode()
+    tool._ledger.stop()
+
+
+def test_remote_run_finally_stops_ledger_even_if_indicator_close_raises():
+    agent = RemoteAgent(_FakeBackend())
+    released = []
+    agent._ledger.hold("key", "owned", lambda: released.append(True))
+
+    class BrokenEpisode:
+        def status(self):
+            return {"identity": {}}
+
+        def fence(self, *args, **kwargs):
+            pass
+
+        def close(self, identity):
+            raise RuntimeError("inert renderer close failure")
+
+    agent._episode = BrokenEpisode()
+    with pytest.raises(RuntimeError, match="renderer close"):
+        agent.run(io.StringIO(""), io.StringIO())
+    assert released == [True]
+    assert not agent._ledger.held_tokens
+
+
+def test_ordered_pending_revoke_compaction_preserves_late_begin_fence():
+    tool, agent, _ = remote_rig()
+    identities = []
+    for _ in range(132):
+        identity = {
+            "owner": "pending",
+            "target": agent._episode_target,
+            "generation": new_episode_generation(),
+        }
+        identities.append(identity)
+        agent._episode_notice(Request(1, "episode_revoke", {"identity": identity}))
+        assert not agent._dispatch(
+            Request(2, "episode_begin", {"identity": identity})
+        ).ok
+        assert not agent._disconnected.is_set()
+        assert len(agent._revoked_generations) == 0
+    for identity in (identities[0], identities[-1]):
+        assert not agent._dispatch(
+            Request(3, "episode_begin", {"identity": identity})
+        ).ok
+    assert tool.begin_episode()["state"] == "viewing"
+    tool.end_episode()
+    tool._ledger.stop()
+
+
+def test_normal_generations_across_shared_transport_owners_use_same_order_domain():
+    first, agent, _ = remote_rig()
+    other_backend = RemoteBackend({"_transport": first._backend._transport})
+    other_backend._connected = True
+    other_backend.handshake = first._backend.handshake
+    second = cu.ComputerTool(other_backend, {"read_only": False, "gate_writes": False})
+    second._episode_enabled = True
+    second._announced = True
+    for index in range(132):
+        owner = first if index % 2 == 0 else second
+        assert owner.begin_episode(explicit=True)["state"] == "viewing"
+        assert owner.end_episode()["indicator_settled"]
+        assert not agent._disconnected.is_set()
+    first._ledger.stop()
+
+
+@run_async
+async def test_public_episode_begin_unsupported_does_not_allocate_or_break_cleanup(
+    monkeypatch,
+):
+    tool = cu.ComputerTool(Backend())
+
+    def no_disclosure():
+        pytest.fail("unsupported lifecycle must not allocate a disclosure surface")
+
+    monkeypatch.setattr(tool, "_ensure_announced", no_disclosure)
+    result = await cu.DesktopTool(tool).execute({"action": "begin_episode"})
+    assert result.output["state"] == "unavailable"
+    assert tool._episode is None and tool._episode_identity is None

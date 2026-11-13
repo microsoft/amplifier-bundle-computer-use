@@ -7,8 +7,11 @@ interruptions; neither is a successful hand-back. Renderers only display state.
 
 from __future__ import annotations
 
+import itertools
+import re
 import threading
 import time
+import uuid
 from collections.abc import Callable
 from contextlib import contextmanager
 from typing import Any
@@ -16,6 +19,33 @@ from typing import Any
 
 class EpisodeError(RuntimeError):
     pass
+
+
+_generations = itertools.count(1)
+
+
+def new_episode_generation() -> str:
+    """Opaque to hosts; ordered across mounts sharing this process's transport."""
+    return f"{next(_generations):016x}-{uuid.uuid4().hex}"
+
+
+def episode_order(generation: str) -> int:
+    if not isinstance(generation, str) or not re.fullmatch(
+        r"[0-9a-f]{16}-[0-9a-f]{32}", generation
+    ):
+        raise EpisodeError("invalid ordered episode generation")
+    return int(generation[:16], 16)
+
+
+def settled_terminal(status: dict) -> bool:
+    """Fresh explicit work is allowed only after all prior custody is settled."""
+    return (
+        status.get("state") in {"released", "interrupted"}
+        and status.get("workers") == 0
+        and status.get("admission_open") is False
+        and status.get("release_confirmed") is True
+        and status.get("indicator_settled") is True
+    )
 
 
 class Episode:
@@ -163,7 +193,7 @@ class Episode:
                 self._identity = dict(identity)
                 self._state = "interrupted"
             self._match(identity)
-            if self._state == "released":
+            if self._state == "released" or self._closed:
                 return
             if self._state in {"viewing", "controlling"}:
                 try:
@@ -183,7 +213,7 @@ class Episode:
     def end(self, identity, *, timeout: float = 5.0) -> dict:
         with self._condition:
             self._match(identity)
-            if self._state == "released":
+            if self._state == "released" or self._closed:
                 return self.status(identity)
             interrupted = self._state == "interrupted"
             self.fence(identity, interrupted=interrupted)
@@ -203,7 +233,7 @@ class Episode:
             except Exception:
                 confirmed = False
             with self._condition:
-                self._confirmed = confirmed and not self._release_failed
+                self._confirmed = confirmed
                 if not confirmed:
                     self._release_failed = True
                     self._state = "interrupted"
@@ -335,7 +365,8 @@ class OverlayIndicator:
         }
 
     def close(self):
-        self.handle.hide()
+        if self.handle is not None:
+            self.handle.hide()
         absent = not getattr(self.handle, "shown", True)
         return {
             "closed": absent,
