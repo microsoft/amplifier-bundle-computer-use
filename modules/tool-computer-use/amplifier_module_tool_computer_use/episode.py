@@ -312,7 +312,31 @@ class Episode:
                     and closed.get("helper_exit")
                     == (0 if result["state"] == "released" else 2)
                 )
-                if not settled:
+                fault_settled = (
+                    closed.get("fault_settled") is True
+                    and closed.get("state") == "interrupted"
+                    and closed.get("healthy") is False
+                    and closed.get("process_settled") is True
+                    and (
+                        (
+                            closed.get("settlement_basis") == "never_launched"
+                            and closed.get("helper_exit") is None
+                        )
+                        or (
+                            closed.get("settlement_basis") == "helper_reaped"
+                            and type(closed.get("helper_exit")) is int
+                        )
+                    )
+                )
+                if fault_settled:
+                    # Dedicated renderer-resource custody only. Input release
+                    # was checked above; retain failure, never relabel as Done
+                    # or invent the native surface-absence acknowledgement.
+                    with self._condition:
+                        self._state = "interrupted"
+                        self._reason = closed.get("reason") or "indicator_failed"
+                        self._closed = True
+                elif not settled:
                     with self._condition:
                         self._state = "interrupted"
                         self._reason = "indicator_close_unconfirmed"

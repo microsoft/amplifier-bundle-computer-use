@@ -864,3 +864,80 @@ async def test_public_episode_begin_unsupported_does_not_allocate_or_break_clean
     result = await cu.DesktopTool(tool).execute({"action": "begin_episode"})
     assert result.output["state"] == "unavailable"
     assert tool._episode is None and tool._episode_identity is None
+
+
+@pytest.mark.parametrize(
+    "mode", ["console_unavailable", "console_user_mismatch", "die", "stale"]
+)
+@run_async
+async def test_actual_adapter_failure_settlement_allows_bundle_cleanup(
+    rig, monkeypatch, mode
+):
+    from test_macos_indicator import inert_indicator
+
+    tool, _ = rig
+    indicator = inert_indicator(monkeypatch, mode)
+    tool._cfg["_indicator_factory"] = lambda: indicator
+    backend_closes = []
+    tool._backend.close = lambda: backend_closes.append(True)
+    monkeypatch.setattr(cu, "_select_and_build", lambda cfg: tool)
+    coordinator = MockCoordinator()
+    mounted = await cu.mount(coordinator)
+    controller = coordinator.get_capability("computer_use.episodes")
+    try:
+        with pytest.raises((cu.BackendError, EpisodeError)):
+            await controller.begin()
+        snapshot = indicator.status()
+        assert snapshot["state"] == "interrupted" and not snapshot["healthy"]
+        assert snapshot["fault_settled"] and snapshot["process_settled"]
+        assert not snapshot["surface_absent"]  # Resource proof != native pixels/ack.
+        await mounted()
+        status = tool.episode_status()
+        assert status["state"] == "interrupted"
+        assert status["release_confirmed"] and status["indicator_settled"]
+        assert backend_closes == [True]
+    finally:
+        indicator.abort()
+        if indicator._proc is not None and indicator._proc.stderr:
+            indicator._proc.stderr.close()
+
+
+@pytest.mark.parametrize(
+    "outcome", ["unknown", "wait_error", "no_returncode", "killed", "never_launched"]
+)
+def test_actual_adapter_resource_faults_reconcile_without_fabricated_release(outcome):
+    from test_macos_indicator import SettlementProcess, adapter
+
+    indicator = adapter.MacOSIndicator()
+    if outcome != "never_launched":
+        indicator._proc = SettlementProcess(outcome)
+    indicator._fail("reply_timeout")
+    identity = {"owner": "o", "target": "t", "generation": "g"}
+    episode = Episode("t", lambda: indicator, lambda: True)
+    with pytest.raises(EpisodeError):
+        episode.begin(identity)
+    result = episode.close(identity)
+    assert result["state"] == "interrupted" and result["release_confirmed"]
+    if outcome in {"killed", "never_launched"}:
+        assert result["indicator_settled"]
+    else:
+        assert not result["indicator_settled"]
+        indicator._proc.outcome = "exit"
+        assert episode.close(identity)["indicator_settled"]
+    assert not indicator.status()["surface_absent"]
+    assert not indicator.status()["healthy"]
+
+
+def test_fault_settlement_cannot_retire_unconfirmed_held_input():
+    from test_macos_indicator import adapter
+
+    indicator = adapter.MacOSIndicator()
+    indicator._fail("reply_timeout")
+    indicator.close()
+    assert indicator.status()["fault_settled"]
+    identity = {"owner": "o", "target": "t", "generation": "g"}
+    episode = Episode("t", lambda: indicator, lambda: False)
+    with pytest.raises(EpisodeError):
+        episode.begin(identity)
+    result = episode.close(identity)
+    assert not result["release_confirmed"] and not result["indicator_settled"]
