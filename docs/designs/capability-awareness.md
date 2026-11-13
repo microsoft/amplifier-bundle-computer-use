@@ -300,7 +300,8 @@ The instinct is "tear down the old overlay." **That would be a §7.1 violation a
 | New target has no presence detector / no `GUARD_MS` entry | Refuse **by default**. Mount tolerates this (`__init__.py:2110-2132` → `None` guard) because the alternative at mount is no capability at all; mid-session it means silently *downgrading* an already-protected session, which is exactly the silent degradation this repo forbids. Overridable only by the same explicit, logged opt-out shape §7.6 already uses |
 | Disclosure refused or channel failed on the new target | Refuse. Old binding intact |
 | Anything in flight or held | Refuse before doing any work (step 0) |
-| Same target as current | No-op, reported as such. Never silently re-disclose |
+| Same target, healthy connection | No-op, reported as such |
+| Same target, retired SSH connection | Rebuild through the ordinary binding path, including the replacement agent's disclosure. Do not replay the failed operation or clear a human halt/pause. Refused disclosure decisions remain refused. |
 
 ### 6.6 What re-target is *not*
 

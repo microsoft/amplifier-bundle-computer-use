@@ -198,7 +198,10 @@ calls have no per-call host parameter.
   keeps it available and reports why.
 - **`desktop` is already mounted:** use
   `desktop(action="retarget", target="ssh://user@host[:port]")` for the confirmed
-  new target. If it fails, the previous binding remains current; do not continue
+  target. This also replaces a retired SSH connection to the same machine; a
+  healthy same-target binding stays unchanged. It never retries the failed
+  action. Inspect current state before sending new input.
+  If it fails, the previous binding remains current; do not continue
   as though the requested new machine were active.
 - **Intentionally select this controller's own desktop:** pass `target="local"` to
   the applicable `activate` or `retarget` call. Omission also means local for these

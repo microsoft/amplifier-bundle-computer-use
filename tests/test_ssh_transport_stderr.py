@@ -270,3 +270,27 @@ def test_stderr_drain_never_falls_back_to_blocking_read(
     monkeypatch.setattr(ssh_transport_mod.os, "read", forbidden)
     assert transport._drain_stderr_on_failure() is None
     assert "nonblocking stderr drain unavailable" in caplog.text
+
+
+def test_truncated_response_is_a_connection_failure_without_replay():
+    """EOF can return partial JSON, not just an empty read."""
+    read_fd, write_fd = os.pipe()
+    os.write(write_fd, b'{"id":1,"ok":true,"result":{"image":"partial-private-pixels')
+    os.close(write_fd)
+    stdout = os.fdopen(read_fd, "rb", buffering=0)
+    transport = SshTransport("user@example.invalid", package_dir=PACKAGE_DIR)
+    request = b'{"id":1,"op":"capture_scaled"}\n'
+    with tempfile.TemporaryFile() as stderr:
+        stderr.write(b"agent exited during output\n")
+        stderr.seek(0)
+        stdin = io.BytesIO()
+        transport._proc = SimpleNamespace(stdin=stdin, stdout=stdout, stderr=stderr)
+        try:
+            with pytest.raises(SshConnectError, match="no complete response") as error:
+                transport.send(request, timeout=0.5)
+            assert stdin.getvalue() == request
+            assert "agent exited during output" in str(error.value)
+            assert "private-pixels" not in str(error.value)
+        finally:
+            transport._proc = None
+            stdout.close()

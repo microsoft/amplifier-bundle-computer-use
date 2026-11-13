@@ -1778,16 +1778,15 @@ class ComputerTool:
                     },
                 )
 
-            # Same-channel short circuit (\u00a76.5: "Same target as current ->
-            # No-op, reported as such. Never silently re-disclose") -
-            # computed from the actual CONNECTED backend's identity, not
-            # the requested string, so two differently-spelled targets that
-            # resolve to the same physical machine are still recognized
-            # (matches `_channel_identity`'s own reasoning). Release the
-            # extra connection this probe just opened (refcounted - see
-            # `_build_ssh_transport`; a no-op for local backends) and
-            # return without touching anything else.
-            if _channel_identity(new_backend) == _channel_identity(current.backend):
+            # A healthy same-target binding is a no-op. A retired connection
+            # needs the ordinary build-and-swap below, not a fresh session.
+            same_channel = _channel_identity(new_backend) == _channel_identity(
+                current.backend
+            )
+            recovering = same_channel and getattr(
+                current.backend, "transport_retired", False
+            )
+            if same_channel and not recovering:
                 try:
                     new_backend.close()
                 except Exception:  # noqa: BLE001 - best-effort
@@ -1806,6 +1805,13 @@ class ComputerTool:
             try:
                 # Step 2 (\u00a76.2): GUARD.
                 new_guard = _build_coexistence_guard(new_backend, new_cfg)
+                if recovering and current.coexistence_guard is not None and new_guard:
+                    # Repair the connection, not the human's Stop decision.
+                    previous_guard = current.coexistence_guard
+                    new_guard.pause = previous_guard.pause
+                    if previous_guard.halted:
+                        assert previous_guard._halt_snapshot is not None
+                        new_guard.seed_halted(previous_guard._halt_snapshot)
                 new_coexistence_cfg = dict(new_cfg.get("coexistence") or {})
                 if new_guard is None:
                     if bool(new_coexistence_cfg.get("retarget_allow_no_guard", False)):
@@ -5119,6 +5125,7 @@ class _AnnouncementDecision:
 
     handle: Any
     refused: AnnouncementRefused | None
+    backend: Backend | None = None
 
 
 def _channel_identity(backend: Backend) -> str:
@@ -5483,6 +5490,15 @@ def _build_announcement(
     channel_key = _channel_identity(backend)
     with _announcement_lock:
         cached = _announcement_decisions.get(channel_key)
+        # The remote overlay dies with its agent. Keep human refusals, but
+        # rebuild a successful disclosure on the replacement connection.
+        if (
+            cached is not None
+            and cached.refused is None
+            and getattr(cached.backend, "transport_retired", False)
+        ):
+            del _announcement_decisions[channel_key]
+            cached = None
     if cached is not None:
         if cached.refused is not None:
             logger.warning(
@@ -5513,7 +5529,8 @@ def _build_announcement(
         raise
     with _announcement_lock:
         _announcement_decisions.setdefault(
-            channel_key, _AnnouncementDecision(handle=handle, refused=None)
+            channel_key,
+            _AnnouncementDecision(handle=handle, refused=None, backend=backend),
         )
     return handle
 

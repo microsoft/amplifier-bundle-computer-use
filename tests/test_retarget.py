@@ -27,11 +27,14 @@ wide caches that persist across tests in the same run.
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 import threading
 import time
 import uuid
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "modules" / "tool-computer-use"))
@@ -537,6 +540,143 @@ def test_retarget_to_the_same_target_is_a_no_op_and_never_redisc_loses():
         assert backend.disclose_calls == 0, "a no-op must never re-disclose"
     finally:
         cu_mod.select_backend = orig
+
+
+class _RecoveryTransport:
+    """Only the wire is fake: shared retirement, backend and retarget are real."""
+
+    def __init__(self):
+        self.fail = False
+        self.ops = []
+        self.closes = 0
+
+    def connect(self, **kwargs):
+        return {
+            "protocol": 1,
+            "agent_sha256": "fake",
+            "python": "3.12.0",
+            "platform": "linux",
+            "backend": "linux-x11",
+            "probe": {"available": True, "reason": ""},
+            "capabilities": [],
+            "permissions": {},
+            "monitors": [],
+        }
+
+    def send(self, line, **kwargs):
+        from amplifier_module_tool_computer_use.ssh_transport import SshConnectError
+
+        request = json.loads(line)
+        self.ops.append(request["op"])
+        if self.fail:
+            raise SshConnectError("connection lost while sending")
+        values = {
+            "screen_geometry": {"width": 1920, "height": 1080, "x": 0, "y": 0},
+            "list_monitors": [
+                {
+                    "id": "screen",
+                    "x": 0,
+                    "y": 0,
+                    "width": 1920,
+                    "height": 1080,
+                    "primary": True,
+                }
+            ],
+            "presence_idle": 999_999.0,
+            "announce_raise": {"shown": True, "buttons": {}},
+            "list_windows": {"windows": [], "foreground": None},
+        }
+        return json.dumps(
+            {"id": request["id"], "ok": True, "result": values.get(request["op"], {})}
+        ).encode()
+
+    def close(self):
+        self.closes += 1
+
+
+def _recovery_backend(key, transport):
+    from amplifier_module_tool_computer_use.remote_backend import RemoteBackend
+    from amplifier_module_tool_computer_use.shared_transport import (
+        acquire_shared_transport,
+    )
+
+    backend = RemoteBackend(
+        {"_transport": acquire_shared_transport(key, lambda: transport)}
+    )
+    backend.connect()
+    return backend
+
+
+@pytest.mark.parametrize("failed_op", ["list_windows", "click"])
+def test_same_target_recovers_retired_transport_without_replaying(
+    monkeypatch, failed_op
+):
+    old_wire, new_wire = _RecoveryTransport(), _RecoveryTransport()
+    key = ("ssh", _unique("recovery-host"), None)
+    backend = _recovery_backend(key, old_wire)
+    tool = _mounted_tool(backend, {"read_only": False, "gate_writes": True})
+    tool._ensure_announced()
+    old_wire.fail = True
+    with pytest.raises(BackendError, match="connection lost"):
+        backend._call(failed_op)
+    fresh = _recovery_backend(key, new_wire)
+    monkeypatch.setattr(cu, "select_backend", lambda cfg: fresh)
+    try:
+        result = tool.retarget("ssh://" + backend.user_host)
+        assert result.success, result.error
+        assert tool._backend is fresh
+        assert tool._binding.gate_writes is True
+        assert tool._binding.read_only is False
+        assert old_wire.ops.count(failed_op) == 1
+        assert failed_op not in new_wire.ops
+        assert new_wire.ops.count("announce_raise") == 1
+        assert fresh.list_windows().windows == []
+        assert old_wire.closes == 1
+    finally:
+        backend.close()
+        fresh.close()
+
+
+@pytest.mark.parametrize("stopped", ["pause", "halt", "held", "refused"])
+def test_same_target_recovery_keeps_human_stop(monkeypatch, stopped):
+    old_wire, new_wire = _RecoveryTransport(), _RecoveryTransport()
+    key = ("ssh", _unique("stopped-recovery"), None)
+    backend = _recovery_backend(key, old_wire)
+    tool = _mounted_tool(backend)
+    guard = tool._coexistence_guard
+    if stopped == "pause":
+        guard.pause.set("manual_test")
+    elif stopped == "halt":
+        guard.seed_halted(guard.presence.sample())
+    elif stopped == "held":
+        tool._ledger.hold("mouse", "mouse:left", lambda: None)
+    else:
+        cu._announcement_decisions[cu._channel_identity(backend)] = (
+            cu._AnnouncementDecision(None, cu.AnnouncementRefused("human declined"))
+        )
+    old_wire.fail = True
+    with pytest.raises(BackendError):
+        backend.list_windows()
+    fresh = _recovery_backend(key, new_wire)
+    monkeypatch.setattr(cu, "select_backend", lambda cfg: fresh)
+    try:
+        result = tool.retarget("ssh://" + backend.user_host)
+        if stopped in {"held", "refused"}:
+            assert not result.success
+            assert tool._backend is backend
+            assert tool._coexistence_guard is guard
+            assert "announce_raise" not in new_wire.ops
+        else:
+            assert result.success, result.error
+            assert tool._backend is fresh
+            assert fresh.list_windows().windows == []
+            assert tool._coexistence_guard.pause is guard.pause
+            assert tool._coexistence_guard.halted == guard.halted
+            assert tool._coexistence_guard.pause.is_paused == (stopped == "pause")
+    finally:
+        tool._ledger.release_all(reason="test cleanup")
+        backend.close()
+        fresh.close()
 
 
 def test_retarget_refuses_a_new_target_with_no_guard_by_default(monkeypatch):
