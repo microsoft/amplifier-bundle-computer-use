@@ -90,7 +90,8 @@ class ObservedControl:
             )
         if self.computer._binding is not binding:
             raise StaleObservation("Target changed")
-        _, encoded = self.computer._run("screenshot", {}, binding=binding)
+        with self.computer._episode_admission("screenshot", binding):
+            _, encoded = self.computer._run("screenshot", {}, binding=binding)
         raw = base64.b64decode(encoded)
         with Image.open(io.BytesIO(raw)) as img:
             fingerprint = hashlib.sha256(img.convert("RGB").tobytes()).hexdigest()
@@ -242,6 +243,8 @@ class ObservedControl:
             try:
                 if arguments.get("action") == "observe":
                     await asyncio.to_thread(self.computer._ensure_announced)
+                    if self.computer._episode_enabled:
+                        await asyncio.to_thread(self.computer.begin_episode)
                     binding = self.computer._binding
                     observed = await asyncio.to_thread(self.observe, binding)
                     return ToolResult(success=True, output=observed)

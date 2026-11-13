@@ -50,6 +50,7 @@ READ_OPS = frozenset(
         # target's own persistent overlay since the last read? A query, no
         # side effect - the same idempotency argument as `presence_idle`.
         "announcement_status",
+        "episode_status",
     }
 )
 WRITE_OPS = frozenset(
@@ -79,6 +80,10 @@ CONTROL_OPS = frozenset(
         # implies. Session-lifecycle, not injected input - CONTROL, matching
         # the design doc's own classification, not WRITE.
         "announce_raise",
+        "episode_begin",
+        "episode_end",
+        "episode_heartbeat",
+        "episode_revoke",
     }
 )
 
@@ -87,6 +92,28 @@ ALL_OPS = READ_OPS | WRITE_OPS | CONTROL_OPS
 
 class UnknownOpError(ValueError):
     """`classify_op` was asked about an op this protocol version does not know."""
+
+
+class EpisodeBeginRefused(RuntimeError):
+    """Correlated target proof of rejection BEFORE this generation was adopted."""
+
+    def __init__(self, receipt: dict[str, Any]) -> None:
+        self.receipt = receipt
+        super().__init__(receipt["reason"])
+
+
+def validate_begin_refusal(receipt: Any, identity: Any) -> bool:
+    """Closed schema; generic errors, timeouts and other identities prove nothing."""
+    return (
+        isinstance(receipt, dict)
+        and set(receipt) == {"version", "identity", "adopted", "reason"}
+        and type(receipt["version"]) is int
+        and receipt["version"] == 1
+        and receipt["identity"] == identity
+        and receipt["adopted"] is False
+        and isinstance(receipt["reason"], str)
+        and receipt["reason"] in {"revoked_before_begin", "target_custody_owned"}
+    )
 
 
 def classify_op(op: str) -> OpClass:
@@ -135,6 +162,7 @@ class Response:
     result: Any = None
     error_type: str | None = None
     error_message: str | None = None
+    error_data: dict[str, Any] | None = None
 
     @classmethod
     def decode(cls, line: bytes | str) -> Response:
@@ -163,6 +191,7 @@ class Response:
             or not isinstance(err.get("type"), str)
             or not isinstance(err.get("message"), str)
             or "result" in data
+            or ("data" in err and not isinstance(err["data"], dict))
         ):
             raise ValueError("malformed failed wire response")
         return cls(
@@ -170,6 +199,7 @@ class Response:
             ok=False,
             error_type=err["type"],
             error_message=err["message"],
+            error_data=err.get("data"),
         )
 
     def encode(self) -> bytes:
@@ -185,6 +215,8 @@ class Response:
                     "message": self.error_message or "",
                 },
             }
+            if self.error_data is not None:
+                payload["error"]["data"] = self.error_data
         return (json.dumps(payload) + "\n").encode("utf-8")
 
 
