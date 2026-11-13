@@ -221,16 +221,24 @@ class PanelRuntime:
         self.surface.apply(protocol.state)
 
     def receive(self, data):
+        # Expiry is a precondition, not a timer side effect. A command arriving
+        # between loop ticks must not renew an already expired generation.
+        self._check_liveness(self.clock())
+        if self.reason != "ok":
+            raise ProtocolError("connection_lost")
         if self.pending is not None:
             raise ProtocolError("protocol_error")
         before = self.protocol.state
         op = self.protocol.accept(decode_frame(data))
-        self.last_command = self.clock()
+        now = self.clock()
+        self._check_liveness(now)
         if self.interrupt_requested or self.reason != "ok":
             self.interrupt()
-        elif before != self.protocol.state:
-            self.applied_at = self.clock()
-            self.surface.apply(self.protocol.state)
+        else:
+            self.last_command = now
+            if before != self.protocol.state:
+                self.applied_at = now
+                self.surface.apply(self.protocol.state)
         self.pending = "terminal" if op in ("close", "abort") else "ack"
 
     def request_interrupt(self):
@@ -251,15 +259,18 @@ class PanelRuntime:
             self.protocol.closing = True
             self.surface.apply("interrupted")
 
-    def tick(self):
-        self.loops += 1
-        self.last_tick = now = self.clock()
+    def _check_liveness(self, now):
         if (
             self.interrupt_requested
-            or now - self.last_command > WATCHDOG_SECONDS
+            or now - self.last_command >= WATCHDOG_SECONDS
             or os.getppid() != self.parent_pid
         ):
             self.interrupt()
+
+    def tick(self):
+        self.loops += 1
+        self.last_tick = now = self.clock()
+        self._check_liveness(now)
         confirmed = False if self.removing_at is not None else self.surface.confirmed()
         if confirmed:
             self.ever_confirmed = True

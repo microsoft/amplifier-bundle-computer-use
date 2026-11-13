@@ -73,7 +73,7 @@ class MacOSIndicator:
     def status(self) -> dict:
         result = dict(self._snapshot)
         if result["healthy"] and (
-            time.monotonic() - self._last_reply > WATCHDOG_SECONDS
+            time.monotonic() - self._last_reply >= WATCHDOG_SECONDS
             or (self._proc is not None and self._proc.poll() is not None)
         ):
             # Observation only: do not wait for a lock or invent release.
@@ -156,8 +156,14 @@ class MacOSIndicator:
             return self._fail("connection_lost")
 
     def _exchange(self, op, state, timeout):
-        if self._failed:
+        # Monitor/close callers must observe *prior* health without relying on
+        # a model/status poll. Never revive an expired generation with traffic.
+        prior = self.status()
+        if self._failed or (op != "start" and not prior["healthy"]):
             return self.status()
+        lease_deadline = (
+            self._last_reply + WATCHDOG_SECONDS if prior["healthy"] else None
+        )
         self._sequence += 1
         row = {
             "v": 1,
@@ -172,6 +178,11 @@ class MacOSIndicator:
         if proc is None:
             raise OSError("helper_failed")
         _, writable, _ = select.select([], [proc.stdin], [], timeout)
+        now = time.monotonic()
+        if lease_deadline is not None and now >= lease_deadline:
+            return self._fail("connection_lost")
+        if now >= deadline:
+            raise TimeoutError
         if not writable or os.write(proc.stdin.fileno(), data) != len(data):
             raise TimeoutError
         while time.monotonic() < deadline:
@@ -227,7 +238,15 @@ class MacOSIndicator:
                 raise ProtocolError("protocol_error")
             if self._failed:
                 return self.status()
-            self._last_reply = time.monotonic()
+            now = time.monotonic()
+            # A correlated reply can arrive after the old lease or request
+            # deadline, even if select returned readable. Check before renewal,
+            # including terminal acknowledgements; do not replay the mutation.
+            if lease_deadline is not None and now >= lease_deadline:
+                return self._fail("connection_lost")
+            if now >= deadline:
+                raise TimeoutError
+            self._last_reply = now
             self._last_loop = reply["loop"]
             self._snapshot = {
                 "available": True,

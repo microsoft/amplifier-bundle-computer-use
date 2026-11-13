@@ -140,6 +140,144 @@ def test_transition_and_terminal_rejection():
         p.accept(command(8, "status", None))
 
 
+@pytest.mark.parametrize(
+    "op,state", [("status", None), ("close", None), ("update", "released")]
+)
+def test_helper_late_traffic_before_tick_cannot_renew_expired_lease(op, state):
+    run, now, replies, surface = runtime()
+    run.tick()
+    run.receive(helper.encode_frame(command(2, "update", "released")))
+    run.tick()
+    # The loop stays alive throughout; the separate stalled-loop watchdog is
+    # irrelevant. Expiry happens between the last tick and late command intake.
+    now[0] = 13.95
+    run.tick()
+    now[0] = 14.01
+    try:
+        run.receive(helper.encode_frame(command(3, op, state)))
+    except helper.ProtocolError:
+        pass
+    now[0] = 14.05
+    run.tick()
+    assert run.reason == "connection_lost"
+    assert run.protocol.state == "interrupted" and not run.finished
+    assert run.last_command == 10.0 and run.protocol.sequence == 2
+    assert surface.states[-1] == "interrupted"
+    assert not any(
+        row["event"] == "terminal" and row["state"] == "released" for row in replies
+    )
+
+
+@pytest.mark.parametrize("op", ["status", "close", "abort"])
+def test_adapter_late_request_without_public_status_cannot_renew_lease(monkeypatch, op):
+    indicator = inert_indicator(monkeypatch)
+    try:
+        assert indicator.start()["healthy"]
+        with indicator._lock:
+            indicator._last_reply = time.monotonic() - helper.WATCHDOG_SECONDS - 0.25
+            seq = indicator._sequence
+            result = indicator._request(op)
+            assert result["state"] == "interrupted" and not result["healthy"]
+            assert indicator._failed and indicator._sequence == seq
+        indicator.close()
+        assert indicator.status()["process_settled"]
+    finally:
+        indicator.abort()
+        indicator._proc.stderr.close()
+
+
+def test_helper_expiry_during_command_validation_does_not_refresh_or_show_release(
+    monkeypatch,
+):
+    run, now, replies, surface = runtime()
+    run.tick()
+    now[0] = 13.99
+    original = helper.validate_command
+
+    def delayed_validation(row):
+        original(row)
+        now[0] = 14.01
+
+    monkeypatch.setattr(helper, "validate_command", delayed_validation)
+    run.receive(helper.encode_frame(command(2, "update", "released")))
+    run.tick()
+    assert run.reason == "connection_lost" and run.protocol.state == "interrupted"
+    assert run.last_command == 10.0 and "released" not in surface.states
+    assert replies[-1]["event"] == "unavailable"
+
+
+@pytest.mark.parametrize("op", ["status", "close"])
+@pytest.mark.parametrize("boundary", ["before_write", "before_reply_renewal"])
+def test_adapter_expiry_during_exchange_cannot_be_refreshed(monkeypatch, op, boundary):
+    indicator = adapter.MacOSIndicator()
+    indicator._snapshot.update(
+        available=True, ready=True, healthy=True, state="released"
+    )
+    indicator._last_reply, indicator._last_loop = 10.0, 1
+    clock, writes = [13.99], []
+    indicator._proc = SimpleNamespace(
+        poll=lambda: None,
+        stdin=SimpleNamespace(fileno=lambda: 101),
+        stdout=SimpleNamespace(fileno=lambda: 102),
+    )
+    reply = {
+        "v": 1,
+        "g": indicator._generation,
+        "s": 1,
+        "event": "ack" if op == "status" else "terminal",
+        "state": "released",
+        "reason": "ok",
+        "window": op == "status",
+        "loop": 2,
+    }
+
+    def select_ready(readers, writers, errors, timeout):
+        if writers and boundary == "before_write":
+            clock[0] = 14.01
+        return readers, writers, []
+
+    def read_reply(_fd, _size):
+        clock[0] = 14.01
+        return helper.encode_frame(reply)
+
+    monkeypatch.setattr(adapter.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(adapter.select, "select", select_ready)
+    monkeypatch.setattr(
+        adapter.os, "write", lambda fd, data: writes.append(data) or len(data)
+    )
+    monkeypatch.setattr(adapter.os, "read", read_reply)
+    result = indicator._request(op)
+    assert result["state"] == "interrupted" and result["reason"] == "connection_lost"
+    assert not result["healthy"] and not result["surface_absent"]
+    assert indicator._last_reply == 10.0 and indicator._failed
+    assert len(writes) == (boundary == "before_reply_renewal")
+    assert not indicator._request(op)["healthy"]
+    assert len(writes) == (boundary == "before_reply_renewal")  # No replay.
+
+
+def test_close_expired_without_intervening_public_status_never_sends_handoff(
+    monkeypatch,
+):
+    indicator = inert_indicator(monkeypatch)
+    try:
+        assert indicator.start()["healthy"]
+        assert indicator.update("released")["state"] == "released"
+        indicator._stop.set()
+        indicator._monitor.join(2)
+        assert not indicator._monitor.is_alive()
+        indicator._last_reply = time.monotonic() - helper.WATCHDOG_SECONDS - 0.25
+        seq = indicator._sequence
+        result = indicator.close()
+        assert result["state"] == "interrupted" and result["process_settled"]
+        assert indicator._failed and indicator._sequence == seq
+        trace = indicator._proc.stderr.read()
+        assert b'"op":"close"' not in trace
+        assert b"final:interrupted" in trace
+    finally:
+        indicator.abort()
+        indicator._proc.stderr.close()
+
+
 def test_readiness_on_later_loop_and_persistent_reasoning_gap():
     run, now, replies, surface = runtime()
     assert replies == []
