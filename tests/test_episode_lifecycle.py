@@ -22,7 +22,7 @@ from amplifier_module_tool_computer_use.ledger import HeldInputLedger
 from amplifier_module_tool_computer_use.remote_agent import RemoteAgent
 from amplifier_module_tool_computer_use.remote_backend import RemoteBackend
 from amplifier_module_tool_computer_use.ssh_transport import SshTransport
-from amplifier_module_tool_computer_use.wire import Request
+from amplifier_module_tool_computer_use.wire import Request, Response
 from test_neutral_computer import Backend, batch
 from test_remote_agent import _FakeBackend
 
@@ -855,6 +855,222 @@ def test_normal_generations_across_shared_transport_owners_use_same_order_domain
         assert owner.end_episode()["indicator_settled"]
         assert not agent._disconnected.is_set()
     first._ledger.stop()
+
+
+@pytest.mark.parametrize("previous", [False, True])
+@pytest.mark.parametrize("refusal", ["revoked", "other_owner"])
+@pytest.mark.parametrize("disposition", ["recover", "cleanup"])
+@run_async
+async def test_definitive_remote_begin_refusal_settles_only_rejected_owner(
+    monkeypatch, previous, refusal, disposition
+):
+    tool, agent, target = remote_rig()
+    controller = cu.EpisodeController(tool)
+    if previous:
+        old = (await controller.begin())["identity"]["generation"]
+        await controller.end(old)
+    other = None
+    if refusal == "other_owner":
+        other = {
+            "owner": "other",
+            "target": agent._episode_target,
+            "generation": new_episode_generation(),
+        }
+        assert agent._dispatch(Request(1, "episode_begin", {"identity": other})).ok
+        assert agent._dispatch(
+            Request(2, "mouse_down", {"button": "left", "_episode": other})
+        ).ok
+    held = list(agent._ledger.held_tokens)
+    ups = list(target.mouse_ups)
+    transport = tool._backend._transport
+    send = transport.send
+    calls = []
+
+    def refused_begin(line):
+        request = Request(**json.loads(line))
+        calls.append(request.op)
+        if request.op == "episode_begin" and refusal == "revoked":
+            agent._episode_notice(
+                Request(99, "episode_revoke", {"identity": request.args["identity"]})
+            )
+        return send(line)
+
+    monkeypatch.setattr(transport, "send", refused_begin)
+    closes = []
+    monkeypatch.setattr(transport, "close", lambda: closes.append(True), raising=False)
+    try:
+        with pytest.raises(cu.BackendError):
+            await controller.begin()
+        identity = dict(tool._episode_identity)
+        # The refusal remains a failed task, not an invented Released badge.
+        status = await controller.status()
+        assert status["identity"] == identity and status["state"] == "interrupted"
+        assert status["target_adopted"] is False
+        assert status["release_confirmed"] and status["indicator_settled"]
+        assert not (await tool.execute({"action": "key", "text": "A"})).success
+        result = await controller.end(identity["generation"], interrupted=True)
+        assert result["release_confirmed"] and result["workers"] == 0
+        assert calls.count("episode_begin") == 1  # Queries/end never replay begin.
+        assert agent._ledger.held_tokens == held and target.mouse_ups == ups
+        assert not agent._dispatch(
+            Request(100, "key", {"combo": "A", "_episode": identity})
+        ).ok
+        assert not agent._dispatch(
+            Request(101, "episode_begin", {"identity": identity})
+        ).ok
+        if disposition == "cleanup":
+            monkeypatch.setattr(cu, "_select_and_build", lambda cfg: tool)
+            mounted = await cu.mount(MockCoordinator())
+            await mounted()
+            assert closes == [True]
+            assert agent._ledger.held_tokens == held and target.mouse_ups == ups
+            if other:
+                assert agent._episode.status(other)["admission_open"]
+            return
+        if other:
+            assert agent._episode.status(other)["admission_open"]
+            assert agent._dispatch(Request(102, "episode_end", {"identity": other})).ok
+        monkeypatch.setattr(transport, "send", send)
+        fresh = await controller.begin()
+        assert fresh["identity"] != identity
+        await controller.end(fresh["identity"]["generation"])
+    finally:
+        if agent._episode:
+            agent._episode.close(agent._episode.status()["identity"])
+        tool._ledger.stop()
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "lost_refusal",
+        "lost_adopted",
+        "generic_error",
+        "wrong_id",
+        "wrong_identity",
+        "extra",
+        "adopted",
+        "bad_reason",
+    ],
+)
+@run_async
+async def test_remote_begin_without_exact_refusal_proof_retains_unknown_custody(
+    monkeypatch, fault
+):
+    tool, agent, target = remote_rig()
+    backend = tool._backend
+    transport = backend._transport
+    send = transport.send
+    calls = []
+
+    def corrupted(line):
+        request = Request(**json.loads(line))
+        calls.append(request.op)
+        if request.op != "episode_begin":
+            return send(line)
+        if fault != "lost_adopted":
+            agent._episode_notice(
+                Request(99, "episode_revoke", {"identity": request.args["identity"]})
+            )
+        raw = json.loads(send(line))
+        if fault.startswith("lost"):
+            raise cu.BackendError("inert missing reply")
+        if fault == "generic_error":
+            raw["error"].pop("data")
+        elif fault == "wrong_id":
+            raw["id"] += 100
+        else:
+            data = raw["error"]["data"]
+            if fault == "wrong_identity":
+                data["identity"]["owner"] = "not-this-owner"
+            elif fault == "extra":
+                data["extra"] = True
+            elif fault == "adopted":
+                data["adopted"] = True
+            else:
+                data["reason"] = []
+        return json.dumps(raw).encode()
+
+    monkeypatch.setattr(transport, "send", corrupted)
+    try:
+        with pytest.raises((cu.BackendError, ValueError)):
+            await cu.EpisodeController(tool).begin()
+        assert backend._episode_fenced
+        status = cu.EpisodeController(tool).cached_status()
+        assert status["admission_open"] is False
+        assert not status["release_confirmed"]
+        assert not status["indicator_settled"]
+        with pytest.raises(cu.BackendError):
+            backend.key("A")
+        assert calls == ["episode_begin"]
+        if fault == "lost_adopted":
+            # Reconcile actual adoption by query/end, never a repeated begin.
+            result = tool.end_episode(interrupted=True)
+            assert result["release_confirmed"]
+        else:
+            with pytest.raises(cu.BackendError):
+                tool.end_episode(interrupted=True)
+            assert not backend._episode_status_cache["release_confirmed"]
+    finally:
+        if agent._episode:
+            agent._episode.close(agent._episode.status()["identity"])
+        tool._ledger.stop()
+
+
+@run_async
+async def test_not_adopted_receipt_cannot_ack_controller_pending_input(monkeypatch):
+    tool, agent, _ = remote_rig()
+    transport = tool._backend._transport
+    send = transport.send
+
+    def revoked(line):
+        request = Request(**json.loads(line))
+        if request.op == "episode_begin":
+            agent._episode_notice(
+                Request(99, "episode_revoke", {"identity": request.args["identity"]})
+            )
+        return send(line)
+
+    monkeypatch.setattr(transport, "send", revoked)
+    try:
+        with pytest.raises(cu.BackendError):
+            await cu.EpisodeController(tool).begin()
+        tool._mouse_pending["mouse:left"] = {}
+        releases = []
+        tool._ledger.hold("mouse", "mouse:left", lambda: releases.append(True))
+        assert not tool.episode_status()["release_confirmed"]
+        assert not cu.EpisodeController(tool).cached_status()["release_confirmed"]
+        assert not tool.end_episode()["release_confirmed"]
+        assert tool._ledger.held_tokens == ["mouse:left"] and releases == []
+    finally:
+        tool._mouse_pending.clear()
+        tool._ledger.stop()
+
+
+def test_begin_refusal_wire_roundtrip_and_adopted_or_invalid_have_no_proof():
+    tool, agent, _ = remote_rig()
+    current = tool.begin_episode()["identity"]
+    try:
+        agent._episode.fence(current)
+        # Already-adopted/fenced generations must never get no-adoption proof.
+        adopted = agent._dispatch(Request(10, "episode_begin", {"identity": current}))
+        assert not adopted.ok and adopted.error_data is None
+        malformed = agent._dispatch(
+            Request(11, "episode_begin", {"identity": {**current, "target": "wrong"}})
+        )
+        assert not malformed.ok and malformed.error_data is None
+        rejected = {**current, "generation": new_episode_generation()}
+        response = agent._dispatch(Request(12, "episode_begin", {"identity": rejected}))
+        assert not response.ok and response.error_type == "EpisodeBeginRefused"
+        decoded = Response.decode(response.encode())
+        assert decoded == response
+        assert decoded.error_data["identity"] == rejected
+        assert decoded.error_data["adopted"] is False
+        replay = agent._dispatch(Request(13, "episode_begin", {"identity": rejected}))
+        assert not replay.ok and replay.error_data is None
+    finally:
+        tool.end_episode(interrupted=True)
+        tool._ledger.stop()
 
 
 @run_async

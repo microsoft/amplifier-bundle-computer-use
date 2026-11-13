@@ -78,7 +78,7 @@ from .target_clock import (
     target_clock_exchange,
     without_target_clock,
 )
-from .wire import PROTOCOL_VERSION, Request, Response, classify_op
+from .wire import PROTOCOL_VERSION, EpisodeBeginRefused, Request, Response, classify_op
 
 logging.basicConfig(
     level=logging.INFO,
@@ -252,8 +252,6 @@ class RemoteAgent:
                 return self._episode.begin(identity)
             if order <= self._episode_highwater:
                 raise EpisodeError("stale episode generation order")
-            if current is not None and not settled_terminal(current):
-                raise EpisodeError("another episode retains target custody")
             revoked = key in self._revoked_generations
             # Begin dispatch consumes its ordered slot even if previously
             # revoked. Old begins can never be replayed after compacting fences.
@@ -263,8 +261,19 @@ class RemoteAgent:
                 for entry in self._revoked_generations
                 if episode_order(entry[1]) > order
             }
-            if revoked:
-                raise EpisodeError("episode revoked before begin")
+            # Consume rejected ordered slots as well. A delayed duplicate can
+            # never acquire custody once the current owner has settled.
+            if revoked or (current is not None and not settled_terminal(current)):
+                raise EpisodeBeginRefused(
+                    {
+                        "version": 1,
+                        "identity": dict(identity),
+                        "adopted": False,
+                        "reason": "revoked_before_begin"
+                        if revoked
+                        else "target_custody_owned",
+                    }
+                )
             if current is not None:
                 self._episode = None
             if self._episode is None:
@@ -699,6 +708,14 @@ class RemoteAgent:
                 )
             result = handler(self, args)
             return Response(id=req.id, ok=True, result=result)
+        except EpisodeBeginRefused as exc:
+            return Response(
+                id=req.id,
+                ok=False,
+                error_type="EpisodeBeginRefused",
+                error_message=str(exc),
+                error_data=exc.receipt,
+            )
         except BackendError as exc:
             return Response(
                 id=req.id,

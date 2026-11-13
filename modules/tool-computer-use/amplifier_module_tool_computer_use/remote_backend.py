@@ -27,7 +27,14 @@ from .backend import (
 from .episode import settled_terminal
 from .ssh_transport import AgentStderrError, SshConnectError, SshTransport
 from .target_clock import CURRENT_TARGET_CLOCK, TargetClockFailure, guarded_target_call
-from .wire import AgentBackendUnavailableError, Request, Response, classify_op
+from .wire import (
+    AgentBackendUnavailableError,
+    EpisodeBeginRefused,
+    Request,
+    Response,
+    classify_op,
+    validate_begin_refusal,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -132,7 +139,31 @@ class RemoteBackend:
                 }
             elif self._episode_fenced:
                 raise BackendError("remote episode fenced")
-        result = self._call("episode_begin", identity=identity)
+        try:
+            result = self._call("episode_begin", identity=identity)
+        except EpisodeBeginRefused as exc:
+            with self._episode_state_lock:
+                if identity == self._episode_identity:
+                    self._episode_fenced = True
+                    self._episode_status_cache = {
+                        "identity": dict(identity),
+                        "state": "interrupted",
+                        "reason": exc.receipt["reason"],
+                        "target_adopted": False,
+                        "begin_refusal": copy.deepcopy(exc.receipt),
+                        "workers": 0,
+                        "admission_open": False,
+                        # Scoped no-input/no-renderer custody, NOT physical
+                        # release of another owner's held input or surface.
+                        "release_confirmed": True,
+                        "indicator_settled": True,
+                    }
+            raise BackendError(f"remote episode begin refused: {exc}") from exc
+        except BaseException:
+            # A missing/malformed reply is not a no-effect receipt. Close local
+            # admission, retain unknown custody and never replay the request.
+            self.fence_episode_local(identity, interrupted=True)
+            raise
         with self._episode_state_lock:
             if self._episode_fenced or identity != self._episode_identity:
                 # Readiness reply is not authority to revoke a newer Stop.
@@ -341,6 +372,12 @@ class RemoteBackend:
                 f"wire desync: sent id={req.id}, got id={resp.id} for op {op!r}"
             )
         if not resp.ok:
+            if (
+                op == "episode_begin"
+                and resp.error_type == "EpisodeBeginRefused"
+                and validate_begin_refusal(resp.error_data, args.get("identity"))
+            ):
+                raise EpisodeBeginRefused(resp.error_data)
             raise BackendError(f"{resp.error_type}: {resp.error_message}")
         if exchange is not None:
             envelope = resp.result

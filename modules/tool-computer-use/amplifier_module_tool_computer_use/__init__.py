@@ -2149,8 +2149,22 @@ class ComputerTool:
         if self._episode is None:
             return {"state": "idle", "release_confirmed": False, "workers": 0}
         if self._binding.is_remote:
-            return self._episode.episode_status(self._episode_identity)
+            return self._own_episode_status(
+                self._episode.episode_status(self._episode_identity)
+            )
         return self._episode.status(self._episode_identity)
+
+    def _own_episode_status(self, status: dict) -> dict:
+        if status.get("target_adopted") is False and (
+            self._episode_workers or self._mouse_pending
+        ):
+            return {
+                **status,
+                "reason": "controller_input_custody_pending",
+                "controller_workers": self._episode_workers,
+                "release_confirmed": False,
+            }
+        return status
 
     def end_episode(self, generation: str | None = None, *, interrupted=False) -> dict:
         # Fence BEFORE waiting for any sponsorship/status/native lock. Another
@@ -2188,6 +2202,12 @@ class ComputerTool:
                             }
                         self._episode_worker_condition.wait(remaining)
                 result = self._episode.end_episode(identity, interrupted=interrupted)
+                if result.get("target_adopted") is False:
+                    # A target no-adoption receipt cannot erase an unrelated
+                    # controller obligation or authorize a synthetic mouse-up.
+                    result = self._own_episode_status(result)
+                    self._episode_fenced_status = result
+                    return result
                 if (
                     result.get("identity") == identity
                     and result.get("release_confirmed") is True
@@ -5905,7 +5925,9 @@ class EpisodeController:
                 "release_confirmed": False,
             }
         if self.computer._binding.is_remote:
-            return copy.deepcopy(episode._episode_status_cache)
+            return self.computer._own_episode_status(
+                copy.deepcopy(episode._episode_status_cache)
+            )
         return episode.status()
 
 
