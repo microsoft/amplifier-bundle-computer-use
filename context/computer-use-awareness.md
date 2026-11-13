@@ -18,6 +18,15 @@ when UI-use reports unavailable/unsupported controls, unstable observations, or
 needs recovery. If `ui_use` is absent, the ordinary computer operator remains the
 first-class path. Verify current state before recovery; never replay unknown input.
 
+**Hand back control.** On supported Mac bindings the target activity panel stays
+up across calls. End the bounded task with `desktop(action="episode_status")`,
+then `desktop(action="end_episode", generation=<that exact generation>)` unless
+the host already owns that boundary. Report released only from confirmed release
+status, separately from task success. Stopping, expiry, disconnect or helper loss
+means pending/interrupted, never Done. Do not auto-begin after an interruption or
+retry uncertain input. Other platforms retain their existing disclosure behavior;
+this episode is cooperative channel/agent ownership, not desktop-wide exclusion.
+
 **Targeting.** `config.target` selects the mount target (unset is this machine;
 `ssh://user@host` is another). `desktop(action="retarget")` re-points an already-mounted
 session; `computer_use_unavailable(action="activate")` mounts tools when none are mounted.

@@ -48,6 +48,7 @@ from .announce_macos import AnnounceError, AnnounceResult
 from .announce_macos import announce as macos_announce
 from .backend import Backend, BackendError, MonitorInfo
 from .coexistence_guard import CoexistenceGuard, HaltedError, OperatorPresenceOverride
+from .episode import Episode, EpisodeError, OverlayIndicator
 from .exclusion import Rect
 from .geometry import Display, ImageSpace, InvalidDisplayGeometryError, compute_display
 from .guard_diagnostics import (
@@ -100,9 +101,18 @@ logger = logging.getLogger(__name__)
 _input_cancelled: contextvars.ContextVar[threading.Event | None] = (
     contextvars.ContextVar("computer_input_cancelled", default=None)
 )
+_episode_cancelled = contextvars.ContextVar("computer_episode_cancelled", default=None)
+_episode_scope = contextvars.ContextVar("computer_episode_scope", default=None)
+_episode_registry_lock = threading.Lock()
+_episode_registry: dict[str, Episode] = {}
 
 
 def _check_input_cancelled() -> None:
+    cancelled = _episode_cancelled.get()
+    if cancelled is not None and cancelled.is_set():
+        raise BackendError(
+            "computer-use episode stopped; native outcome may be partial"
+        )
     signal = _input_cancelled.get()
     if signal is not None and signal.is_set():
         raise BackendError("request cancelled; no further input scheduled")
@@ -435,6 +445,15 @@ class ComputerTool:
         # session previously wrote into together. See `execute()` and
         # `_prune_shots()`.
         self._session_id: str = uuid.uuid4().hex
+        self._episode_enabled = (
+            False  # enabled by the production builder, inert at mount
+        )
+        self._episode_owner = self._session_id
+        self._episode = None
+        self._episode_identity = None
+        self._episode_lock = threading.RLock()
+        self._episode_heartbeat_stop = threading.Event()
+        self._episode_fenced_status = None
         self._observed_control = None
         self._diagnostics = DiagnosticLog()
         # One-shot handoff to the hook's real tool:post call association. Only
@@ -1290,6 +1309,7 @@ class ComputerTool:
         guard.bind_target()
         guard.before_event(coord=coord)
         try:
+            _check_input_cancelled()
             if self._observed_control is not None:
                 from .observed_control import check_observed_proof
 
@@ -1610,6 +1630,18 @@ class ComputerTool:
         target's remoteness, exactly like `__init__` does at mount.
         """
         normalized = str(target).strip() if target else ""
+        if self._episode_enabled and self._episode_identity is not None:
+            result = self.end_episode()
+            if result["state"] != "released" or result["workers"]:
+                return ToolResult(
+                    success=False,
+                    error={
+                        "message": "retarget refused: old episode not released",
+                        "type": "RetargetRefused",
+                    },
+                )
+            self._episode_identity = None
+            self._episode = None
         new_cfg = dict(self._cfg)
         if normalized and normalized != "local":
             new_cfg["target"] = normalized
@@ -1925,6 +1957,12 @@ class ComputerTool:
                 remote_cancel_seen=False,
             )
             old = self._binding
+            self._episode_enabled = (
+                new_backend.name == "macos"
+                or getattr(new_backend, "presence_platform", None) == "macos"
+                or new_cfg.get("_indicator_factory") is not None
+            )
+            self._episode_fenced_status = None
             # Step 7 (\u00a76.2): SWAP - the fix the review named: ONE atomic
             # reference assignment, never a field at a time. A reader can
             # only ever observe the OLD binding whole or the NEW binding
@@ -1977,6 +2015,204 @@ class ComputerTool:
     # this: it fires once, asks a human if needed, and builds the handle
     # this section re-raises/lowers. Nothing here can ask a human anything
     # or clear a sticky refusal.
+    def begin_episode(self, *, explicit=False) -> dict:
+        """Lazy task sponsorship. Owner is this mounted instance, never model input."""
+        with self._episode_lock:
+            scope = _episode_scope.get()
+            if scope is not None and scope[0] is self:
+                if (
+                    self._episode_identity is None
+                    or scope[1] != self._episode_identity["generation"]
+                ):
+                    raise BackendError("stale host episode scope")
+                if self._episode_fenced_status is not None:
+                    raise BackendError("host episode scope fenced")
+            if self._cleanup_started:
+                raise BackendError("computer-use cleanup has started")
+            if self._episode_identity is not None:
+                status = self.episode_status()
+                if explicit and status["state"] == "released":
+                    self._episode_identity = None
+                    self._episode = None
+                    self._episode_fenced_status = None
+                else:
+                    if status["state"] not in {"viewing", "controlling"}:
+                        raise BackendError(
+                            "episode fenced; explicit begin required after confirmed release"
+                        )
+                    if self._binding.is_remote:
+                        self._episode.heartbeat_episode(self._episode_identity)
+                    else:
+                        self._episode.heartbeat(self._episode_identity)
+                    return status
+            binding = self._binding
+            identity = {
+                "owner": self._episode_owner,
+                "target": (
+                    binding.backend.episode_target
+                    if binding.is_remote
+                    else binding.diagnostic_id
+                ),
+                "generation": uuid.uuid4().hex,
+            }
+            if binding.is_remote:
+                self._episode = binding.backend
+                self._episode_identity = identity
+                result = binding.backend.begin_episode(identity)
+            else:
+                key = _channel_identity(binding.backend)
+                with _episode_registry_lock:
+                    existing = _episode_registry.get(key)
+                    if existing is not None:
+                        raise BackendError(
+                            "another controller owns this channel episode"
+                        )
+                    if binding.ledger is not None and binding.ledger.held_tokens:
+                        raise BackendError(
+                            "existing channel held-input custody must settle first"
+                        )
+
+                    def indicator():
+                        factory = self._cfg.get("_indicator_factory")
+                        if factory:
+                            return factory()
+                        if binding.backend.name == "macos":
+                            from .macos_indicator import MacOSIndicator
+
+                            return MacOSIndicator()
+                        return OverlayIndicator(binding.announcement)
+
+                    def release():
+                        if binding.ledger is not None:
+                            binding.ledger.release_all(reason="episode_end")
+                        return not self._mouse_pending and not (
+                            binding.ledger is not None and binding.ledger.held_tokens
+                        )
+
+                    episode = Episode(
+                        identity["target"], indicator, release, lease_seconds=120
+                    )
+                    _episode_registry[key] = episode
+                    self._episode = episode
+                try:
+                    result = episode.begin(identity)
+                except BaseException:
+                    # Failed start stays fenced, with cleanup custody retained.
+                    self._episode_identity = identity
+                    raise
+            self._episode_identity = identity
+            # Renewal belongs to a live bounded sponsor, not a mounted process.
+            # Direct clients get a finite 120s reasoning-gap lease renewed only
+            # by actual calls. Hosts call the capability's heartbeat explicitly.
+            return result
+
+    def episode_status(self) -> dict:
+        if self._episode is None:
+            return {"state": "idle", "release_confirmed": False, "workers": 0}
+        if self._binding.is_remote:
+            return self._episode.episode_status(self._episode_identity)
+        return self._episode.status(self._episode_identity)
+
+    def end_episode(self, generation: str | None = None, *, interrupted=False) -> dict:
+        # Crucially does NOT acquire _announce_lock, which native work holds.
+        with self._episode_lock:
+            identity = self._episode_identity
+            if identity is None:
+                return self.episode_status()
+            if generation is not None and generation != identity["generation"]:
+                raise BackendError("stale episode generation")
+            self._episode_heartbeat_stop.set()
+            if self._binding.is_remote:
+                self._episode.revoke_episode(identity, interrupted=interrupted)
+                result = self._episode.end_episode(identity, interrupted=interrupted)
+            else:
+                self._episode.fence(identity, interrupted=interrupted)
+                result = self._episode.close(identity)
+            if (
+                result["workers"] == 0
+                and result["state"] == "released"
+                and not self._binding.is_remote
+            ):
+                with _episode_registry_lock:
+                    key = _channel_identity(self._binding.backend)
+                    if _episode_registry.get(key) is self._episode:
+                        del _episode_registry[key]
+                # Keep terminal identity until a deliberate new begin.
+            return result
+
+    def fence_episode(self, generation: str, *, interrupted=True) -> dict:
+        identity = self._episode_identity
+        if identity is None or generation != identity["generation"]:
+            raise BackendError("wrong or stale episode generation")
+        self._episode_heartbeat_stop.set()
+        if self._binding.is_remote:
+            # Close controller admission synchronously. Target custody notice
+            # does not wait for the response lock or a native worker.
+            self._episode._episode_fenced = True
+            episode = self._episode
+
+            def notify():
+                try:
+                    episode.revoke_episode(identity, interrupted=interrupted)
+                except Exception:
+                    logger.warning(
+                        "episode revoke reply unconfirmed; target lease remains fenced on expiry"
+                    )
+
+            threading.Thread(target=notify, daemon=True).start()
+            self._episode_fenced_status = {
+                "identity": dict(identity),
+                "state": "interrupted" if interrupted else "stopping",
+                "release_confirmed": False,
+                "workers": None,
+                "admission_open": False,
+            }
+            return dict(self._episode_fenced_status)
+        self._episode.fence(identity, interrupted=interrupted)
+        self._episode_fenced_status = self._episode.status(identity)
+        return dict(self._episode_fenced_status)
+
+    @contextmanager
+    def _episode_admission(
+        self, action: str, binding: _Binding, *, episode=None, identity=None
+    ):
+        if not self._episode_enabled:
+            yield
+            return
+        identity = identity if identity is not None else self._episode_identity
+        episode = episode if episode is not None else self._episode
+        if (
+            identity is None
+            or identity != self._episode_identity
+            or episode is not self._episode
+        ):
+            raise BackendError("no sponsored computer-use episode")
+        scope = _episode_scope.get()
+        if (
+            scope is not None
+            and scope[0] is self
+            and scope[1] != identity["generation"]
+        ):
+            raise BackendError("stale host episode scope")
+        try:
+            if binding.is_remote:
+                # Remote final admission is on the target; controller still
+                # prevents queued post-end calls from being dispatched.
+                binding.backend.check_episode(identity)
+                yield
+            else:
+                with episode.admit(
+                    identity,
+                    controlling=action in MUTATING or action in MUTATING_DESKTOP,
+                ) as cancelled:
+                    token = _episode_cancelled.set(cancelled)
+                    try:
+                        yield
+                    finally:
+                        _episode_cancelled.reset(token)
+        except EpisodeError as exc:
+            raise BackendError(str(exc)) from exc
+
     def _live_band_handle(self) -> Any | None:
         """This session's announcement handle, narrowed to one that supports
         live re-raise/lower (`show()`/`hide()`) - the Linux/Windows overlay.
@@ -2070,6 +2306,8 @@ class ComputerTool:
         with state.lock:
             state.depth -= 1
             depth_now = state.depth
+        if self._episode_enabled and self._episode_identity is not None:
+            return  # Episode, not an empty queue, owns persistent indication.
         if depth_now != 0:
             return
         ledger = self._ledger
@@ -2773,6 +3011,7 @@ class ComputerTool:
 
     async def execute(self, input: dict[str, Any]) -> ToolResult:
         """Run a flat canonical call or one fully prevalidated v1 batch."""
+        invocation_episode = self._episode_identity
         if self._cleanup_started:
             return ToolResult(
                 success=False,
@@ -2828,6 +3067,13 @@ class ComputerTool:
             )
         try:
             await asyncio.to_thread(self._ensure_announced)
+            if self._episode_enabled:
+                if (
+                    invocation_episode is not None
+                    and invocation_episode != self._episode_identity
+                ):
+                    raise BackendError("queued invocation belongs to a stale episode")
+                await asyncio.to_thread(self.begin_episode)
         except asyncio.CancelledError:
             if not batch:
                 raise
@@ -2849,6 +3095,10 @@ class ComputerTool:
             return ToolResult(
                 success=False,
                 error={"message": str(exc), "type": "AnnouncementRefused"},
+            )
+        except (BackendError, EpisodeError) as exc:
+            return ToolResult(
+                success=False, error={"message": str(exc), "type": type(exc).__name__}
             )
         try:
             binding = self._disclosed_binding(binding)
@@ -2896,6 +3146,8 @@ class ComputerTool:
             "running": False,
             "cleanup": None,
             "cancelled": threading.Event(),
+            "episode": self._episode,
+            "episode_identity": self._episode_identity,
         }
         result = None
         captures: list = []
@@ -3047,6 +3299,7 @@ class ComputerTool:
             raise BackendError("computer-use session cleanup has started")
         if self._binding is not binding:
             raise BackendError("request stopped: target or policy changed")
+        _check_input_cancelled()
         if action in MUTATING or action in MUTATING_DESKTOP:
             if binding.read_only:
                 raise BackendError("write blocked: computer-use is mounted read_only")
@@ -3071,7 +3324,13 @@ class ComputerTool:
                 self._diagnostics, binding, self._diagnostics.identity
             ):
                 _check_input_cancelled()
-                outcome = function(*args)
+                with self._episode_admission(
+                    action,
+                    binding,
+                    episode=flight.get("episode"),
+                    identity=flight.get("episode_identity"),
+                ):
+                    outcome = function(*args)
                 with flight["lock"]:
                     flight["outcome"] = outcome
                 return outcome
@@ -3448,6 +3707,9 @@ DESKTOP_ACTIONS = [
     # leave.
     "retarget",
     "diagnostic_snapshot",
+    "begin_episode",
+    "end_episode",
+    "episode_status",
 ]
 
 #: Clipboard *reads* travel to the model provider as tool output (see README Safety
@@ -3561,6 +3823,9 @@ class DesktopTool:
             f"session controls is fixed for the whole session, not chosen per call: {_TARGET_MODEL}"
             " Use `diagnostic_snapshot` for bounded cached, payload-free guard evidence; "
             "it never contacts the target, samples presence, or clears a halt."
+            " Computer use lazily begins an owner-bound episode which persists between "
+            "actions. Call end_episode when the bounded task ends; inspect episode_status "
+            "after an unknown reply, never replay input. Release is distinct from task success."
         )
 
     @property
@@ -3569,6 +3834,10 @@ class DesktopTool:
             "type": "object",
             "properties": {
                 "action": {"type": "string", "enum": DESKTOP_ACTIONS},
+                "generation": {
+                    "type": "string",
+                    "description": "Exact episode generation for end_episode, from episode_status.",
+                },
                 "handle": {
                     "type": "string",
                     "description": "Window handle from list_windows (focus_window).",
@@ -3601,6 +3870,32 @@ class DesktopTool:
         }
 
     async def execute(self, input: dict[str, Any]) -> ToolResult:
+        invocation_episode = self._computer._episode_identity
+        if isinstance(input, dict) and input.get("action") in {
+            "end_episode",
+            "episode_status",
+        }:
+            try:
+                if input["action"] == "end_episode":
+                    if set(input) - {"action", "generation"}:
+                        raise ValueError("end_episode accepts only generation")
+                    if not isinstance(input.get("generation"), str):
+                        raise ValueError(
+                            "end_episode requires exact generation from episode_status"
+                        )
+                    result = await asyncio.to_thread(
+                        self._computer.end_episode, input.get("generation")
+                    )
+                else:
+                    if set(input) != {"action"}:
+                        raise ValueError("episode_status accepts only action")
+                    result = await asyncio.to_thread(self._computer.episode_status)
+                return ToolResult(success=True, output=result)
+            except Exception as exc:
+                return ToolResult(
+                    success=False,
+                    error={"message": str(exc), "type": type(exc).__name__},
+                )
         # Pure cached diagnostics are available even while halted or after
         # cleanup. Do not approve, disclose, poll, copy arbitrary input fields,
         # touch the backend, or wait for _announce_lock on this route.
@@ -3710,10 +4005,26 @@ class DesktopTool:
         # ones that happen to share `_run()` with `computer`.
         try:
             await asyncio.to_thread(self._computer._ensure_announced)
+            if self._computer._episode_enabled or action == "begin_episode":
+                if (
+                    action != "begin_episode"
+                    and invocation_episode is not None
+                    and (invocation_episode != self._computer._episode_identity)
+                ):
+                    raise BackendError("queued invocation belongs to a stale episode")
+                await asyncio.to_thread(
+                    self._computer.begin_episode, explicit=action == "begin_episode"
+                )
+            if action == "begin_episode":
+                return ToolResult(success=True, output=self._computer.episode_status())
         except AnnouncementRefused as exc:
             return ToolResult(
                 success=False,
                 error={"message": str(exc), "type": "AnnouncementRefused"},
+            )
+        except (BackendError, EpisodeError) as exc:
+            return ToolResult(
+                success=False, error={"message": str(exc), "type": type(exc).__name__}
             )
         try:
             binding = self._computer._disclosed_binding(binding)
@@ -3728,19 +4039,43 @@ class DesktopTool:
         # action would, and is what closes F9 (desktop actions bypassing
         # the counter).
         try:
-            band_token = await asyncio.to_thread(self._computer._band_enter)
+            band_token = await self._computer._acquire_batch_band()
         except AnnouncementRefused as exc:
             return ToolResult(
                 success=False,
                 error={"message": str(exc), "type": "AnnouncementRefused"},
             )
+        flight = {
+            "lock": threading.Lock(),
+            "running": False,
+            "cleanup": None,
+            "cancelled": threading.Event(),
+            "episode": self._computer._episode,
+            "episode_identity": self._computer._episode_identity,
+        }
         try:
-            return await self._execute_action(input, binding=binding, approved=approved)
+            return await self._execute_action(
+                input, binding=binding, approved=approved, flight=flight
+            )
         finally:
-            await asyncio.to_thread(self._computer._band_exit, band_token)
+            with flight["lock"]:
+                deferred = flight["running"]
+                if deferred:
+                    flight["cleanup"] = lambda: self._computer._band_exit(band_token)
+            if not deferred:
+                await asyncio.shield(
+                    self._computer._submit_batch_thread(
+                        self._computer._band_exit, band_token
+                    )
+                )
 
     async def _execute_action(
-        self, input: dict[str, Any], *, binding: _Binding, approved: Callable | None
+        self,
+        input: dict[str, Any],
+        *,
+        binding: _Binding,
+        approved: Callable | None,
+        flight: dict,
     ) -> ToolResult:
         """The actual per-action dispatch, unchanged from before band-
         lifetime tracking existed - split out of `execute()` only so that
@@ -3760,6 +4095,11 @@ class DesktopTool:
                 error={"message": f"action {action!r} blocked: mounted read_only"},
             )
         backend = binding.backend
+
+        async def owned(function, *args):
+            return await self._computer._await_owned_step(
+                action, binding, flight, function, *args
+            )
 
         def checked_call(function, *args):
             # Direct desktop reads/monitor changes do not use _run_flat_step.
@@ -3786,7 +4126,7 @@ class DesktopTool:
                             "clipboard_read_policy=block"
                         },
                     )
-                output = await asyncio.to_thread(checked_call, backend.get_clipboard)
+                output = await owned(checked_call, backend.get_clipboard)
                 digest = _text_digest(output)
                 logger.info(
                     "computer-use audit: op=get_clipboard policy=%s chars=%d sha256=%s",
@@ -3818,7 +4158,7 @@ class DesktopTool:
                         with self._computer._guard_write(binding=binding):
                             backend.set_clipboard(body)
 
-                await asyncio.to_thread(set_clipboard)
+                await owned(set_clipboard)
                 # §3 audit hardening: digest, never plaintext - the same
                 # discipline `type` uses, since clipboard content is exactly
                 # the kind of thing that "frequently includes credentials."
@@ -3829,9 +4169,7 @@ class DesktopTool:
                 )
                 return ToolResult(success=True, output="clipboard set")
             if action == "list_monitors":
-                monitors = await asyncio.to_thread(
-                    checked_call, self._computer.list_monitors
-                )
+                monitors = await owned(checked_call, self._computer.list_monitors)
                 current = self._computer.current_monitor
                 lines = [
                     f"  [{m.id}] {m.width}x{m.height} at ({m.x},{m.y})"
@@ -3848,9 +4186,7 @@ class DesktopTool:
                 target = str(input.get("monitor") or "").strip()
                 if not target:
                     raise ValueError("action 'select_monitor' requires 'monitor'")
-                disp = await asyncio.to_thread(
-                    checked_call, self._computer.select_monitor, target
-                )
+                disp = await owned(checked_call, self._computer.select_monitor, target)
                 return ToolResult(
                     success=True,
                     output=(
@@ -3860,7 +4196,7 @@ class DesktopTool:
                         f"{disp.model_width}x{disp.model_height}"
                     ),
                 )
-            summary, _ = await asyncio.to_thread(
+            summary, _ = await owned(
                 self._computer._run_flat_step, action, input, binding, approved
             )
             return ToolResult(success=True, output=summary)
@@ -5342,6 +5678,11 @@ def _select_and_build(cfg: dict[str, Any]) -> ComputerTool:
     backend = select_backend(cfg)
     try:
         computer = ComputerTool(backend, cfg)
+        computer._episode_enabled = (
+            backend.name == "macos"
+            or getattr(backend, "presence_platform", None) == "macos"
+            or cfg.get("_indicator_factory") is not None
+        )
         # D2: resolve display once, here, before the tool ever answers a provider
         # request - not lazily on the first `native_tool_spec` read.
         try:
@@ -5364,7 +5705,7 @@ def _select_and_build(cfg: dict[str, Any]) -> ComputerTool:
         # (same population as before this feature existed: no coexistence
         # layer at all). Computed from the SAME backend `_build_coexistence_guard`
         # was just given, so `_channel_identity` returns the identical key.
-        if computer._coexistence_guard is not None:
+        if computer._coexistence_guard is not None or computer._episode_enabled:
             computer._channel_key = _channel_identity(backend)
             computer._ledger = _get_channel_ledger(computer._channel_key)
             computer._band_state = _get_channel_band_state(computer._channel_key)
@@ -5392,6 +5733,90 @@ def _select_and_build(cfg: dict[str, Any]) -> ComputerTool:
                 "tool-computer-use: failed-build cleanup failed", exc_info=True
             )
         raise
+
+
+class EpisodeController:
+    """Public cooperative host seam; callbacks carry exact captured generation.
+
+    A host supplies a bounded task lifetime and calls heartbeat only while that
+    sponsor is live. No hook name or model-supplied owner establishes authority.
+    """
+
+    def __init__(self, computer):
+        self.computer = computer
+
+    async def begin(self) -> dict:
+        if not self.computer._episode_enabled:
+            return {
+                "state": "unavailable",
+                "reason": "platform_lifecycle_not_enabled",
+                "release_confirmed": False,
+                "workers": 0,
+                "identity": None,
+            }
+        await asyncio.to_thread(self.computer._ensure_announced)
+        return await asyncio.to_thread(self.computer.begin_episode, explicit=True)
+
+    def _identity(self, generation):
+        identity = self.computer._episode_identity
+        if identity is None or identity["generation"] != generation:
+            raise BackendError("wrong or stale episode generation")
+        return identity
+
+    @contextmanager
+    def bind(self, generation: str):
+        """Bind all nested calls/worker contexts to this exact host generation."""
+        self._identity(generation)
+        token = _episode_scope.set((self.computer, generation))
+        try:
+            yield
+        finally:
+            _episode_scope.reset(token)
+
+    def fence(self, generation: str, *, interrupted=True) -> dict:
+        self._identity(generation)
+        return self.computer.fence_episode(generation, interrupted=interrupted)
+
+    async def heartbeat(self, generation: str) -> None:
+        identity = self._identity(generation)
+        episode = self.computer._episode
+        if self.computer._binding.is_remote:
+            await asyncio.to_thread(episode.heartbeat_episode, identity)
+        else:
+            episode.heartbeat(identity)
+
+    async def end(self, generation: str, *, interrupted=False) -> dict:
+        self._identity(generation)
+        # Fence before moving any settlement offloop. Cancellation of the
+        # awaiting host does not reopen admission or imply native drain.
+        self.fence(generation, interrupted=interrupted)
+        return await asyncio.shield(
+            self.computer._submit_batch_thread(
+                lambda: self.computer.end_episode(generation, interrupted=interrupted)
+            )
+        )
+
+    async def status(self, generation: str | None = None) -> dict:
+        if generation is not None:
+            self._identity(generation)
+        return await asyncio.to_thread(self.computer.episode_status)
+
+    def cached_status(self) -> dict:
+        episode = self.computer._episode
+        if episode is not None and not self.computer._binding.is_remote:
+            return episode.status()
+        if self.computer._episode_fenced_status is not None:
+            return dict(self.computer._episode_fenced_status)
+        if episode is None:
+            return {
+                "state": "idle",
+                "identity": None,
+                "workers": 0,
+                "release_confirmed": False,
+            }
+        if self.computer._binding.is_remote:
+            return copy.deepcopy(episode._episode_status_cache)
+        return episode.status()
 
 
 class _MountResult(dict):
@@ -5423,11 +5848,32 @@ async def _mount_backend(coordinator: Any, cfg: dict[str, Any]) -> dict[str, Any
     (`mount()`) or a `ToolResult` (`_activate`).
     """
     computer = await asyncio.to_thread(_select_and_build, cfg)
+    # Bind owner to coordinator runtime identity plus this mount; event payload
+    # session_id and model arguments cannot choose another owner.
+    runtime_owner = getattr(coordinator, "session_id", None)
+    if isinstance(runtime_owner, str):
+        computer._episode_owner = hashlib.sha256(
+            (runtime_owner + ":" + computer._session_id).encode()
+        ).hexdigest()
+    episodes = EpisodeController(computer)
+    register_capability = getattr(coordinator, "register_capability", None)
+    get_capability = getattr(coordinator, "get_capability", None)
+    previous_episodes = (
+        get_capability("computer_use.episodes") if callable(get_capability) else None
+    )
+    if callable(register_capability):
+        register_capability("computer_use.episodes", episodes)
     closed = False
     close_error: BaseException | None = None
 
     def close_current_binding() -> None:
         nonlocal closed, close_error
+        if computer._episode_identity is not None:
+            result = computer.end_episode(interrupted=True)
+            if result["workers"] or not result["release_confirmed"]:
+                raise RuntimeError(
+                    "computer-use cleanup pending: episode release unconfirmed"
+                )
         with computer._announce_lock:
             if close_error is not None:
                 raise close_error
@@ -5470,6 +5916,12 @@ async def _mount_backend(coordinator: Any, cfg: dict[str, Any]) -> dict[str, Any
 
     async def cleanup() -> None:
         await asyncio.to_thread(close_current_binding)
+        if (
+            callable(register_capability)
+            and callable(get_capability)
+            and (get_capability("computer_use.episodes") is episodes)
+        ):
+            register_capability("computer_use.episodes", previous_episodes)
 
     if cfg.get("observed_control") is True:
         from .observed_control import ObservedControl

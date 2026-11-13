@@ -78,30 +78,31 @@ class HeldInputLedger:
         token: str,
         release_fn: Callable[[], None],
         *,
-        retain_on_failure: bool = False,
+        retain_on_failure: bool = True,
     ) -> None:
         """Register `token` (e.g. a modifier name, a button name) as held.
 
-        `retain_on_failure` is for acknowledged safety-release callbacks:
-        preserve their obligation and suppress success notifications when an
-        attempt fails. It does not retry the original input operation.
+        Failed callbacks always retain custody and suppress success notifications.
+        `retain_on_failure` remains accepted for source compatibility; false no
+        longer discards an unconfirmed obligation. No original input is retried.
         """
         with self._lock:
+            if token in self._held:
+                raise RuntimeError(
+                    "held-input token already has an outstanding obligation"
+                )
             if self._stopped:
                 # A hold requested after shutdown must not silently vanish
                 # from the ledger - release immediately rather than track a
                 # phantom entry no trigger will ever see.
-                if retain_on_failure:
-                    held = _Held(
-                        token=token,
-                        kind=kind,
-                        release_fn=release_fn,
-                        retain_on_failure=True,
-                    )
-                    self._held[token] = held
-                    self._release_locked(held)
-                else:
-                    release_fn()
+                held = _Held(
+                    token=token,
+                    kind=kind,
+                    release_fn=release_fn,
+                    retain_on_failure=True,
+                )
+                self._held[token] = held
+                self._release_locked(held)
                 return
             self._held[token] = _Held(
                 token=token,
@@ -168,19 +169,13 @@ class HeldInputLedger:
         try:
             held.release_fn()
         except Exception:
-            if held.retain_on_failure:
-                held.released = False
-                logger.exception(
-                    "held-input ledger: release for %r unconfirmed; retaining custody",
-                    held.token,
-                )
-                return False
+            held.released = False
             logger.exception(
-                "held-input ledger: release_fn for %r (%s) raised - the input "
-                "may still be physically held; this is logged, not swallowed",
+                "held-input ledger: release for %r (%s) unconfirmed; retaining custody",
                 held.token,
                 held.kind,
             )
+            return False
         self._held.pop(held.token, None)
         if self._on_release is not None:
             try:

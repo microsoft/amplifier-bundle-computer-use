@@ -97,6 +97,57 @@ class RemoteBackend:
         # session, long after this dict was built).
         self.handshake: dict[str, Any] | None = None
         self._connected_at: float | None = None
+        self._episode_identity = None
+        self._episode_fenced = False
+        self._episode_status_cache = {
+            "state": "idle",
+            "workers": 0,
+            "release_confirmed": False,
+        }
+
+    @property
+    def episode_target(self):
+        return (self.handshake or {}).get("episode_target")
+
+    def begin_episode(self, identity):
+        self._episode_identity = dict(identity)
+        result = self._call("episode_begin", identity=identity)
+        self._episode_fenced = False
+        self._episode_status_cache = result
+        return result
+
+    def check_episode(self, identity):
+        if self._episode_fenced or identity != self._episode_identity:
+            raise BackendError("remote episode fenced or stale")
+
+    def _episode_notice(self, op, identity, **kwargs):
+        if self._transport is None:
+            raise BackendError("remote episode transport missing")
+        self._transport.notify(
+            Request(
+                id=next(self._ids), op=op, args={"identity": identity, **kwargs}
+            ).encode()
+        )
+
+    def heartbeat_episode(self, identity):
+        self.check_episode(identity)
+        self._episode_notice("episode_heartbeat", identity)
+
+    def revoke_episode(self, identity, *, interrupted=False):
+        if identity != self._episode_identity:
+            raise BackendError("wrong episode owner")
+        self._episode_fenced = True
+        self._episode_notice("episode_revoke", identity, interrupted=interrupted)
+
+    def end_episode(self, identity, *, interrupted=False):
+        result = self._call("episode_end", identity=identity, interrupted=interrupted)
+        self._episode_status_cache = result
+        return result
+
+    def episode_status(self, identity):
+        result = self._call("episode_status", identity=identity)
+        self._episode_status_cache = result
+        return result
 
     @property
     def handshake_age_seconds(self) -> float | None:
@@ -180,6 +231,22 @@ class RemoteBackend:
         if self._transport is None or not self._connected:
             raise BackendError(f"remote backend not connected (op={op!r})")
         op_class = classify_op(op)
+        if self._episode_identity is not None and op not in {
+            "episode_begin",
+            "episode_end",
+            "episode_status",
+            "release_all",
+            "bye",
+            "presence_idle",
+            "announcement_status",
+            "probe",
+            "screen_geometry",
+            "list_monitors",
+            "ping",
+            "announce_raise",
+        }:
+            self.check_episode(self._episode_identity)
+            args["_episode"] = self._episode_identity
         exchange = (
             CURRENT_TARGET_CLOCK.get()
             if self.presence_platform == "windows-wsl2" and op_class == "write"

@@ -50,6 +50,12 @@ the capability is local-only.
 3. **Look again.** Screenshot after anything that changes state, and confirm it did what
    you expected before continuing.
 4. **Stop when the goal is met**, or when you are not sure — see Stop Conditions.
+5. **Hand back control.** Where episode actions are supported, query
+   `desktop(action="episode_status")` and end that exact generation after the
+   bounded task, including an unsuccessful task. A trusted host wrapper may own
+   this boundary already. Do not call release confirmed while status is stopping,
+   interrupted, or release-unconfirmed; query an unknown reply without replaying
+   input. Do not begin a fresh episode to work around Stop or a retained halt.
 
 Coordinates are in the pixel space of the screenshot you were just given. They are scaled
 to the physical display for you; do not do your own scaling math.

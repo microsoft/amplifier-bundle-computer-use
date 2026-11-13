@@ -50,6 +50,7 @@ READ_OPS = frozenset(
         # target's own persistent overlay since the last read? A query, no
         # side effect - the same idempotency argument as `presence_idle`.
         "announcement_status",
+        "episode_status",
     }
 )
 WRITE_OPS = frozenset(
@@ -79,6 +80,10 @@ CONTROL_OPS = frozenset(
         # implies. Session-lifecycle, not injected input - CONTROL, matching
         # the design doc's own classification, not WRITE.
         "announce_raise",
+        "episode_begin",
+        "episode_end",
+        "episode_heartbeat",
+        "episode_revoke",
     }
 )
 

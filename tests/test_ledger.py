@@ -91,12 +91,11 @@ def test_a_raising_release_fn_does_not_prevent_other_releases():
 
     result = ledger.release_all()
 
-    # Both are considered released (removed from the ledger / no longer
-    # "held") even though one's release_fn raised - the exception is logged,
-    # not swallowed silently, but it must not stop the other release.
-    assert sorted(result) == ["broken", "ok"]
+    # Failure is retained custody, never a fabricated RELEASED notification.
+    assert result == ["ok"]
     assert released == ["ok"]
-    assert ledger.held_tokens == []
+    assert ledger.held_tokens == ["broken"]
+    ledger.stop()
 
 
 def test_deadman_timer_releases_everything_with_no_activity():

@@ -196,6 +196,11 @@ class SharedTransportHandle:
     def send(self, line: bytes, *, timeout: float = 30.0) -> bytes:
         return self._entry.send(line, timeout=timeout)
 
+    def notify(self, line: bytes) -> None:
+        if self._released or self._entry.broken:
+            raise self._entry._retired_error()
+        self._entry.transport.notify(line)
+
     def close(self) -> None:
         if self._released:
             return

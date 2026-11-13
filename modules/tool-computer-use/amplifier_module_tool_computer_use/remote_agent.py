@@ -43,10 +43,12 @@ import base64
 import io
 import json
 import logging
+import queue
 import signal
 import sys as _sys
 import threading
 import traceback
+import uuid
 from collections.abc import Callable
 from typing import Any, ClassVar
 
@@ -59,6 +61,7 @@ from .agent_scratch_lease import (
     sweep_stale_agent_dirs,
 )
 from .backend import Backend, BackendError
+from .episode import Episode, EpisodeError, OverlayIndicator
 from .exclusion import ExclusionZone
 from .ledger import DEFAULT_DEADMAN_SECONDS, HeldInputLedger
 from .overlay_linux import LinuxOverlay
@@ -169,6 +172,8 @@ class RemoteAgent:
         *,
         deadman_seconds: float = DEFAULT_DEADMAN_SECONDS,
         read_only: bool = True,
+        require_episode: bool = False,
+        indicator_factory: Callable | None = None,
     ) -> None:
         self.backend = backend
         self.read_only = read_only
@@ -194,6 +199,74 @@ class RemoteAgent:
         self._exclusion = ExclusionZone()
         self._announce_paused = False
         self._announce_cancelled = False
+        # Production entry point requires owner-bound episodes. False supports
+        # old in-process handler harnesses only; run() always enables admission.
+        self._require_episode = require_episode
+        self._episode_target = uuid.uuid4().hex
+        self._episode = None
+        self._indicator_factory = indicator_factory
+        self._disconnected = threading.Event()
+
+    def _make_indicator(self):
+        if self._indicator_factory:
+            return self._indicator_factory()
+        if self.backend.name == "macos":
+            from .macos_indicator import MacOSIndicator
+
+            return MacOSIndicator()
+        return OverlayIndicator(self._overlay)
+
+    def _release_episode(self):
+        self._ledger.release_all(reason="episode_end")
+        return not self._ledger.held_tokens and not self._mouse_pending
+
+    def _op_episode_begin(self, args):
+        identity = args["identity"]
+        if self._episode is not None and self._episode.status()["state"] == "released":
+            if self._episode.status()["identity"] == identity:
+                return self._episode.status(identity)
+            self._episode = None
+        if self._episode is None:
+            self._episode = Episode(
+                self._episode_target,
+                self._make_indicator,
+                self._release_episode,
+                lease_seconds=120,
+            )
+        self._require_episode = True
+        return self._episode.begin(identity)
+
+    def _op_episode_status(self, args):
+        if self._episode is None:
+            return {"state": "idle", "workers": 0, "release_confirmed": False}
+        return self._episode.status(args["identity"])
+
+    def _op_episode_end(self, args):
+        if self._episode is None:
+            raise EpisodeError("no episode")
+        self._episode.fence(
+            args["identity"], interrupted=args.get("interrupted") is True
+        )
+        return self._episode.close(args["identity"])
+
+    def _episode_notice(self, req):
+        # Sole stdin reader handles these notices while the native executor may
+        # be blocked. They never write a response or consume the reply framing.
+        if req.op not in {"episode_heartbeat", "episode_revoke"}:
+            return False
+        try:
+            if self._episode is None:
+                raise EpisodeError("no episode")
+            if req.op == "episode_heartbeat":
+                self._episode.heartbeat(req.args["identity"])
+            else:
+                self._episode.fence(
+                    req.args["identity"],
+                    interrupted=req.args.get("interrupted") is True,
+                )
+        except Exception:
+            logger.warning("stale or invalid episode notice refused")
+        return True
 
     def _on_release(self, kind: str, token: str) -> None:
         # \u00a710.2/\u00a73.3: this exact line, `RELEASED:<token>`, is the
@@ -386,6 +459,7 @@ class RemoteAgent:
             # from the agent's own reality instead of from prose that has to
             # be kept in sync by hand.
             "ops": sorted(self._HANDLERS),
+            "episode_target": self._episode_target,
         }
 
     def run(self, stdin: Any, stdout: Any) -> None:
@@ -395,21 +469,45 @@ class RemoteAgent:
         handshake = self.handshake()
         stdout.write(json.dumps({"id": 0, "ok": True, "result": handshake}) + "\n")
         stdout.flush()
-        try:
-            for line in stdin:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    data = json.loads(line)
-                    req = Request(
-                        id=int(data["id"]),
-                        op=str(data["op"]),
-                        args=data.get("args") or {},
+        requests = queue.Queue(maxsize=64)
+
+        def read_requests():
+            try:
+                for line in stdin:
+                    try:
+                        data = json.loads(line)
+                        req = Request(
+                            id=int(data["id"]),
+                            op=str(data["op"]),
+                            args=data.get("args") or {},
+                        )
+                    except Exception:
+                        continue
+                    if not self._episode_notice(req):
+                        try:
+                            requests.put_nowait(req)
+                        except queue.Full:
+                            # Do not let a full action queue prevent revocation.
+                            if self._episode is not None:
+                                self._episode.fence(
+                                    self._episode.status()["identity"],
+                                    reason="queue_overflow",
+                                )
+                            break
+            finally:
+                self._disconnected.set()
+                if self._episode is not None:
+                    self._episode.fence(
+                        self._episode.status()["identity"], reason="disconnected"
                     )
-                except Exception as exc:  # noqa: BLE001 - malformed line, not our bug
-                    logger.warning("malformed request line: %s (%s)", line[:200], exc)
-                    continue
+                requests.put(None)
+
+        threading.Thread(target=read_requests, daemon=True).start()
+        try:
+            while True:
+                req = requests.get()
+                if req is None:
+                    break
                 resp = self._dispatch(req)
                 stdout.write(resp.encode().decode("utf-8"))
                 stdout.flush()
@@ -424,12 +522,61 @@ class RemoteAgent:
             # drop that never runs another line of Python here would leave
             # both a held key AND a stranded overlay - one guarantee, one
             # call site, for both.
+            if self._episode is not None:
+                self._episode.close(self._episode.status()["identity"])
             self._ledger.stop()
             self._teardown_overlay()
 
     # -- dispatch ---------------------------------------------------------------
 
     def _dispatch(self, req: Request) -> Response:
+        # Native admission is independent of controller hooks and of the
+        # synchronous response path. No queued request can cross a revoke fence.
+        protected = req.op in {
+            "capture",
+            "capture_scaled",
+            "cursor_position",
+            "list_windows",
+            "get_clipboard",
+            "move",
+            "click",
+            "mouse_down",
+            "mouse_up",
+            "drag",
+            "scroll",
+            "key",
+            "hold_key",
+            "hold",
+            "type_text",
+            "focus_window",
+            "set_clipboard",
+        }
+        if getattr(self, "_require_episode", False) and protected:
+            try:
+                if self._episode is None:
+                    raise EpisodeError("target requires an explicit sponsored episode")
+                with self._episode.admit(
+                    req.args.get("_episode"),
+                    controlling=classify_op(req.op) == "write",
+                ):
+                    return RemoteAgent._dispatch_admitted(self, req)
+            except Exception as exc:
+                return Response(
+                    id=req.id,
+                    ok=False,
+                    error_type=type(exc).__name__,
+                    error_message=str(exc),
+                )
+        return RemoteAgent._dispatch_admitted(self, req)
+
+    def _dispatch_admitted(self, req: Request) -> Response:
+        if getattr(self, "_require_episode", False) and self._disconnected.is_set():
+            return Response(
+                id=req.id,
+                ok=False,
+                error_type="EpisodeError",
+                error_message="controller disconnected",
+            )
         try:
             op_class = classify_op(req.op)
         except ValueError as exc:
@@ -803,6 +950,9 @@ class RemoteAgent:
         "announce_raise": _op_announce_raise,
         "announcement_status": _op_announcement_status,
         "release_all": _op_release_all,
+        "episode_begin": _op_episode_begin,
+        "episode_status": _op_episode_status,
+        "episode_end": _op_episode_end,
         "bye": _op_bye,
     }
 
@@ -947,6 +1097,7 @@ def main(argv: list[str] | None = None) -> int:
         backend,
         deadman_seconds=args.deadman_seconds,
         read_only=str(args.read_only).lower() != "false",
+        require_episode=backend.name == "macos",
     )
     agent.install_signal_handlers()
     try:
