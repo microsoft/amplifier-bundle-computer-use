@@ -9,6 +9,7 @@ dependencies = [
     "pillow>=10.0",
     "python-xlib>=0.33; sys_platform == 'linux'",
     "pyobjc-framework-Quartz>=10.0; sys_platform == 'darwin'",
+    "pyobjc-framework-Cocoa>=10.0; sys_platform == 'darwin'",
     # Self-configuring fix: `ComputerUseUnavailableTool` action="persist"
     # (`_persist_target`) reads/writes the user's `~/.amplifier/settings.yaml`.
     "pyyaml>=6.0",
