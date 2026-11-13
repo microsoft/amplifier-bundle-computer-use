@@ -1027,3 +1027,30 @@ def test_retarget_from_interrupted_requires_full_settlement(rig, monkeypatch, se
     else:
         assert not selected and tool._backend is old_backend
         indicator.close = close
+
+
+@pytest.mark.parametrize("failure", ["before_start", "non_os_launch"])
+def test_episode_start_exception_owns_actual_adapter_never_launched_settlement(
+    monkeypatch, failure
+):
+    from test_macos_indicator import adapter
+
+    indicator = adapter.MacOSIndicator()
+
+    def broken(*args, **kwargs):
+        raise ValueError("inert non-OS startup failure")
+
+    if failure == "before_start":
+        monkeypatch.setattr(indicator, "start", broken)
+    else:
+        monkeypatch.setattr(adapter.sys, "platform", "darwin")
+        monkeypatch.setattr(indicator, "_launch", broken)
+    episode = Episode("t", lambda: indicator, lambda: True)
+    identity = {"owner": "o", "target": "t", "generation": "g"}
+    with pytest.raises(ValueError):
+        episode.begin(identity)
+    result = episode.close(identity)
+    assert indicator.status()["settlement_basis"] == "never_launched"
+    assert indicator.status()["process_settled"] is True
+    assert result["indicator_settled"] and result["release_confirmed"]
+    assert result["state"] == "interrupted" and not result["admission_open"]
