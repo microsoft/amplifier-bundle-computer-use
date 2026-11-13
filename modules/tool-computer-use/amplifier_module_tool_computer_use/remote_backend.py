@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import itertools
 import logging
+import threading
 import time
 from typing import Any
 
@@ -99,6 +100,7 @@ class RemoteBackend:
         self._connected_at: float | None = None
         self._episode_identity = None
         self._episode_fenced = False
+        self._episode_state_lock = threading.RLock()
         self._episode_status_cache = {
             "state": "idle",
             "workers": 0,
@@ -110,15 +112,44 @@ class RemoteBackend:
         return (self.handshake or {}).get("episode_target")
 
     def begin_episode(self, identity):
-        self._episode_identity = dict(identity)
+        with self._episode_state_lock:
+            if identity != self._episode_identity:
+                if self._episode_identity is not None and (
+                    self._episode_status_cache.get("state") != "released"
+                ):
+                    raise BackendError("prior remote generation is not released")
+                self._episode_identity = dict(identity)
+                self._episode_fenced = False
+            elif self._episode_fenced:
+                raise BackendError("remote episode fenced")
         result = self._call("episode_begin", identity=identity)
-        self._episode_fenced = False
-        self._episode_status_cache = result
+        with self._episode_state_lock:
+            if self._episode_fenced or identity != self._episode_identity:
+                # Readiness reply is not authority to revoke a newer Stop.
+                raise BackendError("remote episode fenced during begin reply")
+            self._episode_status_cache = result
         return result
 
     def check_episode(self, identity):
-        if self._episode_fenced or identity != self._episode_identity:
-            raise BackendError("remote episode fenced or stale")
+        with self._episode_state_lock:
+            if self._episode_fenced or identity != self._episode_identity:
+                raise BackendError("remote episode fenced or stale")
+
+    def fence_episode_local(self, identity, *, interrupted=False):
+        with self._episode_state_lock:
+            if identity != self._episode_identity:
+                raise BackendError("wrong episode owner")
+            self._episode_fenced = True
+            prior = self._episode_status_cache
+            self._episode_status_cache = {
+                **prior,
+                "identity": dict(identity),
+                "state": "interrupted"
+                if interrupted or prior.get("state") == "interrupted"
+                else "stopping",
+                "admission_open": False,
+                "release_confirmed": False,
+            }
 
     def _episode_notice(self, op, identity, **kwargs):
         if self._transport is None:
@@ -134,9 +165,7 @@ class RemoteBackend:
         self._episode_notice("episode_heartbeat", identity)
 
     def revoke_episode(self, identity, *, interrupted=False):
-        if identity != self._episode_identity:
-            raise BackendError("wrong episode owner")
-        self._episode_fenced = True
+        self.fence_episode_local(identity, interrupted=interrupted)
         self._episode_notice("episode_revoke", identity, interrupted=interrupted)
 
     def end_episode(self, identity, *, interrupted=False):
@@ -146,7 +175,15 @@ class RemoteBackend:
 
     def episode_status(self, identity):
         result = self._call("episode_status", identity=identity)
-        self._episode_status_cache = result
+        with self._episode_state_lock:
+            if self._episode_fenced and result.get("admission_open"):
+                result = {
+                    **result,
+                    "target_state": result["state"],
+                    "state": self._episode_status_cache.get("state", "interrupted"),
+                    "admission_open": False,
+                }
+            self._episode_status_cache = result
         return result
 
     @property

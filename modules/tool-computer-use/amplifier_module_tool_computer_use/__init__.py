@@ -2172,7 +2172,7 @@ class ComputerTool:
         if self._binding.is_remote:
             # Close controller admission synchronously. Target custody notice
             # does not wait for the response lock or a native worker.
-            self._episode._episode_fenced = True
+            self._episode.fence_episode_local(identity, interrupted=interrupted)
             episode = self._episode
 
             def notify():

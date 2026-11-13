@@ -295,6 +295,46 @@ async def test_production_mount_exports_trusted_controller_and_cleanup(
     assert coordinator.get_capability("computer_use.episodes") is None
 
 
+@run_async
+async def test_late_remote_begin_reply_cannot_clear_host_fence_with_notice_delayed():
+    tool, agent, target = remote_rig()
+    backend = tool._backend
+    transport = backend._transport
+    send = transport.send
+    target_ready, release_reply = threading.Event(), threading.Event()
+    notices = []
+
+    def delayed_send(line):
+        response = send(line)
+        if json.loads(line)["op"] == "episode_begin":
+            target_ready.set()
+            assert release_reply.wait(3)
+        return response
+
+    transport.send = delayed_send
+    transport.notify = lambda line: notices.append(line)
+    keys = []
+    target.key = keys.append
+    controller = cu.EpisodeController(tool)
+    beginning = asyncio.create_task(controller.begin())
+    assert await asyncio.to_thread(target_ready.wait, 2)
+    generation = tool._episode_identity["generation"]
+    assert agent._episode.status()["admission_open"]
+    controller.fence(generation, interrupted=True)
+    release_reply.set()
+    with pytest.raises(cu.BackendError, match="fenced"):
+        await beginning
+    assert backend._episode_fenced
+    assert controller.cached_status()["state"] == "interrupted"
+    result = await tool.execute({"action": "key", "text": "A"})
+    assert not result.success and keys == []
+    for line in notices:
+        agent._episode_notice(Request(**json.loads(line)))
+    transport.notify = lambda line: agent._episode_notice(Request(**json.loads(line)))
+    await controller.end(generation, interrupted=True)
+    tool._ledger.stop()
+
+
 def test_lost_begin_reply_reconciles_status_without_replaying_begin():
     backend = RemoteBackend()
     identity = {"owner": "owner", "target": "target", "generation": "generation"}
