@@ -404,6 +404,8 @@ h=importlib.util.module_from_spec(spec); spec.loader.exec_module(h)
 h.TERMINAL_DWELL_SECONDS=0.03
 mode=sys.argv[2]
 p=h._read_start()
+if mode in ("console_unavailable","console_user_mismatch","cocoa_unavailable"):
+    h._emit(p.reply("unavailable",mode)); sys.exit(2)
 if mode=="die": sys.exit(2)
 if mode=="timeout": time.sleep(10); sys.exit(2)
 class Surface:
@@ -504,9 +506,130 @@ def test_inert_faults_fail_closed_and_settle(monkeypatch, mode):
     assert not result["healthy"] and not result["ready"]
     assert result["state"] == "interrupted"
     assert result["process_settled"] and not result["surface_absent"]
+    assert result["fault_settled"] and result["settlement_basis"] == "helper_reaped"
     assert not indicator.start()["healthy"]  # Never restart unknown generation.
     indicator.close()
     indicator._proc.stderr.close()
+
+
+@pytest.mark.parametrize(
+    "reason", ["console_unavailable", "console_user_mismatch", "cocoa_unavailable"]
+)
+def test_startup_unavailable_helper_reaped_is_failed_resource_settlement(
+    monkeypatch, reason
+):
+    indicator = inert_indicator(monkeypatch, reason)
+    try:
+        result = indicator.start()
+        assert result["state"] == "interrupted" and result["reason"] == reason
+        assert not result["healthy"] and not result["ready"]
+        assert result["process_settled"] and result["fault_settled"]
+        assert result["settlement_basis"] == "helper_reaped"
+        assert not result["surface_absent"]  # No invented native metadata ack.
+        assert indicator.close()["fault_settled"]
+    finally:
+        indicator.abort()
+        indicator._proc.stderr.close()
+
+
+def test_never_launched_failure_has_explicit_resource_settlement(monkeypatch):
+    indicator = adapter.MacOSIndicator()
+    monkeypatch.setattr(adapter.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        indicator, "_launch", lambda: (_ for _ in ()).throw(OSError("private"))
+    )
+    result = indicator.start()
+    assert result["state"] == "interrupted" and result["reason"] == "helper_failed"
+    assert result["fault_settled"] and result["process_settled"]
+    assert (
+        result["settlement_basis"] == "never_launched" and result["helper_exit"] is None
+    )
+    assert not result["surface_absent"] and not result["healthy"]
+    assert indicator.close()["fault_settled"]
+
+
+class SettlementProcess:
+    """Inert wait/escalation controls, never an actual OS PID."""
+
+    def __init__(self, outcome):
+        self.returncode = None
+        self.outcome = outcome
+        self.signals = []
+        self.waits = 0
+        self.stdin = SimpleNamespace(closed=True, fileno=lambda: 101)
+        self.stdout = SimpleNamespace(closed=True, fileno=lambda: 102)
+
+    def wait(self, timeout):
+        self.waits += 1
+        if self.outcome == "wait_error":
+            raise OSError("private")
+        if self.outcome == "unknown" or (self.outcome == "killed" and self.waits < 3):
+            raise subprocess.TimeoutExpired("private", timeout)
+        if self.outcome != "no_returncode":
+            self.returncode = -9 if self.outcome == "killed" else 2
+        return self.returncode
+
+    def terminate(self):
+        self.signals.append("terminate")
+
+    def kill(self):
+        self.signals.append("kill")
+
+
+@pytest.mark.parametrize("outcome", ["unknown", "no_returncode", "wait_error"])
+def test_unknown_process_outcome_never_claims_fault_settlement(outcome):
+    indicator = adapter.MacOSIndicator()
+    indicator._proc = SettlementProcess(outcome)
+    indicator._fail("reply_timeout")
+    result = indicator.close()
+    assert result["state"] == "interrupted" and not result["healthy"]
+    assert not result["process_settled"] and not result["fault_settled"]
+    assert not result["surface_absent"] and result["settlement_basis"] == "not_settled"
+    assert result["helper_exit"] is None
+    # Retained cleanup custody can settle later once exit really is observed.
+    indicator._proc.outcome = "exit"
+    recovered = indicator.close()
+    assert recovered["fault_settled"] and recovered["process_settled"]
+    assert recovered["state"] == "interrupted" and not recovered["healthy"]
+
+
+def test_confirmed_kill_exit_settles_resource_but_never_becomes_release():
+    indicator = adapter.MacOSIndicator()
+    indicator._proc = SettlementProcess("killed")
+    indicator._fail("reply_timeout")
+    result = indicator.close()
+    assert indicator._proc.signals == ["terminate", "kill"]
+    assert result["state"] == "interrupted" and result["reason"] == "reply_timeout"
+    assert result["process_settled"] and result["fault_settled"]
+    assert result["helper_exit"] == -9 and not result["surface_absent"]
+    assert result["settlement_basis"] == "helper_reaped" and not result["healthy"]
+
+
+def test_pipe_setup_failure_retains_spawned_helper_custody(monkeypatch):
+    indicator = adapter.MacOSIndicator()
+    proc = SettlementProcess("exit")
+    monkeypatch.setattr(adapter.sys, "platform", "darwin")
+    monkeypatch.setattr(adapter.subprocess, "Popen", lambda *a, **kw: proc)
+    monkeypatch.setattr(
+        adapter.os, "set_blocking", lambda *_: (_ for _ in ()).throw(OSError("private"))
+    )
+    result = indicator.start()
+    assert indicator._proc is proc and proc.waits == 1
+    assert result["fault_settled"] and result["process_settled"]
+    assert result["settlement_basis"] == "helper_reaped"  # Not never_launched.
+    assert result["state"] == "interrupted" and not result["healthy"]
+
+
+def test_unsupported_platform_proves_no_helper_created(monkeypatch):
+    indicator = adapter.MacOSIndicator()
+    monkeypatch.setattr(adapter.sys, "platform", "linux")
+    monkeypatch.setattr(
+        adapter.subprocess, "Popen", lambda *_a, **_k: pytest.fail("must not spawn")
+    )
+    result = indicator.start()
+    assert result["fault_settled"] and result["process_settled"]
+    assert result["settlement_basis"] == "never_launched"
+    assert not result["healthy"] and not result["surface_absent"]
 
 
 def test_health_loss_irreversible_nonblocking_and_no_mutation_replay(monkeypatch):
@@ -539,8 +662,10 @@ def test_timeout_not_process_death_or_release(monkeypatch):
         assert result["reason"] == "reply_timeout"
         assert result["state"] == "interrupted"
         assert not result["process_settled"]
+        assert not result["fault_settled"]
         indicator.close()
         assert indicator.status()["process_settled"]
+        assert indicator.status()["fault_settled"]
     finally:
         indicator.abort()
         indicator._proc.stderr.close()
@@ -559,6 +684,7 @@ def test_real_lost_mutation_reply_is_not_replayed(monkeypatch):
         assert b'"op":"close"' not in trace and b'"op":"abort"' not in trace
         assert b"final:interrupted" in trace
         assert indicator.status()["process_settled"]
+        assert indicator.status()["fault_settled"]
     finally:
         indicator.abort()
         indicator._proc.stderr.close()
@@ -573,6 +699,7 @@ def test_background_detects_helper_death_without_model_poll(monkeypatch):
         assert not indicator.status()["healthy"]
         indicator.close()
         assert indicator.status()["process_settled"]
+        assert indicator.status()["fault_settled"]
     finally:
         indicator.abort()
         indicator._proc.stderr.close()

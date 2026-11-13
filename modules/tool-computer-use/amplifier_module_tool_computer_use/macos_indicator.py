@@ -39,7 +39,13 @@ _ACTIONS = {
 
 
 class MacOSIndicator:
-    """Single-use generation. status() is a monitor-maintained nonblocking copy."""
+    """Single-use generation. status() is a monitor-maintained nonblocking copy.
+
+    ``fault_settled`` is resource custody, NOT healthy disclosure or release.
+    A completed wait on our dedicated helper proves its process-owned NSPanel
+    resources cannot remain live. It does not fabricate ``surface_absent``
+    (the native metadata acknowledgement), pixels or physical input release.
+    """
 
     def __init__(self):
         self._generation = uuid.uuid4().hex
@@ -68,6 +74,8 @@ class MacOSIndicator:
             "surface_absent": False,
             "process_settled": False,
             "helper_exit": None,
+            "fault_settled": False,
+            "settlement_basis": "not_settled",
         }
 
     def status(self) -> dict:
@@ -94,6 +102,11 @@ class MacOSIndicator:
                 "reason": self._failure_reason or "connection_lost",
                 "terminal": False,
                 "own_window_confirmed": False,
+                "fault_settled": (
+                    result["process_settled"]
+                    and result["settlement_basis"]
+                    in ("never_launched", "helper_reaped")
+                ),
             }
         return result
 
@@ -108,6 +121,9 @@ class MacOSIndicator:
             bufsize=0,
             close_fds=True,
         )
+        # Retain custody immediately: pipe setup can fail after Popen succeeded.
+        # _reap must never mistake that failure for a never-launched helper.
+        self._proc = proc
         os.set_blocking(proc.stdin.fileno(), False)
         os.set_blocking(proc.stdout.fileno(), False)
         return proc
@@ -119,7 +135,9 @@ class MacOSIndicator:
             if self._proc is not None or self._failed or self._snapshot["closed"]:
                 return self.status()
             if sys.platform != "darwin":
-                return self._fail("unsupported_platform")
+                self._fail("unsupported_platform")
+                self._reap()
+                return self.status()
             try:
                 self._proc = self._launch()
                 result = self._request("start", state, WATCHDOG_SECONDS - 0.5)
@@ -263,6 +281,8 @@ class MacOSIndicator:
                 "surface_absent": closed,
                 "process_settled": False,
                 "helper_exit": None,
+                "fault_settled": False,
+                "settlement_basis": "not_settled",
             }
             return self.status()
         raise TimeoutError
@@ -304,29 +324,42 @@ class MacOSIndicator:
     def _reap(self):
         proc = self._proc
         if proc is None:
+            self._record_settlement("never_launched", None)
             return True
-        if proc.stdin and not proc.stdin.closed:
-            proc.stdin.close()
         try:
-            proc.wait(timeout=TERMINAL_DWELL_SECONDS + 0.5)
-        except subprocess.TimeoutExpired:
-            proc.terminate()
+            if proc.stdin and not proc.stdin.closed:
+                proc.stdin.close()
             try:
-                proc.wait(timeout=0.5)
+                proc.wait(timeout=TERMINAL_DWELL_SECONDS + 0.5)
             except subprocess.TimeoutExpired:
-                proc.kill()
+                proc.terminate()
                 try:
                     proc.wait(timeout=0.5)
                 except subprocess.TimeoutExpired:
-                    return False
-        if proc.stdout and not proc.stdout.closed:
-            proc.stdout.close()
+                    proc.kill()
+                    try:
+                        proc.wait(timeout=0.5)
+                    except subprocess.TimeoutExpired:
+                        return False
+            if proc.stdout and not proc.stdout.closed:
+                proc.stdout.close()
+        except OSError:
+            # Including a race during signal delivery: retain custody until a
+            # subsequent wait actually observes exit, never infer it from error.
+            return False
+        if type(proc.returncode) is not int:
+            return False  # An attempted wait/kill is not a confirmed process exit.
+        self._record_settlement("helper_reaped", proc.returncode)
+        return True
+
+    def _record_settlement(self, basis, helper_exit):
         self._snapshot = {
             **self._snapshot,
             "process_settled": True,
-            "helper_exit": proc.returncode,
+            "helper_exit": helper_exit,
+            "fault_settled": self._failed,
+            "settlement_basis": basis,
         }
-        return True
 
     def close(self) -> dict:
         return self._finish("close")
@@ -340,6 +373,7 @@ class MacOSIndicator:
             if self._snapshot["closed"] and self._snapshot["process_settled"]:
                 return self.status()
             if self._proc is None:
+                self._reap()
                 self._snapshot = {
                     **self._snapshot,
                     "closed": True,
