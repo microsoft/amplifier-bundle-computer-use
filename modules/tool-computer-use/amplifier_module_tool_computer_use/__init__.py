@@ -454,6 +454,8 @@ class ComputerTool:
         self._episode_lock = threading.RLock()
         self._episode_heartbeat_stop = threading.Event()
         self._episode_fenced_status = None
+        self._episode_worker_condition = threading.Condition()
+        self._episode_workers = 0
         self._observed_control = None
         self._diagnostics = DiagnosticLog()
         # One-shot handoff to the hook's real tool:post call association. Only
@@ -2129,13 +2131,31 @@ class ComputerTool:
             self.fence_episode(identity["generation"], interrupted=interrupted)
         with self._episode_lock:
             if identity is None:
-                return self.episode_status()
+                identity = self._episode_identity
+                if identity is None:
+                    return self.episode_status()
+                self.fence_episode(identity["generation"], interrupted=interrupted)
             if self._episode_identity != identity:
                 raise BackendError("stale episode generation")
             if generation is not None and generation != identity["generation"]:
                 raise BackendError("stale episode generation")
             self._episode_heartbeat_stop.set()
             if self._binding.is_remote:
+                deadline = time.monotonic() + 5
+                with self._episode_worker_condition:
+                    while self._episode_workers:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            return {
+                                "identity": dict(identity),
+                                "state": "stopping",
+                                "reason": "controller_workers_pending",
+                                "workers": self._episode_workers,
+                                "admission_open": False,
+                                "release_confirmed": False,
+                                "indicator_settled": False,
+                            }
+                        self._episode_worker_condition.wait(remaining)
                 result = self._episode.end_episode(identity, interrupted=interrupted)
                 if (
                     result.get("identity") == identity
@@ -2221,9 +2241,17 @@ class ComputerTool:
         try:
             if binding.is_remote:
                 # Remote final admission is on the target; controller still
-                # prevents queued post-end calls from being dispatched.
-                binding.backend.check_episode(identity)
-                yield
+                # owns the complete worker, including late custody registration
+                # after the target has replied to native input.
+                with self._episode_worker_condition:
+                    binding.backend.check_episode(identity)
+                    self._episode_workers += 1
+                try:
+                    yield
+                finally:
+                    with self._episode_worker_condition:
+                        self._episode_workers -= 1
+                        self._episode_worker_condition.notify_all()
             else:
                 with episode.admit(
                     identity,

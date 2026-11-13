@@ -621,3 +621,38 @@ async def test_cleanup_retains_capability_and_backend_until_indicator_settles(
     await mounted()
     assert backend_closes == [True]
     assert coordinator.get_capability("computer_use.episodes") is None
+
+
+@run_async
+async def test_remote_end_drains_controller_late_hold_registration(rig, monkeypatch):
+    tool, agent, target = remote_rig()
+    entered, proceed = threading.Event(), threading.Event()
+    register = tool._hold_mouse_button
+
+    def delayed(*args, **kwargs):
+        entered.set()
+        assert proceed.wait(3)
+        return register(*args, **kwargs)
+
+    monkeypatch.setattr(tool, "_hold_mouse_button", delayed)
+    down = asyncio.create_task(
+        tool.execute({"action": "left_mouse_down", "coordinate": [1, 1]})
+    )
+    assert await asyncio.to_thread(entered.wait, 2)
+    ending = asyncio.create_task(asyncio.to_thread(tool.end_episode))
+    await asyncio.sleep(0.02)
+    assert not ending.done()
+    assert tool._episode_workers == 1
+    assert len(target.mouse_downs) == 1
+    proceed.set()
+    assert (await down).success
+    result = await ending
+    assert result["state"] == "released"
+    assert tool._episode_workers == 0 and not tool._mouse_pending
+    assert not tool._ledger.held_tokens and not agent._ledger.held_tokens
+    assert len(target.mouse_ups) == 1
+    tool.begin_episode(explicit=True)
+    tool._ledger._on_deadman()
+    assert len(target.mouse_ups) == 1  # no stale cleanup can touch a new generation
+    tool.end_episode()
+    tool._ledger.stop()
