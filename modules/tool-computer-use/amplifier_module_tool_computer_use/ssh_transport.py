@@ -53,6 +53,7 @@ PAYLOAD_MODULES = (
     "target_clock.py",
     "wire.py",
     "ledger.py",
+    "episode.py",
     "agent_scratch_lease.py",
     "remote_agent.py",
     # The session-start disclosure channel (docs/designs/coexistence.md
@@ -65,6 +66,8 @@ PAYLOAD_MODULES = (
     # dependency) and is shipped for the same reason those two are.
     "exclusion.py",
     "announce_macos.py",
+    "macos_indicator.py",
+    "macos_indicator_helper.py",
     "overlay_linux.py",
     "overlay_windows.py",
     # NOT a Python module, and required anyway: `windows.py` resolves
@@ -361,6 +364,7 @@ class SshTransport:
         self.port = port
         self._proc: subprocess.Popen[bytes] | None = None
         self._lock = threading.Lock()
+        self._write_lock = threading.Lock()
         self._sent_sha256: str | None = None
         self.handshake: dict[str, Any] | None = None
 
@@ -388,6 +392,7 @@ class SshTransport:
             extras = [
                 "pillow",
                 'pyobjc-framework-Quartz; sys_platform=="darwin"',
+                'pyobjc-framework-Cocoa; sys_platform=="darwin"',
                 'python-xlib; sys_platform=="linux"',
             ]
             with_args = " ".join(f"--with {shlex.quote(e)}" for e in extras)
@@ -457,8 +462,9 @@ class SshTransport:
             raise SshConnectError("not connected")
         with self._lock:
             try:
-                proc.stdin.write(line)
-                proc.stdin.flush()
+                with self._write_lock:
+                    proc.stdin.write(line)
+                    proc.stdin.flush()
             except BrokenPipeError as exc:
                 raise SshConnectError(
                     f"connection to {self.user_host} lost while sending"
@@ -481,6 +487,15 @@ class SshTransport:
             if b'"error' in resp_line or b'"ok": false' in resp_line:
                 self._drain_stderr_on_failure()
             return resp_line
+
+    def notify(self, line: bytes) -> None:
+        """One-way episode custody notice, never waits behind a native reply."""
+        proc = self._proc
+        if proc is None or proc.stdin is None:
+            raise SshConnectError("not connected")
+        with self._write_lock:
+            proc.stdin.write(line)
+            proc.stdin.flush()
 
     def _read_line_with_timeout(self, stream: Any, timeout: float) -> bytes | None:
         result: dict[str, bytes | None] = {"line": None}

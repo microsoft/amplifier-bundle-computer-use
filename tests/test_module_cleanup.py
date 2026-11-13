@@ -865,29 +865,22 @@ async def test_cleanup_wins_before_direct_desktop_worker_dispatch(
     desktop = cu.DesktopTool(computer)
     loop = asyncio.get_running_loop()
     queued, proceed = asyncio.Event(), threading.Event()
-    to_thread = asyncio.to_thread
+    submit = computer._submit_batch_thread
 
-    async def delayed_to_thread(function, *args, **kwargs):
+    def delayed_submit(function, *args, **kwargs):
         # Gate the actual queued backend worker, not the earlier announcement
         # or band workers. Cleanup must take the lock before this dispatch does.
-        if function.__name__ not in {
-            "checked_call",
-            "get_clipboard",
-            "set_clipboard",
-            "list_monitors",
-            "select_monitor",
-            "_run_flat_step",
-        }:
-            return await to_thread(function, *args, **kwargs)
+        if function.__name__ != "_run_owned_step":
+            return submit(function, *args, **kwargs)
 
         def delayed():
             loop.call_soon_threadsafe(queued.set)
             assert proceed.wait(2), "test desktop dispatch gate was not released"
             return function(*args, **kwargs)
 
-        return await to_thread(delayed)
+        return submit(delayed)
 
-    monkeypatch.setattr(asyncio, "to_thread", delayed_to_thread)
+    monkeypatch.setattr(computer, "_submit_batch_thread", delayed_submit)
     running = asyncio.create_task(desktop.execute(payload))
     try:
         await asyncio.wait_for(queued.wait(), 2)

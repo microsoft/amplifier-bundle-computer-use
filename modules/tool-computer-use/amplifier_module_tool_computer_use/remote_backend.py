@@ -9,8 +9,10 @@ action didn't land.
 
 from __future__ import annotations
 
+import copy
 import itertools
 import logging
+import threading
 import time
 from typing import Any
 
@@ -22,9 +24,17 @@ from .backend import (
     WindowInfo,
     WindowList,
 )
+from .episode import settled_terminal
 from .ssh_transport import AgentStderrError, SshConnectError, SshTransport
 from .target_clock import CURRENT_TARGET_CLOCK, TargetClockFailure, guarded_target_call
-from .wire import AgentBackendUnavailableError, Request, Response, classify_op
+from .wire import (
+    AgentBackendUnavailableError,
+    EpisodeBeginRefused,
+    Request,
+    Response,
+    classify_op,
+    validate_begin_refusal,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +107,144 @@ class RemoteBackend:
         # session, long after this dict was built).
         self.handshake: dict[str, Any] | None = None
         self._connected_at: float | None = None
+        self._episode_identity = None
+        self._episode_fenced = False
+        self._episode_state_lock = threading.RLock()
+        self._episode_status_cache = {
+            "state": "idle",
+            "workers": 0,
+            "release_confirmed": False,
+        }
+
+    @property
+    def episode_target(self):
+        return (self.handshake or {}).get("episode_target")
+
+    def begin_episode(self, identity):
+        with self._episode_state_lock:
+            if identity != self._episode_identity:
+                if self._episode_identity is not None and (
+                    not self._settled_receipt(self._episode_identity)
+                ):
+                    raise BackendError("prior remote generation custody is not settled")
+                self._episode_identity = dict(identity)
+                self._episode_fenced = False
+                self._episode_status_cache = {
+                    "identity": dict(identity),
+                    "state": "starting",
+                    "workers": 0,
+                    "admission_open": False,
+                    "release_confirmed": False,
+                    "indicator_settled": False,
+                }
+            elif self._episode_fenced:
+                raise BackendError("remote episode fenced")
+        try:
+            result = self._call("episode_begin", identity=identity)
+        except EpisodeBeginRefused as exc:
+            with self._episode_state_lock:
+                if identity == self._episode_identity:
+                    self._episode_fenced = True
+                    self._episode_status_cache = {
+                        "identity": dict(identity),
+                        "state": "interrupted",
+                        "reason": exc.receipt["reason"],
+                        "target_adopted": False,
+                        "begin_refusal": copy.deepcopy(exc.receipt),
+                        "workers": 0,
+                        "admission_open": False,
+                        # Scoped no-input/no-renderer custody, NOT physical
+                        # release of another owner's held input or surface.
+                        "release_confirmed": True,
+                        "indicator_settled": True,
+                    }
+            raise BackendError(f"remote episode begin refused: {exc}") from exc
+        except BaseException:
+            # A missing/malformed reply is not a no-effect receipt. Close local
+            # admission, retain unknown custody and never replay the request.
+            self.fence_episode_local(identity, interrupted=True)
+            raise
+        with self._episode_state_lock:
+            if self._episode_fenced or identity != self._episode_identity:
+                # Readiness reply is not authority to revoke a newer Stop.
+                raise BackendError("remote episode fenced during begin reply")
+            self._episode_status_cache = result
+        return result
+
+    def check_episode(self, identity):
+        with self._episode_state_lock:
+            if self._episode_fenced or identity != self._episode_identity:
+                raise BackendError("remote episode fenced or stale")
+
+    def fence_episode_local(self, identity, *, interrupted=False):
+        with self._episode_state_lock:
+            if identity != self._episode_identity:
+                raise BackendError("wrong episode owner")
+            if self._settled_receipt(identity):
+                return
+            self._episode_fenced = True
+            prior = self._episode_status_cache
+            self._episode_status_cache = {
+                **prior,
+                "identity": dict(identity),
+                "state": "interrupted"
+                if interrupted or prior.get("state") == "interrupted"
+                else "stopping",
+                "admission_open": False,
+                "release_confirmed": False,
+            }
+
+    def _episode_notice(self, op, identity, **kwargs):
+        if self._transport is None:
+            raise BackendError("remote episode transport missing")
+        self._transport.notify(
+            Request(
+                id=next(self._ids), op=op, args={"identity": identity, **kwargs}
+            ).encode()
+        )
+
+    def heartbeat_episode(self, identity):
+        self.check_episode(identity)
+        self._episode_notice("episode_heartbeat", identity)
+
+    def revoke_episode(self, identity, *, interrupted=False):
+        self.fence_episode_local(identity, interrupted=interrupted)
+        self._episode_notice("episode_revoke", identity, interrupted=interrupted)
+
+    def end_episode(self, identity, *, interrupted=False):
+        with self._episode_state_lock:
+            if identity == self._episode_identity and self._settled_receipt(identity):
+                return copy.deepcopy(self._episode_status_cache)
+        result = self._call("episode_end", identity=identity, interrupted=interrupted)
+        with self._episode_state_lock:
+            if identity == self._episode_identity:
+                self._episode_status_cache = result
+        return result
+
+    def _settled_receipt(self, identity):
+        return self._episode_status_cache.get(
+            "identity"
+        ) == identity and settled_terminal(self._episode_status_cache)
+
+    def episode_status(self, identity):
+        with self._episode_state_lock:
+            if identity == self._episode_identity and self._settled_receipt(identity):
+                # Another transport reference may now own the target. Its
+                # current status cannot replace our immutable terminal receipt.
+                return copy.deepcopy(self._episode_status_cache)
+        result = self._call("episode_status", identity=identity)
+        with self._episode_state_lock:
+            if identity != self._episode_identity:
+                return result  # Delayed old query cannot replace current custody.
+            if self._episode_fenced and result.get("admission_open"):
+                result = {
+                    **result,
+                    "target_state": result["state"],
+                    "state": self._episode_status_cache.get("state", "interrupted"),
+                    "admission_open": False,
+                }
+            self._episode_status_cache = result
+        return result
 
     @property
     def handshake_age_seconds(self) -> float | None:
@@ -184,6 +332,22 @@ class RemoteBackend:
         if self._transport is None or not self._connected:
             raise BackendError(f"remote backend not connected (op={op!r})")
         op_class = classify_op(op)
+        if self._episode_identity is not None and op not in {
+            "episode_begin",
+            "episode_end",
+            "episode_status",
+            "release_all",
+            "bye",
+            "presence_idle",
+            "announcement_status",
+            "probe",
+            "screen_geometry",
+            "list_monitors",
+            "ping",
+            "announce_raise",
+        }:
+            self.check_episode(self._episode_identity)
+            args["_episode"] = self._episode_identity
         exchange = (
             CURRENT_TARGET_CLOCK.get()
             if self.presence_platform == "windows-wsl2" and op_class == "write"
@@ -212,6 +376,12 @@ class RemoteBackend:
                 f"wire desync: sent id={req.id}, got id={resp.id} for op {op!r}"
             )
         if not resp.ok:
+            if (
+                op == "episode_begin"
+                and resp.error_type == "EpisodeBeginRefused"
+                and validate_begin_refusal(resp.error_data, args.get("identity"))
+            ):
+                raise EpisodeBeginRefused(resp.error_data)
             raise BackendError(f"{resp.error_type}: {resp.error_message}")
         if exchange is not None:
             envelope = resp.result
