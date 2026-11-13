@@ -2114,17 +2114,35 @@ class ComputerTool:
         return self._episode.status(self._episode_identity)
 
     def end_episode(self, generation: str | None = None, *, interrupted=False) -> dict:
-        # Crucially does NOT acquire _announce_lock, which native work holds.
+        # Fence BEFORE waiting for any sponsorship/status/native lock. Another
+        # call may hold _episode_lock while waiting for a remote status reply.
+        identity = self._episode_identity
+        if identity is not None:
+            if generation is not None and generation != identity["generation"]:
+                raise BackendError("stale episode generation")
+            self.fence_episode(identity["generation"], interrupted=interrupted)
         with self._episode_lock:
-            identity = self._episode_identity
             if identity is None:
                 return self.episode_status()
+            if self._episode_identity != identity:
+                raise BackendError("stale episode generation")
             if generation is not None and generation != identity["generation"]:
                 raise BackendError("stale episode generation")
             self._episode_heartbeat_stop.set()
             if self._binding.is_remote:
-                self._episode.revoke_episode(identity, interrupted=interrupted)
                 result = self._episode.end_episode(identity, interrupted=interrupted)
+                if (
+                    result.get("identity") == identity
+                    and result.get("release_confirmed") is True
+                    and result.get("workers") == 0
+                ):
+                    # The target already emitted owned ups. Do not replay them
+                    # through a now-fenced backend; retire only our own boxes.
+                    for token in list(self._mouse_pending):
+                        if self._binding.ledger is not None:
+                            self._binding.ledger.acknowledge_release(token)
+                        self._mouse_pending.pop(token, None)
+                self._episode_fenced_status = result
             else:
                 self._episode.fence(identity, interrupted=interrupted)
                 result = self._episode.close(identity)
@@ -3067,13 +3085,15 @@ class ComputerTool:
             )
         try:
             await asyncio.to_thread(self._ensure_announced)
+            pinned_episode, pinned_identity = None, None
             if self._episode_enabled:
                 if (
                     invocation_episode is not None
                     and invocation_episode != self._episode_identity
                 ):
                     raise BackendError("queued invocation belongs to a stale episode")
-                await asyncio.to_thread(self.begin_episode)
+                sponsored = await asyncio.to_thread(self.begin_episode)
+                pinned_episode, pinned_identity = self._episode, sponsored["identity"]
         except asyncio.CancelledError:
             if not batch:
                 raise
@@ -3146,8 +3166,8 @@ class ComputerTool:
             "running": False,
             "cleanup": None,
             "cancelled": threading.Event(),
-            "episode": self._episode,
-            "episode_identity": self._episode_identity,
+            "episode": pinned_episode,
+            "episode_identity": pinned_identity,
         }
         result = None
         captures: list = []
@@ -4005,6 +4025,7 @@ class DesktopTool:
         # ones that happen to share `_run()` with `computer`.
         try:
             await asyncio.to_thread(self._computer._ensure_announced)
+            pinned_episode, pinned_identity = None, None
             if self._computer._episode_enabled or action == "begin_episode":
                 if (
                     action != "begin_episode"
@@ -4012,8 +4033,12 @@ class DesktopTool:
                     and (invocation_episode != self._computer._episode_identity)
                 ):
                     raise BackendError("queued invocation belongs to a stale episode")
-                await asyncio.to_thread(
+                sponsored = await asyncio.to_thread(
                     self._computer.begin_episode, explicit=action == "begin_episode"
+                )
+                pinned_episode, pinned_identity = (
+                    self._computer._episode,
+                    sponsored["identity"],
                 )
             if action == "begin_episode":
                 return ToolResult(success=True, output=self._computer.episode_status())
@@ -4050,8 +4075,8 @@ class DesktopTool:
             "running": False,
             "cleanup": None,
             "cancelled": threading.Event(),
-            "episode": self._computer._episode,
-            "episode_identity": self._computer._episode_identity,
+            "episode": pinned_episode,
+            "episode_identity": pinned_identity,
         }
         try:
             return await self._execute_action(

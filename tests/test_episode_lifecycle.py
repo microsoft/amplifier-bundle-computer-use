@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import queue
 import threading
 import time
 import uuid
@@ -310,3 +311,205 @@ def test_lost_begin_reply_reconciles_status_without_replaying_begin():
         backend.begin_episode(identity)
     assert backend.episode_status(identity)["identity"] == identity
     assert calls == ["episode_begin", "episode_status"]
+
+
+@pytest.mark.parametrize("loss", ["expiry", "helper"])
+def test_end_and_cached_status_check_deadline_before_watchdog_tick(loss):
+    indicator = Indicator()
+    clock = [0.0]
+    episode = Episode("t", lambda: indicator, lambda: True, clock=lambda: clock[0])
+    identity = {"owner": "o", "target": "t", "generation": "g"}
+    episode.begin(identity)
+    if loss == "expiry":
+        clock[0] = 10.01
+    else:
+        indicator.healthy = False
+    result = episode.end(identity)
+    assert result["state"] == "interrupted"
+    assert "released" not in indicator.states
+    assert not episode.status()["admission_open"]
+
+
+def test_indicator_upgrade_exception_is_sticky():
+    indicator = Indicator()
+    update = indicator.update
+
+    def fail(state):
+        if state == "controlling":
+            raise RuntimeError("unknown indicator acknowledgement")
+        return update(state)
+
+    indicator.update = fail
+    episode = Episode("t", lambda: indicator, lambda: True)
+    identity = {"owner": "o", "target": "t", "generation": "g"}
+    episode.begin(identity)
+    with pytest.raises(EpisodeError), episode.admit(identity, controlling=True):
+        pytest.fail("admitted without indicator")
+    indicator.update = update
+    with pytest.raises(EpisodeError):
+        episode.heartbeat(identity)
+    assert episode.end(identity)["state"] == "interrupted"
+
+
+@pytest.mark.parametrize("surface", ["computer", "desktop"])
+@run_async
+async def test_call_queued_at_band_cannot_attach_replacement_generation(
+    rig, monkeypatch, surface
+):
+    tool, _ = rig
+    entered, proceed = asyncio.Event(), asyncio.Event()
+    acquire = tool._acquire_batch_band
+
+    async def gate():
+        entered.set()
+        await proceed.wait()
+        return await acquire()
+
+    monkeypatch.setattr(tool, "_acquire_batch_band", gate)
+    tool._backend.get_clipboard = lambda: "inert"
+    target = tool if surface == "computer" else cu.DesktopTool(tool)
+    payload = (
+        {"action": "key", "text": "A"}
+        if surface == "computer"
+        else {"action": "get_clipboard"}
+    )
+    queued = asyncio.create_task(target.execute(payload))
+    await asyncio.wait_for(entered.wait(), 2)
+    old = tool.episode_status()["identity"]["generation"]
+    assert (await asyncio.to_thread(tool.end_episode, old))["state"] == "released"
+    tool.begin_episode(explicit=True)
+    proceed.set()
+    assert not (await queued).success
+    assert tool._backend.calls == []
+
+
+def test_reader_revoke_overtaking_queued_begin_remains_fenced():
+    indicator = Indicator()
+    agent = RemoteAgent(
+        _FakeBackend(), require_episode=True, indicator_factory=lambda: indicator
+    )
+    identity = {"owner": "o", "target": agent._episode_target, "generation": "g"}
+    lines = queue.Queue()
+    entered, proceed, revoked = threading.Event(), threading.Event(), threading.Event()
+    dispatch, notice = agent._dispatch, agent._episode_notice
+
+    def gated(req):
+        if req.op == "episode_begin":
+            entered.set()
+            assert proceed.wait(3)
+        return dispatch(req)
+
+    def observed(req):
+        result = notice(req)
+        if req.op == "episode_revoke":
+            revoked.set()
+        return result
+
+    agent._dispatch, agent._episode_notice = gated, observed
+
+    class Input:
+        def __iter__(self):
+            while (line := lines.get()) is not None:
+                yield line
+
+    stdout = io.StringIO()
+    worker = threading.Thread(target=agent.run, args=(Input(), stdout))
+    worker.start()
+    lines.put(Request(1, "episode_begin", {"identity": identity}).encode())
+    assert entered.wait(2)
+    lines.put(Request(2, "episode_revoke", {"identity": identity}).encode())
+    assert revoked.wait(2)
+    lines.put(Request(3, "key", {"combo": "A", "_episode": identity}).encode())
+    proceed.set()
+    lines.put(Request(4, "bye").encode())
+    lines.put(None)
+    worker.join(3)
+    assert not worker.is_alive()
+    replies = {
+        row["id"]: row for row in map(json.loads, stdout.getvalue().splitlines())
+    }
+    assert replies[1]["ok"] is False and replies[3]["ok"] is False
+    assert 2 not in replies  # one-way notice never disturbs response framing
+
+
+def remote_rig():
+    target = _FakeBackend()
+    agent = RemoteAgent(
+        target, read_only=False, require_episode=True, indicator_factory=Indicator
+    )
+
+    class Transport:
+        user_host = "inert"
+        port = None
+
+        def send(self, line):
+            req = json.loads(line)
+            return agent._dispatch(Request(**req)).encode()
+
+        def notify(self, line):
+            agent._episode_notice(Request(**json.loads(line)))
+
+    backend = RemoteBackend({"_transport": Transport()})
+    backend._connected = True
+    backend.handshake = {"episode_target": agent._episode_target}
+    tool = cu.ComputerTool(backend, {"read_only": False, "gate_writes": False})
+    tool._episode_enabled = True
+    tool._announced = True
+    tool.resolve_display()
+    tool._ledger = HeldInputLedger(deadman_seconds=100)
+    return tool, agent, target
+
+
+@run_async
+async def test_remote_target_release_reconciles_controller_without_replaying_up():
+    tool, agent, target = remote_rig()
+    assert (
+        await tool.execute({"action": "left_mouse_down", "coordinate": [1, 1]})
+    ).success
+    assert tool._mouse_pending
+    result = await asyncio.to_thread(tool.end_episode)
+    assert result["state"] == "released"
+    assert not tool._mouse_pending and tool._ledger.held_tokens == []
+    assert not agent._ledger.held_tokens and len(target.mouse_ups) == 1
+    tool._ledger.release_all()
+    assert len(target.mouse_ups) == 1
+    tool._ledger.stop()
+
+
+def test_public_end_fences_before_waiting_sponsor_status_lock():
+    tool, agent, _ = remote_rig()
+    tool.begin_episode()
+    entered, proceed, ending = threading.Event(), threading.Event(), threading.Event()
+    status = tool._episode.episode_status
+
+    def blocked(identity):
+        entered.set()
+        assert proceed.wait(3)
+        return status(identity)
+
+    tool._episode.episode_status = blocked
+    begin_worker = threading.Thread(target=lambda: _ignore_error(tool.begin_episode))
+    begin_worker.start()
+    assert entered.wait(2)
+
+    def end():
+        ending.set()
+        tool.end_episode()
+
+    end_worker = threading.Thread(target=end)
+    end_worker.start()
+    assert ending.wait(1)
+    wait_for(lambda: tool._episode._episode_fenced)
+    wait_for(lambda: not agent._episode.status()["admission_open"])
+    proceed.set()
+    begin_worker.join(3)
+    end_worker.join(3)
+    assert not end_worker.is_alive()
+    tool._ledger.stop()
+
+
+def _ignore_error(function):
+    try:
+        function()
+    except Exception:
+        pass

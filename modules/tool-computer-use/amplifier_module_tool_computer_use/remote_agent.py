@@ -206,6 +206,8 @@ class RemoteAgent:
         self._episode = None
         self._indicator_factory = indicator_factory
         self._disconnected = threading.Event()
+        self._episode_control_lock = threading.RLock()
+        self._revoked_generations: set[tuple[str, str]] = set()
 
     def _make_indicator(self):
         if self._indicator_factory:
@@ -222,19 +224,34 @@ class RemoteAgent:
 
     def _op_episode_begin(self, args):
         identity = args["identity"]
-        if self._episode is not None and self._episode.status()["state"] == "released":
-            if self._episode.status()["identity"] == identity:
-                return self._episode.status(identity)
-            self._episode = None
-        if self._episode is None:
-            self._episode = Episode(
-                self._episode_target,
-                self._make_indicator,
-                self._release_episode,
-                lease_seconds=120,
-            )
+        if not isinstance(identity, dict):
+            raise EpisodeError("invalid episode identity")
+        key = (identity.get("owner"), identity.get("generation"))
+        with self._episode_control_lock:
+            if key in self._revoked_generations:
+                raise EpisodeError("episode revoked before begin")
+            if (
+                self._episode is not None
+                and self._episode.status()["state"] == "released"
+            ):
+                if self._episode.status()["identity"] == identity:
+                    return self._episode.status(identity)
+                self._episode = None
+            if self._episode is None:
+                self._episode = Episode(
+                    self._episode_target,
+                    self._make_indicator,
+                    self._release_episode,
+                    lease_seconds=120,
+                )
+            episode = self._episode
         self._require_episode = True
-        return self._episode.begin(identity)
+        result = episode.begin(identity)
+        with self._episode_control_lock:
+            if key in self._revoked_generations:
+                episode.fence(identity, reason="revoked_during_begin")
+                raise EpisodeError("episode revoked during begin")
+        return result
 
     def _op_episode_status(self, args):
         if self._episode is None:
@@ -255,6 +272,23 @@ class RemoteAgent:
         if req.op not in {"episode_heartbeat", "episode_revoke"}:
             return False
         try:
+            identity = req.args["identity"]
+            if req.op == "episode_revoke":
+                if (
+                    not isinstance(identity, dict)
+                    or identity.get("target") != self._episode_target
+                ):
+                    raise EpisodeError("wrong episode target")
+                key = (identity.get("owner"), identity.get("generation"))
+                if any(not isinstance(v, str) or not v or len(v) > 128 for v in key):
+                    raise EpisodeError("invalid episode generation")
+                with self._episode_control_lock:
+                    # Keep bounded tombstones when revoke overtakes begin.
+                    # Overflow fences the connection rather than evicting one.
+                    if len(self._revoked_generations) >= 128:
+                        self._disconnected.set()
+                    else:
+                        self._revoked_generations.add(key)
             if self._episode is None:
                 raise EpisodeError("no episode")
             if req.op == "episode_heartbeat":

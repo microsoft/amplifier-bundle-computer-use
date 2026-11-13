@@ -131,8 +131,12 @@ class Episode:
                 self._check_locked()
                 upgrade = controlling and self._state == "viewing"
             if upgrade:
-                result = self._indicator.update("controlling")
-                if not all(result.get(k) is True for k in ("ready", "healthy")):
+                try:
+                    result = self._indicator.update("controlling")
+                    ready = all(result.get(k) is True for k in ("ready", "healthy"))
+                except Exception:
+                    ready = False
+                if not ready:
                     self.fence(identity, reason="indicator_lost")
                     raise EpisodeError("target indicator update unconfirmed")
             with self._condition:
@@ -153,6 +157,11 @@ class Episode:
             self._match(identity)
             if self._state == "released":
                 return
+            if self._state in {"viewing", "controlling"}:
+                try:
+                    self._check_locked()
+                except EpisodeError:
+                    interrupted = True
             self._state = (
                 "interrupted"
                 if interrupted or self._state == "interrupted"
@@ -231,6 +240,11 @@ class Episode:
         with self._condition:
             if identity is not None:
                 self._match(identity)
+            if self._state in {"viewing", "controlling"}:
+                try:
+                    self._check_locked()
+                except EpisodeError:
+                    pass
             return {
                 "identity": dict(self._identity) if self._identity else None,
                 "state": self._state,

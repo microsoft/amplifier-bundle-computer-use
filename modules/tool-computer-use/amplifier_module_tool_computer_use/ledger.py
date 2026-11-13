@@ -155,6 +155,18 @@ class HeldInputLedger:
                 self._timer.cancel()
                 self._timer = None
 
+    def acknowledge_release(self, token: str) -> None:
+        """Retire controller custody from owner-bound target release evidence.
+
+        Emits no input. The caller must already have matching target generation,
+        native worker drain and successful ledger-release acknowledgement.
+        """
+        with self._lock:
+            held = self._held.pop(token, None)
+            if held is not None:
+                held.released = True
+            self._reset_deadman_locked()
+
     @property
     def held_tokens(self) -> list[str]:
         with self._lock:
