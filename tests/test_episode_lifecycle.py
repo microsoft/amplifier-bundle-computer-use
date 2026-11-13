@@ -513,3 +513,71 @@ def _ignore_error(function):
         function()
     except Exception:
         pass
+
+
+@run_async
+async def test_cleanup_owns_pending_start_and_no_active_publish_after_close(
+    rig, monkeypatch
+):
+    tool, indicator = rig
+    entered, proceed = threading.Event(), threading.Event()
+    start = indicator.start
+
+    def blocked(state="viewing"):
+        entered.set()
+        assert proceed.wait(3)
+        return start(state)
+
+    indicator.start = blocked
+    backend_closes = []
+    tool._backend.close = lambda: backend_closes.append(True)
+    monkeypatch.setattr(cu, "_select_and_build", lambda cfg: tool)
+    coordinator = MockCoordinator()
+    mounted = await cu.mount(coordinator)
+    controller = coordinator.get_capability("computer_use.episodes")
+    beginning = asyncio.create_task(controller.begin())
+    assert await asyncio.to_thread(entered.wait, 2)
+    cleaning = asyncio.create_task(mounted())
+    await asyncio.sleep(0.02)
+    assert not cleaning.done() and not backend_closes
+    assert controller.cached_status()["admission_open"] is False
+    proceed.set()
+    with pytest.raises((EpisodeError, cu.BackendError)):
+        await beginning
+    await cleaning
+    assert indicator.closed and backend_closes == [True]
+    assert not tool.episode_status()["admission_open"]
+    assert coordinator.get_capability("computer_use.episodes") is None
+
+
+@run_async
+async def test_cleanup_retains_capability_and_backend_until_indicator_settles(
+    rig, monkeypatch
+):
+    tool, indicator = rig
+    backend_closes = []
+    tool._backend.close = lambda: backend_closes.append(True)
+    real_close = indicator.close
+    indicator.close = lambda: {
+        "closed": False,
+        "surface_absent": False,
+        "process_settled": False,
+        "helper_exit": None,
+    }
+    monkeypatch.setattr(cu, "_select_and_build", lambda cfg: tool)
+    coordinator = MockCoordinator()
+    mounted = await cu.mount(coordinator)
+    controller = coordinator.get_capability("computer_use.episodes")
+    await controller.begin()
+    with pytest.raises(RuntimeError, match="indicator settlement"):
+        await mounted()
+    status = controller.cached_status()
+    assert status["release_confirmed"] is True
+    assert status["indicator_settled"] is False
+    assert status["state"] == "interrupted"
+    assert not backend_closes
+    assert coordinator.get_capability("computer_use.episodes") is controller
+    indicator.close = real_close
+    await mounted()
+    assert backend_closes == [True]
+    assert coordinator.get_capability("computer_use.episodes") is None

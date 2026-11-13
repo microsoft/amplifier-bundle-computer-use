@@ -2094,8 +2094,14 @@ class ComputerTool:
                     )
                     _episode_registry[key] = episode
                     self._episode = episode
+                    # Publish startup custody before a blocking helper start;
+                    # cleanup/Stop must be able to fence this pending generation.
+                    self._episode_identity = identity
                 try:
                     result = episode.begin(identity)
+                    if self._cleanup_started:
+                        episode.fence(identity, reason="cleanup_during_start")
+                        raise BackendError("cleanup overtook episode startup")
                 except BaseException:
                     # Failed start stays fenced, with cleanup custody retained.
                     self._episode_identity = identity
@@ -5893,11 +5899,26 @@ async def _mount_backend(coordinator: Any, cfg: dict[str, Any]) -> dict[str, Any
 
     def close_current_binding() -> None:
         nonlocal closed, close_error
+        # Close startup admission before inspecting pending generation custody.
+        # Legacy non-episode cleanup keeps its existing held-input retry path.
+        if computer._episode_enabled:
+            computer._cleanup_started = True
+            identity = computer._episode_identity
+            if identity is not None:
+                computer.fence_episode(identity["generation"], interrupted=True)
+            # If cleanup overtook allocation, await that startup owner's
+            # finally before deciding whether any helper custody exists.
+            with computer._episode_lock:
+                pass
         if computer._episode_identity is not None:
             result = computer.end_episode(interrupted=True)
-            if result["workers"] or not result["release_confirmed"]:
+            if (
+                result["workers"]
+                or not result["release_confirmed"]
+                or result.get("indicator_settled") is not True
+            ):
                 raise RuntimeError(
-                    "computer-use cleanup pending: episode release unconfirmed"
+                    "computer-use cleanup pending: episode release or indicator settlement unconfirmed"
                 )
         with computer._announce_lock:
             if close_error is not None:

@@ -154,6 +154,14 @@ class Episode:
     def fence(self, identity, *, reason: str = "stopping", interrupted: bool = True):
         """Close admission immediately; never wait for a native worker here."""
         with self._condition:
+            if (
+                self._identity is None
+                and isinstance(identity, dict)
+                and (identity.get("target") == self.target)
+            ):
+                # Cleanup/Stop can overtake the scheduled startup worker.
+                self._identity = dict(identity)
+                self._state = "interrupted"
             self._match(identity)
             if self._state == "released":
                 return
@@ -252,6 +260,7 @@ class Episode:
                 "workers": self._workers,
                 "admission_open": self._state in {"viewing", "controlling"},
                 "release_confirmed": self._confirmed,
+                "indicator_settled": self._closed,
                 "scope": "cooperative_channel_agent_not_desktop_wide",
             }
 
@@ -260,6 +269,8 @@ class Episode:
         if result["workers"] or not result["release_confirmed"]:
             return result
         with self._render_lock:
+            if self._indicator is None:
+                self._closed = True  # Start was fenced before allocating a helper.
             if self._indicator is not None and not self._closed:
                 closed = self._indicator.close()
                 # Normal helper closure is intentionally unhealthy (no live
