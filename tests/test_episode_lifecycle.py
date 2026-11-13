@@ -298,9 +298,15 @@ async def test_production_mount_exports_trusted_controller_and_cleanup(
     assert coordinator.get_capability("computer_use.episodes") is None
 
 
+@pytest.mark.parametrize("replacement", [False, True])
 @run_async
-async def test_late_remote_begin_reply_cannot_clear_host_fence_with_notice_delayed():
+async def test_late_remote_begin_reply_cannot_clear_host_fence_with_notice_delayed(
+    replacement,
+):
     tool, agent, target = remote_rig()
+    if replacement:
+        tool.begin_episode()
+        assert tool.end_episode()["state"] == "released"
     backend = tool._backend
     transport = backend._transport
     send = transport.send

@@ -117,11 +117,19 @@ class RemoteBackend:
         with self._episode_state_lock:
             if identity != self._episode_identity:
                 if self._episode_identity is not None and (
-                    not settled_terminal(self._episode_status_cache)
+                    not self._settled_receipt(self._episode_identity)
                 ):
                     raise BackendError("prior remote generation custody is not settled")
                 self._episode_identity = dict(identity)
                 self._episode_fenced = False
+                self._episode_status_cache = {
+                    "identity": dict(identity),
+                    "state": "starting",
+                    "workers": 0,
+                    "admission_open": False,
+                    "release_confirmed": False,
+                    "indicator_settled": False,
+                }
             elif self._episode_fenced:
                 raise BackendError("remote episode fenced")
         result = self._call("episode_begin", identity=identity)
@@ -141,7 +149,7 @@ class RemoteBackend:
         with self._episode_state_lock:
             if identity != self._episode_identity:
                 raise BackendError("wrong episode owner")
-            if settled_terminal(self._episode_status_cache):
+            if self._settled_receipt(identity):
                 return
             self._episode_fenced = True
             prior = self._episode_status_cache
@@ -174,24 +182,29 @@ class RemoteBackend:
 
     def end_episode(self, identity, *, interrupted=False):
         with self._episode_state_lock:
-            if identity == self._episode_identity and settled_terminal(
-                self._episode_status_cache
-            ):
+            if identity == self._episode_identity and self._settled_receipt(identity):
                 return copy.deepcopy(self._episode_status_cache)
         result = self._call("episode_end", identity=identity, interrupted=interrupted)
-        self._episode_status_cache = result
+        with self._episode_state_lock:
+            if identity == self._episode_identity:
+                self._episode_status_cache = result
         return result
+
+    def _settled_receipt(self, identity):
+        return self._episode_status_cache.get(
+            "identity"
+        ) == identity and settled_terminal(self._episode_status_cache)
 
     def episode_status(self, identity):
         with self._episode_state_lock:
-            if identity == self._episode_identity and settled_terminal(
-                self._episode_status_cache
-            ):
+            if identity == self._episode_identity and self._settled_receipt(identity):
                 # Another transport reference may now own the target. Its
                 # current status cannot replace our immutable terminal receipt.
                 return copy.deepcopy(self._episode_status_cache)
         result = self._call("episode_status", identity=identity)
         with self._episode_state_lock:
+            if identity != self._episode_identity:
+                return result  # Delayed old query cannot replace current custody.
             if self._episode_fenced and result.get("admission_open"):
                 result = {
                     **result,
