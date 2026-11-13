@@ -42,6 +42,48 @@ aliases; ordinary `computer`/`screenshot` name collisions do not imply intent.
 The known orchestrator builder is checked for actual ToolSpec-extra preservation.
 A public `stream()` path this hook cannot project is refused loudly before wrapping.
 
+## Optional session-media producer
+
+A qualified host can bind `experimental.media.v1` before module initialization.
+The screenshot producer requires integer `version == 1`, `enabled is True`, and a
+callable `computer_use.media_policy(ref, *, purpose)` capability. It privately
+ingests the already-captured PNG after ordinary action cleanup, then returns an
+actual `ToolResult.output` mapping with `experimental.media.v1: {refs: [...]}`.
+No marker string, image bytes or local screenshot path is emitted on that path.
+The loop alone publishes surviving effective post-hook refs and checkpoints them.
+Packaging failure never recaptures or replays completed input; cancelled batches
+retain completed progress with no promotable refs.
+
+The host's source-policy registry binds the same callback into its generic media
+store policy verifier. It classifies original screenshot session/call identities
+and invokes the original mounted tool's `_validate_media_ref(ref, *, purpose)`.
+At producer `purpose="persist"` admission, the host must bind that classification
+to the actual current tool call, not caller text. Validate again before resolve,
+private preparation and every count/transport attempt. Ref possession, a digest,
+`capture_id`/`binding_id` labels, or compatibility reporting is never consent.
+Lost original issuance after restart, copy, fork or bounded eviction is unavailable,
+not permission to hydrate a durable blob. Keep source classification on those
+paths so loss of the owner cannot misclassify screenshots as unrestricted uploads.
+Convert an initial source refusal to explicit unavailable text before counting;
+after fitting, refuse rather than replace pixels or refresh capture consent.
+
+Original capture time and two-hour expiry are fixed before capture starts, with a
+private monotonic deadline too. Ingest, retry, resume, copy and fork cannot renew
+them. Identical pixels can have independently expiring observations. Existing
+target, machine, disclosure, policy binding, halt, pause and cleanup state remains
+owned by the tool/host; media handling creates no capture or input authority.
+This source base adds no native episode claims that it cannot establish.
+
+Call `computer_use.prepare_request` **before generic hydration and counting**:
+it applies `max_inline_screenshots` newest-first to genuine owner-issued screenshot
+refs on a private canonical copy, preserving other producers' media and metadata.
+Count/send must retain that same effective projection. The generic host, not a
+second legacy provider wrapper, owns hydration and its private transport witnesses.
+Historical marker projection remains available through the explicit preparation
+capability. Without generic media, a mounted compatible legacy reader can still
+use the established private marker path. Without either reader, new screenshots
+return useful unavailable text and retain no fallback pixels.
+
 The write gate inspects nested canonical batch actions, so a top-level batch cannot
 hide writes. Interactive approval is default-deny and bound to the exact batch payload
 and target/policy; the executor consumes that approval once. Explicit

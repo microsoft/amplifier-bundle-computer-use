@@ -41,6 +41,7 @@ except ImportError:  # pragma: no cover
 logger = logging.getLogger(__name__)
 __version__ = "0.1.0"
 MARKER = "__amplifier_computer_use__"
+MEDIA_NAMESPACE = "experimental.media.v1"
 _WRAPPED_FLAG = "_amplifier_computer_use_wrapped"
 _DEFAULT_MAX_INLINE_IMAGES = 3
 _TRACE_PATH = os.environ.get("AMPLIFIER_COMPUTER_USE_TRACE")
@@ -281,6 +282,7 @@ def _expand_tool_results(
     capture_for_message=None,
     *,
     image_witness=None,
+    media_for_message=None,
 ) -> list[Any]:
     """Generic recency projection retaining complete original error/reference text.
 
@@ -291,6 +293,36 @@ def _expand_tool_results(
     changed = False
     budget = max_inline
     for msg in reversed(messages):
+        metadata = _field(msg, "metadata")
+        if isinstance(metadata, dict) and MEDIA_NAMESPACE in metadata:
+            # Generic media is projected by the host's pre-fit adapter. Never
+            # parse its useful text as a legacy marker or hydrate it twice.
+            selected = media_for_message(msg) if media_for_message else []
+            if selected and budget <= 0:
+                carrier = metadata[MEDIA_NAMESPACE]
+                remaining = [r for r in carrier["refs"] if r not in selected]
+                content = _read_content(msg)
+                note = "[Image unavailable: superseded by a newer screenshot; no pixels supplied]"
+                if isinstance(content, str):
+                    content = content + "\n" + note
+                else:
+                    content = [*(content or []), {"type": "text", "text": note}]
+                clone = _with_content(msg, content)
+                updated = {
+                    **metadata,
+                    MEDIA_NAMESPACE: {**carrier, "refs": remaining},
+                }
+                if isinstance(clone, dict):
+                    clone["metadata"] = updated
+                else:
+                    clone.metadata = updated
+                changed = True
+                rewritten.append(clone)
+            else:
+                if selected:
+                    budget -= 1
+                rewritten.append(msg)
+            continue
         original = _read_content(msg)
         payload = _parse_marker(original)
         if payload is None or _field(msg, "role") != "tool":
@@ -356,12 +388,18 @@ def _expand_tool_results(
     return rewritten if changed else messages
 
 
-def _project_request(request, max_inline, capture_for_message, *, image_witness=None):
+def _project_request(
+    request, max_inline, capture_for_message, *, image_witness=None, media_for_message=None
+):
     messages = getattr(request, "messages", None)
     if not isinstance(messages, list):
         return request
     projected = _expand_tool_results(
-        messages, max_inline, capture_for_message, image_witness=image_witness
+        messages,
+        max_inline,
+        capture_for_message,
+        image_witness=image_witness,
+        media_for_message=media_for_message,
     )
     if projected is messages:
         return request
@@ -667,6 +705,31 @@ async def mount(
         get_capability(projection_capability) if supports_preparation else None
     )
 
+    def screenshot_refs(msg):
+        """Classify exact owner-issued refs, not tool names or serialized text."""
+        metadata = _field(msg, "metadata")
+        carrier = metadata.get(MEDIA_NAMESPACE) if isinstance(metadata, dict) else None
+        if (
+            _field(msg, "role") != "tool"
+            or not isinstance(carrier, dict)
+            or not isinstance(carrier.get("refs"), list)
+        ):
+            return []
+        tools = coordinator.get("tools")
+        if not isinstance(tools, dict):
+            return []
+        owners = [
+            tool
+            for tool in tools.values()
+            if _has_capture_authority(tool)
+            and callable(getattr(tool, "_owns_media_ref", None))
+        ]
+        return [
+            ref
+            for ref in carrier["refs"]
+            if any(tool._owns_media_ref(ref) for tool in owners)
+        ]
+
     def prepare_request(request):
         """Optional pre-fit host integration; ordinary provider wrappers remain."""
         if not active:
@@ -679,6 +742,7 @@ async def mount(
             image_witness=lambda captures, capture: witnesses.append(
                 (captures, capture)
             ),
+            media_for_message=screenshot_refs,
         )
 
         def validate():
@@ -740,6 +804,15 @@ async def mount(
                 "computer-use: no provider found to wrap (requested=%r); screenshot inlining will not happen this turn",
                 name,
             )
+        elif (
+            callable(get_capability)
+            and get_capability(MEDIA_NAMESPACE) is not None
+        ):
+            # A generic host owns the private count/send projection, including
+            # stream and source policy witnesses. Do not add a late independent
+            # legacy provider wrapper around it. The explicit prepare capability
+            # above remains available for genuine historical marker results.
+            return HookResult(action="continue")
         else:
             fields = ("complete", "request_budget", _WRAPPED_FLAG)
             own = getattr(provider, "__dict__", {})

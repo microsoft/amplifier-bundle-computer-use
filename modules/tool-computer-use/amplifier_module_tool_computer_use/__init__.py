@@ -38,6 +38,7 @@ from collections import deque
 from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -120,6 +121,37 @@ REMOTE_TRANSPORT_WARNING_MS = 2000.0
 
 SHOT_DIR = Path.home() / ".amplifier" / "computer-use" / "shots"
 SHOT_TTL_SECONDS = 2 * 60 * 60
+
+
+@dataclass(frozen=True)
+class _CaptureIdentity:
+    """Private observation identity, created once at the actual capture boundary."""
+
+    id: str
+    created_at: float
+    deadline: float
+    expires_at: float
+    binding: Any
+    source: str
+
+
+class _CapturedImage(str):
+    """Transient encoded pixels with their original authority, never a tool output."""
+
+    def __new__(
+        cls, encoded: str, binding: Any, source: str, started: tuple[float, float]
+    ):
+        image = super().__new__(cls, encoded)
+        now, monotonic = started
+        image.capture = _CaptureIdentity(
+            uuid.uuid4().hex,
+            now,
+            monotonic + SHOT_TTL_SECONDS,
+            now + SHOT_TTL_SECONDS,
+            binding,
+            source,
+        )
+        return image
 
 #: Security hardening (adversarial review, no prior gating beyond the parent
 #: directory's inherited umask): screenshots of a driven desktop are
@@ -441,6 +473,12 @@ class ComputerTool:
         # successful image results emitted by this instance enter this queue.
         # It is bounded, memory-only, and cannot be reconstructed from history.
         self._issued_capture_results: deque = deque(maxlen=64)
+        # A host binds media before module initialization. Absence retains the
+        # qualified legacy marker path; a present but incompatible capability
+        # must never cause fallback persistence of new pixels.
+        self._media_get_capability: Callable | None = None
+        self._media_coordinator: Any = None
+        self._issued_media: deque = deque(maxlen=64)
 
         # -- security hardening: clipboard read policy ------------------------
         # `get_clipboard` (docs/DesktopTool) previously had no gate
@@ -2164,6 +2202,7 @@ class ComputerTool:
             if binding.current_monitor is not None:
                 m = binding.current_monitor
                 region = (m.x, m.y, m.x + m.width, m.y + m.height)
+            started = time.time(), time.monotonic()
             b64 = capture_scaled_b64(
                 backend, disp, region, self._max_edge, self._max_pixels
             )
@@ -2174,7 +2213,9 @@ class ComputerTool:
                 "computer-use audit: op=screenshot sha256=%s",
                 _bytes_digest(base64.standard_b64decode(b64)),
             )
-            return "screenshot captured", b64
+            return "screenshot captured", _CapturedImage(
+                b64, binding, "screenshot", started
+            )
 
         if action == "zoom":
             # Models reach for `region` about as often as `coordinate`, and sometimes
@@ -2194,10 +2235,13 @@ class ComputerTool:
             x1, y1 = disp.to_screen(raw[0], raw[1])
             x2, y2 = disp.to_screen(raw[2], raw[3])
             region = (x1, y1, max(x1 + 8, x2), max(y1 + 8, y2))
+            started = time.time(), time.monotonic()
             b64 = capture_scaled_b64(
                 backend, disp, region, self._max_edge, self._max_pixels
             )
-            return f"zoomed to region {list(raw)}", b64
+            return f"zoomed to region {list(raw)}", _CapturedImage(
+                b64, binding, "zoom", started
+            )
 
         if action == "cursor_position":
             sx, sy = backend.cursor_position()
@@ -2670,7 +2714,11 @@ class ComputerTool:
                 text, image, display=display, captures=captures
             )
             if packaged.success:
-                payload = json.loads(packaged.output)
+                payload = (
+                    packaged.output
+                    if isinstance(packaged.output, dict)
+                    else json.loads(packaged.output)
+                )
             else:
                 error = packaged.error
                 payload["text"] += f"; stopped: {error['message']}"
@@ -2684,7 +2732,9 @@ class ComputerTool:
                 presses_completed
             )
         return ToolResult(
-            success=error is None, output=json.dumps(payload), error=error
+            success=error is None,
+            output=payload if MARKER not in payload else json.dumps(payload),
+            error=error,
         )
 
     def _submit_batch_thread(self, function, *args):
@@ -2932,16 +2982,160 @@ class ComputerTool:
                     }
                     if previous:
                         result.error["previous_error"] = previous
-                    payload = json.loads(result.output)
+                    payload = (
+                        result.output
+                        if isinstance(result.output, dict)
+                        else json.loads(result.output)
+                    )
                     payload["text"] += "; " + result.error["message"]
-                    result.output = json.dumps(payload)
+                    result.output = (
+                        payload if MARKER not in payload else json.dumps(payload)
+                    )
         # Cleanup can change success (notably cancellation). Register only the
         # final emitted result, never an intermediate screenshot or failed batch.
+        if isinstance(result.output, dict):
+            try:
+                result = await self._stage_capture_result(result, captures)
+            except asyncio.CancelledError:
+                if not batch:
+                    raise
+                previous = result.error
+                result.success = False
+                result.error = {
+                    "message": "batch cancelled during image staging; completed actions retained, no retry scheduled",
+                    "type": "CancelledError",
+                }
+                if previous:
+                    result.error["previous_error"] = previous
+                result.output = {
+                    **result.output,
+                    "text": result.output["text"] + "; " + result.error["message"],
+                }
+            captures = []
         if result.success and captures:
             self._issued_capture_results.append(
                 (copy.deepcopy(result.model_dump()), captures)
             )
         return result
+
+    def _validate_capture(self, capture: _CaptureIdentity) -> None:
+        """No backend calls, presence sampling, renewed disclosure or new capture."""
+        binding = capture.binding
+        guard = binding.coexistence_guard
+        if (
+            self._cleanup_started
+            or self._binding is not binding
+            or binding.announce_refused is not None
+            or binding.remote_cancel_seen
+            or binding.remote_pause_seen
+            or time.time() >= capture.expires_at
+            or time.monotonic() >= capture.deadline
+            or (guard is not None and (guard.halted or guard.pause.is_paused))
+        ):
+            raise ValueError("Computer screenshot authority is no longer current")
+
+    def _validate_media_ref(self, ref: Any, *, purpose: str) -> bool:
+        """Host policy-verifier seam; possession of a ref cannot authorize pixels.
+
+        The host must route original screenshot call identities here on resolve,
+        preparation and every transport attempt. A resumed/forked coordinator
+        deliberately has no issuance record. Its host must refuse hydration.
+        """
+        for saved, capture in self._issued_media:
+            if saved == ref:
+                self._validate_capture(capture)
+                return True
+        raise ValueError("Computer screenshot was not issued by this session")
+
+    def _owns_media_ref(self, ref: Any) -> bool:
+        """Classification only, never permission, hydration or publication."""
+        return any(saved == ref for saved, _ in self._issued_media)
+
+    async def _stage_capture_result(self, result: ToolResult, captures: list) -> ToolResult:
+        output = dict(result.output)
+        unavailable = (
+            "[Image unavailable: compatible media handling or screenshot authority "
+            "is not available; no pixels supplied]"
+        )
+        try:
+            cap = self._media_get_capability("experimental.media.v1")
+            policy_owner = self._media_get_capability("computer_use.media_policy")
+            if (
+                not result.success
+                or getattr(cap, "version", None) != 1
+                or type(getattr(cap, "version", None)) is not int
+                or getattr(cap, "enabled", False) is not True
+                or not callable(getattr(cap, "ingest", None))
+                or len(captures) != 1
+                or not isinstance(captures[0], _CapturedImage)
+                or not callable(policy_owner)
+            ):
+                raise ValueError("media graph is not qualified")
+            image = captures[0]
+            capture = image.capture
+            self._validate_capture(capture)
+            # This is the loop's trusted task-local execution scope, not any
+            # caller-provided tool argument or a guessed/fabricated tool ID.
+            scopes = getattr(self._media_coordinator, "_tool_dispatch_contexts", {})
+            scope = scopes.get(asyncio.current_task(), {})
+            call_id = scope.get("tool_call_id")
+            session_id = getattr(cap, "session_id", None)
+            if not isinstance(call_id, str) or not call_id or not session_id:
+                raise ValueError("no trusted current tool call")
+            origin = {
+                "kind": "tool",
+                "session_id": session_id,
+                "id": call_id,
+                "created_at": datetime.fromtimestamp(
+                    capture.created_at, timezone.utc
+                ).isoformat(),
+                "expires_at": datetime.fromtimestamp(
+                    capture.expires_at, timezone.utc
+                ).isoformat(),
+            }
+            staged = await cap.ingest(
+                {"encoding": "base64", "data": str(image), "mime": "image/png"},
+                source_format="image-bytes",
+                origin=copy.deepcopy(origin),
+                policy=None,
+            )
+            # Never recapture/retry on staging failure or a lost ingest reply.
+            self._validate_capture(capture)
+            if (
+                self._media_get_capability("experimental.media.v1") is not cap
+                or self._media_get_capability("computer_use.media_policy")
+                is not policy_owner
+            ):
+                raise ValueError("media or screenshot policy owner changed")
+            refs = staged["staged_refs"]
+            if (
+                not isinstance(refs, list)
+                or len(refs) != 1
+                or refs[0] != staged["value"]
+                or refs[0].get("provenance") != origin
+                or refs[0].get("session_id") != session_id
+                or refs[0].get("sha256")
+                != hashlib.sha256(base64.b64decode(image, validate=True)).hexdigest()
+            ):
+                raise ValueError("media staging changed the original observation")
+            self._issued_media.append((copy.deepcopy(refs[0]), capture))
+            # The host binds this function into its generic store policy_verifier.
+            # Presence is only compatibility; its positive check is required.
+            if policy_owner(copy.deepcopy(refs[0]), purpose="persist") is not True:
+                raise ValueError("screenshot policy owner refused staged reference")
+            output["experimental.media.v1"] = {"refs": copy.deepcopy(refs)}
+            output["computer_use"] = {
+                "capture_id": capture.id,
+                "source": capture.source,
+                "binding_id": capture.binding.diagnostic_id,
+            }
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Preserve known action status/progress. Packaging failure is not
+            # evidence that the completed action should be executed again.
+            output["text"] = str(output.get("text", "")) + "\n" + unavailable
+        return result.model_copy(update={"output": output})
 
     def _take_issued_capture_result(self, result: Any) -> list | None:
         """Consume an exact issued result at the actual coordinator tool:post seam."""
@@ -3335,25 +3529,46 @@ class ComputerTool:
         display: Display | None = None,
         captures: list | None = None,
     ) -> ToolResult:
-        """Package a successful `_run()` outcome that produced an image into
-        the marker `ToolResult` `hook-computer-use` looks for - unchanged
-        logic shared by flat calls and canonical batches instead of
-        re-implementing screenshot persistence.
+        """Keep captured bytes private until final cleanup and async staging.
 
-        Screenshots live on disk; only a path travels in the transcript. The hook
-        inlines the bytes at request time, so the transcript never carries base64.
-        (Marker protocol unchanged - see hook-computer-use.)
-
-        Security hardening: previously one flat directory shared by every
-        session, relying entirely on the inherited umask for permissions -
-        on a shared/multi-user controller box that can leave screenshots of
-        a driven desktop world- or group-readable for the full TTL window.
-        Now: a per-session subdirectory (`self._session_id`, set once in
-        `__init__`), and BOTH the directory and the file get an explicit
-        `os.chmod` after creation - umask only affects the mode requested
-        at creation time, it is not itself a guarantee, so this is what
-        actually enforces owner-only access regardless of umask.
+        Explicitly old hosts retain the qualified owner-private marker path.
+        A host offering generic media cannot fall back to legacy persistence
+        when its graph or source-policy owner is unavailable.
         """
+        try:
+            capability = (
+                self._media_get_capability("experimental.media.v1")
+                if self._media_get_capability is not None
+                else None
+            )
+        except Exception:
+            return ToolResult(
+                success=True,
+                output={"text": summary + " [Image unavailable; no pixels supplied]"},
+            )
+        if (
+            capability is None
+            and self._media_get_capability is not None
+            and not callable(
+                self._media_get_capability("computer_use.prepare_request")
+            )
+        ):
+            # Mounted hosts without either compatible reader cannot retain new
+            # screenshot bytes merely because generic handling is absent.
+            return ToolResult(
+                success=True,
+                output={"text": summary + " [Image unavailable; no pixels supplied]"},
+            )
+        if capability is not None:
+            # Async ingest happens only after the call's ordinary cleanup has
+            # settled. No transient bytes are put into ToolResult or tool:post.
+            disp = display if display is not None else self.display
+            if captures is not None and isinstance(image_b64, _CapturedImage):
+                captures.append(image_b64)
+            return ToolResult(
+                success=True,
+                output={"text": f"{summary} ({disp.model_width}x{disp.model_height})"},
+            )
         try:
             return self._persist_screenshot_result(
                 summary, image_b64, display=display, captures=captures
@@ -5423,6 +5638,8 @@ async def _mount_backend(coordinator: Any, cfg: dict[str, Any]) -> dict[str, Any
     (`mount()`) or a `ToolResult` (`_activate`).
     """
     computer = await asyncio.to_thread(_select_and_build, cfg)
+    computer._media_get_capability = getattr(coordinator, "get_capability", None)
+    computer._media_coordinator = coordinator
     closed = False
     close_error: BaseException | None = None
 
