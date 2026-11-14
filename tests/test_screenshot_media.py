@@ -442,3 +442,53 @@ def test_capture_encoding_delay_does_not_renew_original_ttl(tmp_path, monkeypatc
     assert image.capture.created_at == 1000
     assert image.capture.expires_at == 1000 + cu.SHOT_TTL_SECONDS
     assert image.capture.deadline == 2000 + cu.SHOT_TTL_SECONDS
+
+
+def test_legacy_historical_marker_is_protected_not_original_capture_authority(monkeypatch):
+    from amplifier_module_hook_computer_use.legacy_media import (
+        legacy_screenshot_origin_for,
+        recognize_legacy_screenshot_marker,
+    )
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Recognition cannot read a path or sample a clock")
+
+    monkeypatch.setattr(cu.time, "time", forbidden)
+    monkeypatch.setattr(cu.os, "stat", forbidden)
+    value = {cu.MARKER: 1, "text": "screenshot captured", "images": ["/untrusted.png"]}
+    before = copy.deepcopy(value)
+    held = recognize_legacy_screenshot_marker(value)
+    assert held == {
+        "owner": "computer-use", "format": "legacy-screenshot-marker-v1",
+        "status": "held", "reason": "missing-original-capture-receipt",
+        "origin": None, "image_count": 1, "pixels_converted": 0,
+    }
+    snapshot = {
+        "source_sha256": "a" * 64, "record_index": 1,
+        "path": "/untrusted.png", "image_index": 0, "sha256": "b" * 64,
+        "bytes": 100, "session_id": "native-session",
+    }
+    assert legacy_screenshot_origin_for(snapshot) is None
+    assert value == before and "/untrusted.png" not in json.dumps(held)
+
+
+@pytest.mark.parametrize("value", [
+    None,
+    "__amplifier_computer_use__ in human prose",
+    json.dumps({cu.MARKER: 1, "text": "captured", "images": ["/shot.png"]}),
+    {cu.MARKER: True, "text": "captured", "images": ["/shot.png"]},
+    {cu.MARKER: 2, "text": "captured", "images": ["/shot.png"]},
+    {cu.MARKER: 1, "text": "no image", "images": []},
+    {cu.MARKER: 1, "text": "captured", "images": [False]},
+    {cu.MARKER: 1, "text": "captured", "images": [""]},
+    {cu.MARKER: 1, "text": None, "images": ["/shot.png"]},
+    {cu.MARKER: 1, "text": "captured", "images": ["/shot.png"], "created_at": "today"},
+    {"output": {cu.MARKER: 1, "text": "captured", "images": ["/shot.png"]}},
+    {NS: {"refs": []}},
+])
+def test_legacy_historical_adapter_does_not_guess_or_parse(value):
+    from amplifier_module_hook_computer_use.legacy_media import (
+        recognize_legacy_screenshot_marker,
+    )
+
+    assert recognize_legacy_screenshot_marker(value) is None

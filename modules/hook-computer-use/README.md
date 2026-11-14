@@ -84,6 +84,25 @@ capability. Without generic media, a mounted compatible legacy reader can still
 use the established private marker path. Without either reader, new screenshots
 return useful unavailable text and retain no fallback pixels.
 
+### Historical screenshot recognition
+
+`amplifier_module_hook_computer_use.legacy_media` exposes
+`recognize_legacy_screenshot_marker(decoded_value)`. The host's existing bounded,
+allowlisted owner parser supplies a decoded exact `{__amplifier_computer_use__: 1,
+text: str, images: [nonempty_str, ...]}` mapping. A recognized marker returns a
+`held` / `missing-original-capture-receipt` disposition, with `origin: None` and
+zero converted pixels. Unknown versions/fields, wrappers and strings return None;
+the host must retain its unknown-format protection, not infer unrestricted media.
+The adapter does not parse arbitrary prose/JSON strings or open any image path.
+
+The original legacy writer never persisted capture creation/expiry or its private
+issuance witness. `legacy_screenshot_origin_for(snapshot)` therefore always
+returns None for historical source-SHA/record/image-index lookups. Event dates,
+file times, filename UUIDs and pixel digests cannot reconstruct that missing
+receipt. Old records remain protected and unchanged; neither optimization nor
+this adapter renews screen consent. Prospective structured refs follow their
+existing media-store provenance instead.
+
 The write gate inspects nested canonical batch actions, so a top-level batch cannot
 hide writes. Interactive approval is default-deny and bound to the exact batch payload
 and target/policy; the executor consumes that approval once. Explicit
